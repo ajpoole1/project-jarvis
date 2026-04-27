@@ -126,14 +126,19 @@ def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
             break
     messages = []
     for msg_id in msg_ids:
-        msg = service.users().messages().get(
-            userId="me", id=msg_id, format="metadata",
-            metadataHeaders=["From", "Subject"],
-        ).execute()
+        msg = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=msg_id,
+                format="metadata",
+                metadataHeaders=["From", "Subject"],
+            )
+            .execute()
+        )
         messages.append(msg)
     return messages
-
-
 
 
 def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSummary]:
@@ -149,14 +154,16 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
 
         cached = get_cached_action(con, email)
         if cached:
-            results.append(EmailSummary(
-                msg_id=msg["id"],
-                sender=name,
-                sender_email=email,
-                subject=subject,
-                action=cached,
-                reason="cached rule",
-            ))
+            results.append(
+                EmailSummary(
+                    msg_id=msg["id"],
+                    sender=name,
+                    sender_email=email,
+                    subject=subject,
+                    action=cached,
+                    reason="cached rule",
+                )
+            )
         else:
             uncached.append((msg["id"], name, email, subject))
 
@@ -200,7 +207,9 @@ Emails:
         try:
             classifications = json.loads(raw)
         except json.JSONDecodeError:
-            classifications = [{"action": "keep", "reason": "parse error — defaulting to keep"} for _ in chunk]
+            classifications = [
+                {"action": "keep", "reason": "parse error — defaulting to keep"} for _ in chunk
+            ]
 
         for (msg_id, name, email, subject), cls in zip(chunk, classifications, strict=False):
             action = cls.get("action", "keep")
@@ -209,15 +218,17 @@ Emails:
             tag = cls.get("tag", "none")
             if tag not in TAGS:
                 tag = "none"
-            results.append(EmailSummary(
-                msg_id=msg_id,
-                sender=name,
-                sender_email=email,
-                subject=subject,
-                action=action,
-                reason=cls.get("reason", ""),
-                tag=tag,
-            ))
+            results.append(
+                EmailSummary(
+                    msg_id=msg_id,
+                    sender=name,
+                    sender_email=email,
+                    subject=subject,
+                    action=action,
+                    reason=cls.get("reason", ""),
+                    tag=tag,
+                )
+            )
             cache_rule(con, email, action, confirmed=False)
 
     return results
@@ -258,29 +269,45 @@ def get_or_create_labels(service) -> dict[str, str]:
         if name in existing:
             label_map[tag] = existing[name]
         else:
-            created = service.users().labels().create(
-                userId="me",
-                body={"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"},
-            ).execute()
+            created = (
+                service.users()
+                .labels()
+                .create(
+                    userId="me",
+                    body={
+                        "name": name,
+                        "labelListVisibility": "labelShow",
+                        "messageListVisibility": "show",
+                    },
+                )
+                .execute()
+            )
             label_map[tag] = created["id"]
     return label_map
 
 
-def execute_actions(service, summaries: list[EmailSummary], con: sqlite3.Connection, label_map: dict[str, str] | None = None):
+def execute_actions(
+    service,
+    summaries: list[EmailSummary],
+    con: sqlite3.Connection,
+    label_map: dict[str, str] | None = None,
+):
     for s in summaries:
         add_labels = []
         if label_map and s.tag and s.tag != "none" and s.tag in label_map:
             add_labels = [label_map[s.tag]]
         if s.action == "archive":
             service.users().messages().modify(
-                userId="me", id=s.msg_id,
+                userId="me",
+                id=s.msg_id,
                 body={"removeLabelIds": ["INBOX"], "addLabelIds": add_labels},
             ).execute()
         elif s.action in ("trash", "unsubscribe"):
             service.users().messages().trash(userId="me", id=s.msg_id).execute()
         elif s.action == "keep" and add_labels:
             service.users().messages().modify(
-                userId="me", id=s.msg_id,
+                userId="me",
+                id=s.msg_id,
                 body={"addLabelIds": add_labels},
             ).execute()
         cache_rule(con, s.sender_email, s.action, confirmed=True)
@@ -321,9 +348,7 @@ def confirm_action(con: sqlite3.Connection, action: str) -> str:
 
 
 def confirm_all(con: sqlite3.Connection) -> str:
-    cursor = con.execute(
-        "UPDATE gmail_sender_rules SET confirmed = 1 WHERE confirmed = 0"
-    )
+    cursor = con.execute("UPDATE gmail_sender_rules SET confirmed = 1 WHERE confirmed = 0")
     con.commit()
     return f"Confirmed {cursor.rowcount} pending sender rules."
 
@@ -345,10 +370,10 @@ def run(batch_size: int = DEFAULT_BATCH_SIZE, dry_run: bool = DRY_RUN) -> str:
     report = build_staging_report(summaries, dry_run)
     if not dry_run:
         non_keep = [s for s in summaries if s.action != "keep"]
-        execute_actions(service, non_keep + [s for s in summaries if s.action == "keep"], con, label_map)
+        execute_actions(
+            service, non_keep + [s for s in summaries if s.action == "keep"], con, label_map
+        )
     return report
-
-
 
 
 def purge_archive(batch_size: int = 500):
@@ -395,18 +420,26 @@ def drain_categories(batch_size: int = DEFAULT_BATCH_SIZE):
         total = 0
         print(f"\nDraining {label}...")
         while True:
-            result = service.users().messages().list(
-                userId="me", labelIds=[label], maxResults=min(batch_size, 500)
-            ).execute()
+            result = (
+                service.users()
+                .messages()
+                .list(userId="me", labelIds=[label], maxResults=min(batch_size, 500))
+                .execute()
+            )
             msg_stubs = result.get("messages", [])
             if not msg_stubs:
                 print(f"  {label} clear. {total} actioned.")
                 break
             messages = [
-                service.users().messages().get(
-                    userId="me", id=m["id"], format="metadata",
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=m["id"],
+                    format="metadata",
                     metadataHeaders=["From", "Subject"],
-                ).execute()
+                )
+                .execute()
                 for m in msg_stubs
             ]
             summaries = classify_emails(messages, con)
@@ -418,7 +451,8 @@ def drain_categories(batch_size: int = DEFAULT_BATCH_SIZE):
             # strip the category label from all processed messages so they don't get refetched
             for msg in messages:
                 service.users().messages().modify(
-                    userId="me", id=msg["id"],
+                    userId="me",
+                    id=msg["id"],
                     body={"removeLabelIds": [label]},
                 ).execute()
             total += len(non_keep)
@@ -446,7 +480,9 @@ def drain(batch_size: int = DEFAULT_BATCH_SIZE):
         execute_actions(service, summaries, con, label_map)
         total_actioned += len(non_keep)
         keep_count = len(summaries) - len(non_keep)
-        print(f"Pass {run_count}: actioned {len(non_keep)} ({total_actioned} total), {keep_count} kept. Continuing...")
+        print(
+            f"Pass {run_count}: actioned {len(non_keep)} ({total_actioned} total), {keep_count} kept. Continuing..."
+        )
 
 
 if __name__ == "__main__":
