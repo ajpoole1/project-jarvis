@@ -110,8 +110,8 @@ jarvis/
 
 | Phase | Status | Goal |
 |---|---|---|
-| Phase 1 | 🔲 Not started | Foundation — OpenClaw, Discord, first voice note |
-| Phase 2 | 🔲 Not started | Core integrations — HA, Gmail, Calendar, Spotify |
+| Phase 1 | ✅ Done | Foundation — OpenClaw, Discord, first voice note |
+| Phase 2 | 🔄 In progress | Core integrations — HA, Gmail, Calendar, Spotify |
 | Phase 3 | 🔲 Not started | Agentic skills — Gmail cleanup, job search, morning briefing, garden |
 | Phase 4 | 🔲 Not started | VPS migration + Pi deployment |
 | Phase 5 | 🔲 Not started | Jarvis Android app (Flutter, sideloaded APK) |

@@ -6,13 +6,13 @@ _Update this file at the end of every Claude Code session. This is how context s
 
 ## Current Phase
 
-**Phase 1 — Foundation** (not started)
+**Phase 2 — Core integrations** (in progress)
 
 ---
 
 ## Last Updated
 
-2026-04-27 — CI/CD setup, branch rename, branch protection
+2026-04-27 — Phase 1 complete: OpenClaw + Discord bot live and responding
 
 ---
 
@@ -25,15 +25,23 @@ _Update this file at the end of every Claude Code session. This is how context s
 - Created `requirements-dev.txt` — pinned ruff 0.4.4, pytest 8.2.0, pytest-cov 5.0.0
 - Created `.env.example` — placeholder values for all integrations (Anthropic, Discord, Gmail, HA, Spotify, Tailscale)
 - Created `docker-compose.yml` — scaffold with openclaw service + busybox placeholder
+- Added `tests/test_placeholder.py` — prevents pytest exit-code-5 on empty suite
 - Renamed `master` → `main` on GitHub and locally
 - Created `develop` branch, pushed to remote
 - Set branch protection on `main`: all 5 CI checks required, strict up-to-date, force push/delete blocked
+- Installed WSL2, Docker Desktop, Node.js (via nvm v24.15.0), Claude Code CLI in WSL
+- Created Python venv at `.venv`, installed ruff + pytest dev dependencies
+- Installed and configured OpenClaw — Claude CLI auth, Sonnet as default model
+- Created private Discord server, registered Jarvis bot, enabled Message Content Intent
+- Connected OpenClaw to Discord — bot online and responding to @mentions in Jarvis server
 
 ---
 
 ## In Progress
 
-_Nothing. Phase 1 foundation work is next._
+**Gmail cleanup skill** — `skills/gmail-cleanup/skill.py`
+- Inbox cleared. Classifier running with confirmed SQLite rule cache.
+- Tagging system designed but not yet built (see Up Next)
 
 ---
 
@@ -45,13 +53,21 @@ _Nothing._
 
 ## Up Next
 
-- [ ] Install WSL2 Remote extension in VS Code
-- [ ] Confirm Docker Compose starts cleanly from WSL terminal
-- [ ] `npm install -g openclaw`, run onboard wizard, set Claude API key
-- [ ] Create private Discord server, register bot token
-- [ ] Connect Discord integration, test first voice note → Claude response
 - [ ] Build `openclaw/` Dockerfile so `docker-compose.yml` openclaw service can actually build
-- [ ] Create `tests/` directory with a placeholder test so pytest doesn't fail on empty suite
+- [ ] Begin Phase 2: Home Assistant skill, Calendar, Spotify
+- [x] Gmail: clear inbox backlog — drain, drain_categories, purge_archive all working
+- [ ] Gmail: build tagging system — apply Gmail labels alongside actions:
+    - jarvis/receipts, jarvis/bills, jarvis/job-search, jarvis/health, jarvis/family, jarvis/projects
+    - Haiku returns both action + tag in one call
+    - Create labels in Gmail if they don't exist, apply on execute
+- [ ] Gmail: flag-and-remove flow — emails Jarvis isn't sure about get flagged in Discord for user decision then removed
+- [ ] Gmail: add `purge` mode — scan archive for emails older than N days, re-classify with "still relevant?" prompt, stage trash for expired notifications (project shutdowns, shipping, CI failures, surveys). Run after inbox is clean.
+- [ ] Gmail: wire skill into OpenClaw so Jarvis can trigger cleanup from Discord
+- [ ] Gmail + Calendar: calendar-aware classifier — appointment confirmations/reminders check Google Calendar before acting:
+    - Event exists → archive silently
+    - Event missing → flag in Discord, offer to add to calendar (stage then approve)
+    - Update/cancellation emails → always flag, never silently archive
+    - Requires Calendar skill built first
 
 ---
 

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout *)",
+      "Bash(git commit -m ' *)",
+      "Bash(gh pr *)",
+      "Bash(gh run *)",
+      "Bash(git pull *)",
+      "Bash(npm --version)"
+    ],
+    "additionalDirectories": [
+      "/mnt/c/Users/aaron/Documents/python/project-jarvis"
+    ]
+  }
+}

@@ -87,3 +87,6 @@ desktop.ini
 secrets/
 credentials/
 service_account*.json
+config/personal/
+data/
+logs/
