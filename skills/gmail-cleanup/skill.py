@@ -8,15 +8,14 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).parents[2] / ".env")
-
 import anthropic
+from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+load_dotenv(Path(__file__).parents[2] / ".env")
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
@@ -203,7 +202,7 @@ Emails:
         except json.JSONDecodeError:
             classifications = [{"action": "keep", "reason": "parse error — defaulting to keep"} for _ in chunk]
 
-        for (msg_id, name, email, subject), cls in zip(chunk, classifications):
+        for (msg_id, name, email, subject), cls in zip(chunk, classifications, strict=False):
             action = cls.get("action", "keep")
             if action not in ACTIONS:
                 action = "keep"
@@ -248,8 +247,8 @@ def build_staging_report(summaries: list[EmailSummary], dry_run: bool) -> str:
 def get_or_create_labels(service) -> dict[str, str]:
     """Return a map of tag name → Gmail label ID, creating labels that don't exist."""
     existing = {
-        l["name"]: l["id"]
-        for l in service.users().labels().list(userId="me").execute().get("labels", [])
+        lbl["name"]: lbl["id"]
+        for lbl in service.users().labels().list(userId="me").execute().get("labels", [])
     }
     label_map = {}
     for tag in TAGS:
@@ -350,31 +349,6 @@ def run(batch_size: int = DEFAULT_BATCH_SIZE, dry_run: bool = DRY_RUN) -> str:
     return report
 
 
-def nuke_categories(batch_size: int = 500):
-    """Drain all Gmail category tabs using auto-action rules."""
-    service = get_gmail_service()
-    con = init_db()
-    for label, action in CATEGORY_AUTO_ACTIONS.items():
-        total = 0
-        print(f"Draining {label} → {action}...")
-        while True:
-            result = service.users().messages().list(
-                userId="me", labelIds=[label], maxResults=batch_size
-            ).execute()
-            messages = result.get("messages", [])
-            if not messages:
-                print(f"  {label} cleared. {total} emails actioned.")
-                break
-            for msg in messages:
-                if action in ("unsubscribe", "trash"):
-                    service.users().messages().trash(userId="me", id=msg["id"]).execute()
-                else:
-                    service.users().messages().modify(
-                        userId="me", id=msg["id"],
-                        body={"removeLabelIds": ["INBOX"]},
-                    ).execute()
-                total += 1
-            print(f"  {label}: {total} so far...")
 
 
 def purge_archive(batch_size: int = 500):
