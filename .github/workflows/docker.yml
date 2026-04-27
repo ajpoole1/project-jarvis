@@ -1,0 +1,21 @@
+name: Docker Validation
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  validate:
+    name: Validate docker-compose config
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy .env.example to .env
+        run: cp .env.example .env
+
+      - name: Validate compose config
+        run: docker compose config
