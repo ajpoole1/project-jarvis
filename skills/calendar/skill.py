@@ -113,8 +113,16 @@ def cmd_today(service) -> str:
     _, t_max = _day_bounds(tomorrow)
     events = fetch_events(service, t_min, t_max)
 
-    today_events = [e for e in events if e["start"].get("dateTime", e["start"].get("date", "")).startswith(str(today))]
-    tomorrow_events = [e for e in events if e["start"].get("dateTime", e["start"].get("date", "")).startswith(str(tomorrow))]
+    today_events = [
+        e
+        for e in events
+        if e["start"].get("dateTime", e["start"].get("date", "")).startswith(str(today))
+    ]
+    tomorrow_events = [
+        e
+        for e in events
+        if e["start"].get("dateTime", e["start"].get("date", "")).startswith(str(tomorrow))
+    ]
 
     blocks = [
         format_day_block(today, today_events),
@@ -134,7 +142,8 @@ def cmd_week(service) -> str:
     for i in range(7):
         d = today + timedelta(days=i)
         day_events = [
-            e for e in events
+            e
+            for e in events
             if e["start"].get("dateTime", e["start"].get("date", "")).startswith(str(d))
         ]
         blocks.append(format_day_block(d, day_events))
@@ -180,7 +189,14 @@ def cmd_upcoming(service, days: int = 30) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def cmd_add(service, title: str, date_str: str, time_str: str = "", duration_min: int = 60, calendar_id: str = "primary") -> str:
+def cmd_add(
+    service,
+    title: str,
+    date_str: str,
+    time_str: str = "",
+    duration_min: int = 60,
+    calendar_id: str = "primary",
+) -> str:
     tz = _tz()
     try:
         d = date.fromisoformat(date_str)
@@ -251,5 +267,7 @@ if __name__ == "__main__":
         print(cmd_calendars(service))
     else:
         print(f"Unknown command: {cmd}")
-        print("Commands: today, week, check <date>, upcoming [days], add <title> <date> [time] [duration] [cal_id], calendars")
+        print(
+            "Commands: today, week, check <date>, upcoming [days], add <title> <date> [time] [duration] [cal_id], calendars"
+        )
         sys.exit(1)
