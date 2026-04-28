@@ -77,8 +77,60 @@ def init_db():
             last_applied TEXT
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_pending_actions (
+            msg_id          TEXT PRIMARY KEY,
+            sender_email    TEXT NOT NULL,
+            sender_display  TEXT NOT NULL,
+            subject         TEXT NOT NULL,
+            action          TEXT NOT NULL,
+            tag             TEXT NOT NULL DEFAULT 'none',
+            reason          TEXT,
+            staged_at       TEXT DEFAULT (datetime('now'))
+        )
+    """)
     con.commit()
     return con
+
+
+def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
+    con.execute("DELETE FROM gmail_pending_actions")
+    for s in summaries:
+        con.execute(
+            """INSERT OR REPLACE INTO gmail_pending_actions
+               (msg_id, sender_email, sender_display, subject, action, tag, reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (s.msg_id, s.sender_email, s.sender, s.subject, s.action, s.tag, s.reason),
+        )
+    con.commit()
+
+
+def load_pending(con: sqlite3.Connection) -> list[EmailSummary]:
+    rows = con.execute(
+        "SELECT msg_id, sender_email, sender_display, subject, action, tag, reason FROM gmail_pending_actions"
+    ).fetchall()
+    return [
+        EmailSummary(msg_id=r[0], sender_email=r[1], sender=r[2], subject=r[3], action=r[4], tag=r[5], reason=r[6] or "")
+        for r in rows
+    ]
+
+
+def clear_pending(con: sqlite3.Connection):
+    con.execute("DELETE FROM gmail_pending_actions")
+    con.commit()
+
+
+def adjust_pending(con: sqlite3.Connection, sender_email: str, action: str) -> str:
+    if action not in ACTIONS:
+        return f"Unknown action '{action}'. Choose from: {', '.join(ACTIONS)}"
+    cursor = con.execute(
+        "UPDATE gmail_pending_actions SET action = ? WHERE sender_email = ?",
+        (action, sender_email.lower()),
+    )
+    con.commit()
+    if cursor.rowcount == 0:
+        return f"No pending email from {sender_email}."
+    return f"Updated: {sender_email} → {action}"
 
 
 def get_cached_action(con: sqlite3.Connection, sender_email: str) -> str | None:
@@ -399,20 +451,71 @@ def override_rule(con: sqlite3.Connection, sender_email: str, action: str) -> st
     return f"Rule set: {sender_email} → {action} (confirmed)."
 
 
-def run(batch_size: int = DEFAULT_BATCH_SIZE, dry_run: bool = DRY_RUN) -> str:
-    """Entry point called by OpenClaw. Returns a staging report string."""
+def stage(batch_size: int = DEFAULT_BATCH_SIZE) -> str:
+    """Classify inbox and save pending actions to SQLite. Nothing is executed."""
     service = get_gmail_service()
     con = init_db()
-    label_map = get_or_create_labels(service)
     messages = fetch_inbox_messages(service, batch_size)
     summaries = classify_emails(messages, con)
-    report = build_staging_report(summaries, dry_run)
-    if not dry_run:
-        non_keep = [s for s in summaries if s.action != "keep"]
-        execute_actions(
-            service, non_keep + [s for s in summaries if s.action == "keep"], con, label_map
-        )
-    return report
+    save_pending(con, summaries)
+    report = build_staging_report(summaries, dry_run=True)
+    actionable = [s for s in summaries if s.action != "keep"]
+    if not actionable:
+        return report
+    return report + "\n\nReply **execute** to apply, **cancel** to abort, or **adjust <sender> <action>** to change individual items."
+
+
+def cmd_execute() -> str:
+    """Apply all pending staged actions."""
+    service = get_gmail_service()
+    con = init_db()
+    summaries = load_pending(con)
+    if not summaries:
+        return "No pending actions. Run the gmail cleanup first to stage actions."
+    label_map = get_or_create_labels(service)
+    non_keep = [s for s in summaries if s.action != "keep"]
+    keep = [s for s in summaries if s.action == "keep"]
+    execute_actions(service, non_keep + keep, con, label_map)
+    clear_pending(con)
+    actioned = len(non_keep)
+    return f"Done. {actioned} email{'s' if actioned != 1 else ''} actioned, {len(keep)} kept."
+
+
+def cmd_cancel() -> str:
+    """Discard pending staged actions without executing."""
+    con = init_db()
+    pending = load_pending(con)
+    if not pending:
+        return "No pending actions to cancel."
+    clear_pending(con)
+    return f"Cancelled. {len(pending)} staged actions discarded — nothing was changed."
+
+
+def cmd_pending() -> str:
+    """Show current staged actions waiting for approval."""
+    con = init_db()
+    summaries = load_pending(con)
+    if not summaries:
+        return "No pending actions staged."
+    return build_staging_report(summaries, dry_run=True)
+
+
+def cmd_adjust(sender_email: str, action: str) -> str:
+    """Change the staged action for a specific sender before executing."""
+    con = init_db()
+    return adjust_pending(con, sender_email, action)
+
+
+# keep `run` as an alias so heartbeat/drain callers still work
+def run(batch_size: int = DEFAULT_BATCH_SIZE, dry_run: bool = DRY_RUN) -> str:
+    if dry_run:
+        return stage(batch_size)
+    result = stage(batch_size)
+    con = init_db()
+    summaries = load_pending(con)
+    if any(s.action != "keep" for s in summaries):
+        result += "\n" + cmd_execute()
+    return result
 
 
 def purge_archive(batch_size: int = 500):
@@ -528,9 +631,21 @@ if __name__ == "__main__":
     import sys
 
     con = init_db()
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "stage"
 
-    if cmd == "purge_archive":
+    if cmd in ("stage", "run"):
+        print(stage())
+    elif cmd == "execute":
+        print(cmd_execute())
+    elif cmd == "cancel":
+        print(cmd_cancel())
+    elif cmd == "pending":
+        print(cmd_pending())
+    elif cmd == "adjust":
+        sender = sys.argv[2] if len(sys.argv) > 2 else ""
+        action = sys.argv[3] if len(sys.argv) > 3 else ""
+        print(cmd_adjust(sender, action))
+    elif cmd == "purge_archive":
         purge_archive()
     elif cmd == "drain_categories":
         drain_categories()
@@ -548,4 +663,5 @@ if __name__ == "__main__":
         action = sys.argv[3] if len(sys.argv) > 3 else ""
         print(override_rule(con, sender, action))
     else:
-        print(run())
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
