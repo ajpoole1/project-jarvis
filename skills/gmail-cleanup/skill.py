@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -144,6 +145,32 @@ def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
     return messages
 
 
+def fetch_calendar_context(days: int = 30) -> str:
+    """Return upcoming calendar events as a prompt-ready string. Empty string if unavailable."""
+    skill_path = Path(__file__).parents[1] / "calendar" / "skill.py"
+    python_path = Path(__file__).parents[1] / "calendar" / ".venv" / "bin" / "python"
+    if not skill_path.exists() or not python_path.exists():
+        return ""
+    try:
+        result = subprocess.run(
+            [str(python_path), str(skill_path), "upcoming", str(days)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return ""
+        events = json.loads(result.stdout)
+        if not events:
+            return ""
+        lines = [f"Upcoming calendar events (next {days} days):"]
+        for e in events:
+            start = e.get("start", "")[:10]
+            summary = e.get("summary", "")
+            lines.append(f"- {start}: {summary}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSummary]:
     client = anthropic.Anthropic()
     results = []
@@ -171,9 +198,10 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             uncached.append((msg["id"], name, email, subject))
 
     CLASSIFY_CHUNK = 50
+    calendar_context = fetch_calendar_context()
     PROMPT_TEMPLATE = """Classify each email as one of: archive, trash, unsubscribe, keep.
 
-Rules:
+{calendar_section}Rules:
 - keep: personal correspondence from real people, financial alerts (low balance, fraud, CRA/tax), health/medical, travel bookings, anything related to the user's daughter Ellie or wife Polina
 - archive: invoices, receipts, and billing statements from non-Amazon vendors (banks, insurance, software, professional services), job applications, account statements
 - trash: ALL Amazon order confirmations and shipping notifications, ALL Shopify merchant shipping/delivery emails, any order or tracking email from a retail store or marketplace
@@ -184,6 +212,8 @@ PRIORITY RULES (apply in order, first match wins):
 1. message@amisgest.com AND subject contains "journal de bord": ALWAYS trash — redundant app push notification. Applies even if subject mentions Ellie or family names.
 2. message@amisgest.com (all other subjects): keep, tag=family — daycare (Le Royaume des enfants) operational messages and bulletins
 3. Any email referencing "Ellie", "Polina Poole", or "Polina Serebryakova": always keep
+
+APPOINTMENT RULE: If an email is a confirmation, reminder, or scheduling notice for an appointment already listed in the calendar above, archive it — it is already saved. If it is appointment-related but NOT on the calendar, keep it.
 
 Also assign a tag from: receipts, bills, job-search, health, family, projects, none
 
@@ -199,10 +229,14 @@ Emails:
             f'{i+1}. From: "{name}" <{email}> | Subject: {subject}'
             for i, (_, name, email, subject) in enumerate(chunk)
         )
+        calendar_section = calendar_context + "\n\n" if calendar_context else ""
         response = client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=4096,
-            messages=[{"role": "user", "content": PROMPT_TEMPLATE.format(batch_input=batch_input)}],
+            messages=[{"role": "user", "content": PROMPT_TEMPLATE.format(
+                calendar_section=calendar_section,
+                batch_input=batch_input,
+            )}],
         )
         raw = response.content[0].text.strip()
         if raw.startswith("```"):
