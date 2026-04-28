@@ -79,6 +79,10 @@ captures/
 Thumbs.db
 desktop.ini
 
+# Internal session files — contain personal operational details
+CLAUDE.md
+CONTEXT.md
+
 # Secrets / credentials
 *.pem
 *.key
