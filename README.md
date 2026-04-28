@@ -92,7 +92,7 @@ This is an active portfolio project. Logic is public; personal data stays local.
 | `home-assistant` | 🔲 Planned | Control lights, fan, cameras via HA REST API |
 | `spotify` | 🔲 Planned | Playback control, queue management |
 | `job-search` | 🔲 Planned | Scrape listings, deduplicate via SQLite, surface matches |
-| `garden` | 🔲 Planned | Quebec zone 4-5 planting calendar, irrigation scheduling via Pi GPIO |
+| `garden` | 🔲 Planned | Hardiness zone 4-5 planting calendar, irrigation scheduling via Pi GPIO |
 | `notes` | 🔲 Planned | Quick capture to SQLite, searchable via Discord |
 | `tasks` | 🔲 Planned | Task tracking with Discord interface |
 | `browser-automation` | 🔲 Planned | Form filling, login flows, scraping |
