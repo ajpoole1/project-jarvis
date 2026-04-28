@@ -110,7 +110,15 @@ def load_pending(con: sqlite3.Connection) -> list[EmailSummary]:
         "SELECT msg_id, sender_email, sender_display, subject, action, tag, reason FROM gmail_pending_actions"
     ).fetchall()
     return [
-        EmailSummary(msg_id=r[0], sender_email=r[1], sender=r[2], subject=r[3], action=r[4], tag=r[5], reason=r[6] or "")
+        EmailSummary(
+            msg_id=r[0],
+            sender_email=r[1],
+            sender=r[2],
+            subject=r[3],
+            action=r[4],
+            tag=r[5],
+            reason=r[6] or "",
+        )
         for r in rows
     ]
 
@@ -206,7 +214,9 @@ def fetch_calendar_context(days: int = 30) -> str:
     try:
         result = subprocess.run(
             [str(python_path), str(skill_path), "upcoming", str(days)],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         if result.returncode != 0 or not result.stdout.strip():
             return ""
@@ -285,10 +295,15 @@ Emails:
         response = client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=4096,
-            messages=[{"role": "user", "content": PROMPT_TEMPLATE.format(
-                calendar_section=calendar_section,
-                batch_input=batch_input,
-            )}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": PROMPT_TEMPLATE.format(
+                        calendar_section=calendar_section,
+                        batch_input=batch_input,
+                    ),
+                }
+            ],
         )
         raw = response.content[0].text.strip()
         if raw.startswith("```"):
@@ -330,7 +345,9 @@ def build_staging_report(summaries: list[EmailSummary], dry_run: bool) -> str:
         grouped[s.action].append(s)
 
     total = sum(len(v) for v in grouped.values())
-    lines = [f"**Gmail cleanup — {'DRY RUN ' if dry_run else ''}staged actions** ({total} emails fetched)\n"]
+    lines = [
+        f"**Gmail cleanup — {'DRY RUN ' if dry_run else ''}staged actions** ({total} emails fetched)\n"
+    ]
     for action in ("trash", "unsubscribe", "archive", "keep"):
         items = grouped[action]
         if not items:
@@ -462,7 +479,10 @@ def stage(batch_size: int = DEFAULT_BATCH_SIZE) -> str:
     actionable = [s for s in summaries if s.action != "keep"]
     if not actionable:
         return report
-    return report + "\n\nReply **execute** to apply, **cancel** to abort, or **adjust <sender> <action>** to change individual items."
+    return (
+        report
+        + "\n\nReply **execute** to apply, **cancel** to abort, or **adjust <sender> <action>** to change individual items."
+    )
 
 
 def cmd_execute() -> str:
