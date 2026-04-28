@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +32,9 @@ DRY_RUN = os.environ.get("GMAIL_DRY_RUN", "true").lower() == "true"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 ACTIONS = ("archive", "trash", "unsubscribe", "keep")
+
+# Senders whose action depends on subject — never cache, always classify via Haiku
+NEVER_CACHE_SENDERS = {"message@amisgest.com"}
 
 TAGS = ("receipts", "bills", "job-search", "health", "family", "projects", "none")
 LABEL_PREFIX = "jarvis"
@@ -73,8 +77,68 @@ def init_db():
             last_applied TEXT
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_pending_actions (
+            msg_id          TEXT PRIMARY KEY,
+            sender_email    TEXT NOT NULL,
+            sender_display  TEXT NOT NULL,
+            subject         TEXT NOT NULL,
+            action          TEXT NOT NULL,
+            tag             TEXT NOT NULL DEFAULT 'none',
+            reason          TEXT,
+            staged_at       TEXT DEFAULT (datetime('now'))
+        )
+    """)
     con.commit()
     return con
+
+
+def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
+    con.execute("DELETE FROM gmail_pending_actions")
+    for s in summaries:
+        con.execute(
+            """INSERT OR REPLACE INTO gmail_pending_actions
+               (msg_id, sender_email, sender_display, subject, action, tag, reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (s.msg_id, s.sender_email, s.sender, s.subject, s.action, s.tag, s.reason),
+        )
+    con.commit()
+
+
+def load_pending(con: sqlite3.Connection) -> list[EmailSummary]:
+    rows = con.execute(
+        "SELECT msg_id, sender_email, sender_display, subject, action, tag, reason FROM gmail_pending_actions"
+    ).fetchall()
+    return [
+        EmailSummary(
+            msg_id=r[0],
+            sender_email=r[1],
+            sender=r[2],
+            subject=r[3],
+            action=r[4],
+            tag=r[5],
+            reason=r[6] or "",
+        )
+        for r in rows
+    ]
+
+
+def clear_pending(con: sqlite3.Connection):
+    con.execute("DELETE FROM gmail_pending_actions")
+    con.commit()
+
+
+def adjust_pending(con: sqlite3.Connection, sender_email: str, action: str) -> str:
+    if action not in ACTIONS:
+        return f"Unknown action '{action}'. Choose from: {', '.join(ACTIONS)}"
+    cursor = con.execute(
+        "UPDATE gmail_pending_actions SET action = ? WHERE sender_email = ?",
+        (action, sender_email.lower()),
+    )
+    con.commit()
+    if cursor.rowcount == 0:
+        return f"No pending email from {sender_email}."
+    return f"Updated: {sender_email} → {action}"
 
 
 def get_cached_action(con: sqlite3.Connection, sender_email: str) -> str | None:
@@ -141,6 +205,34 @@ def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
     return messages
 
 
+def fetch_calendar_context(days: int = 30) -> str:
+    """Return upcoming calendar events as a prompt-ready string. Empty string if unavailable."""
+    skill_path = Path(__file__).parents[1] / "calendar" / "skill.py"
+    python_path = Path(__file__).parents[1] / "calendar" / ".venv" / "bin" / "python"
+    if not skill_path.exists() or not python_path.exists():
+        return ""
+    try:
+        result = subprocess.run(
+            [str(python_path), str(skill_path), "upcoming", str(days)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return ""
+        events = json.loads(result.stdout)
+        if not events:
+            return ""
+        lines = [f"Upcoming calendar events (next {days} days):"]
+        for e in events:
+            start = e.get("start", "")[:10]
+            summary = e.get("summary", "")
+            lines.append(f"- {start}: {summary}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSummary]:
     client = anthropic.Anthropic()
     results = []
@@ -152,7 +244,7 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
         subject = headers.get("Subject", "(no subject)")
         name, email = parse_sender(raw_from)
 
-        cached = get_cached_action(con, email)
+        cached = None if email in NEVER_CACHE_SENDERS else get_cached_action(con, email)
         if cached:
             results.append(
                 EmailSummary(
@@ -168,19 +260,22 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             uncached.append((msg["id"], name, email, subject))
 
     CLASSIFY_CHUNK = 50
+    calendar_context = fetch_calendar_context()
     PROMPT_TEMPLATE = """Classify each email as one of: archive, trash, unsubscribe, keep.
 
-Rules:
+{calendar_section}Rules:
 - keep: personal correspondence from real people, financial alerts (low balance, fraud, CRA/tax), health/medical, travel bookings, anything related to the user's daughter Ellie or wife Polina
 - archive: invoices, receipts, and billing statements from non-Amazon vendors (banks, insurance, software, professional services), job applications, account statements
 - trash: ALL Amazon order confirmations and shipping notifications, ALL Shopify merchant shipping/delivery emails, any order or tracking email from a retail store or marketplace
 - unsubscribe: marketing/promotional email, retail sale announcements, newsletters the user did not explicitly request
 - trash: spam, irrelevant bulk mail, duplicate notifications, automated alerts with no action required, ANY email from a retailer or vendor that does not contain a specific order number, tracking number, or account-specific transaction detail — generic "sale", "new arrivals", "don't miss out" emails from stores are always trash even if the store is known
 
-PRIORITY RULES:
-- message@amisgest.com with subject containing "journal de bord": trash — user gets app notifications, email is redundant
-- message@amisgest.com (all other subjects): keep — caregiver messages and important school communications
-- Any email referencing "Ellie", "Polina Poole", or "Polina Serebryakova" (user's daughter and wife): always keep
+PRIORITY RULES (apply in order, first match wins):
+1. message@amisgest.com AND subject contains "journal de bord": ALWAYS trash — redundant app push notification. Applies even if subject mentions Ellie or family names.
+2. message@amisgest.com (all other subjects): keep, tag=family — daycare (Le Royaume des enfants) operational messages and bulletins
+3. Any email referencing "Ellie", "Polina Poole", or "Polina Serebryakova": always keep
+
+APPOINTMENT RULE: If an email is a confirmation, reminder, or scheduling notice for an appointment already listed in the calendar above, archive it — it is already saved. If it is appointment-related but NOT on the calendar, keep it.
 
 Also assign a tag from: receipts, bills, job-search, health, family, projects, none
 
@@ -196,10 +291,19 @@ Emails:
             f'{i+1}. From: "{name}" <{email}> | Subject: {subject}'
             for i, (_, name, email, subject) in enumerate(chunk)
         )
+        calendar_section = calendar_context + "\n\n" if calendar_context else ""
         response = client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=4096,
-            messages=[{"role": "user", "content": PROMPT_TEMPLATE.format(batch_input=batch_input)}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": PROMPT_TEMPLATE.format(
+                        calendar_section=calendar_section,
+                        batch_input=batch_input,
+                    ),
+                }
+            ],
         )
         raw = response.content[0].text.strip()
         if raw.startswith("```"):
@@ -229,7 +333,8 @@ Emails:
                     tag=tag,
                 )
             )
-            cache_rule(con, email, action, confirmed=False)
+            if email not in NEVER_CACHE_SENDERS:
+                cache_rule(con, email, action, confirmed=False)
 
     return results
 
@@ -239,7 +344,10 @@ def build_staging_report(summaries: list[EmailSummary], dry_run: bool) -> str:
     for s in summaries:
         grouped[s.action].append(s)
 
-    lines = [f"**Gmail cleanup — {'DRY RUN ' if dry_run else ''}staged actions**\n"]
+    total = sum(len(v) for v in grouped.values())
+    lines = [
+        f"**Gmail cleanup — {'DRY RUN ' if dry_run else ''}staged actions** ({total} emails fetched)\n"
+    ]
     for action in ("trash", "unsubscribe", "archive", "keep"):
         items = grouped[action]
         if not items:
@@ -360,20 +468,74 @@ def override_rule(con: sqlite3.Connection, sender_email: str, action: str) -> st
     return f"Rule set: {sender_email} → {action} (confirmed)."
 
 
-def run(batch_size: int = DEFAULT_BATCH_SIZE, dry_run: bool = DRY_RUN) -> str:
-    """Entry point called by OpenClaw. Returns a staging report string."""
+def stage(batch_size: int = DEFAULT_BATCH_SIZE) -> str:
+    """Classify inbox and save pending actions to SQLite. Nothing is executed."""
     service = get_gmail_service()
     con = init_db()
-    label_map = get_or_create_labels(service)
     messages = fetch_inbox_messages(service, batch_size)
     summaries = classify_emails(messages, con)
-    report = build_staging_report(summaries, dry_run)
-    if not dry_run:
-        non_keep = [s for s in summaries if s.action != "keep"]
-        execute_actions(
-            service, non_keep + [s for s in summaries if s.action == "keep"], con, label_map
-        )
-    return report
+    save_pending(con, summaries)
+    report = build_staging_report(summaries, dry_run=True)
+    actionable = [s for s in summaries if s.action != "keep"]
+    if not actionable:
+        return report
+    return (
+        report
+        + "\n\nReply **execute** to apply, **cancel** to abort, or **adjust <sender> <action>** to change individual items."
+    )
+
+
+def cmd_execute() -> str:
+    """Apply all pending staged actions."""
+    service = get_gmail_service()
+    con = init_db()
+    summaries = load_pending(con)
+    if not summaries:
+        return "No pending actions. Run the gmail cleanup first to stage actions."
+    label_map = get_or_create_labels(service)
+    non_keep = [s for s in summaries if s.action != "keep"]
+    keep = [s for s in summaries if s.action == "keep"]
+    execute_actions(service, non_keep + keep, con, label_map)
+    clear_pending(con)
+    actioned = len(non_keep)
+    return f"Done. {actioned} email{'s' if actioned != 1 else ''} actioned, {len(keep)} kept."
+
+
+def cmd_cancel() -> str:
+    """Discard pending staged actions without executing."""
+    con = init_db()
+    pending = load_pending(con)
+    if not pending:
+        return "No pending actions to cancel."
+    clear_pending(con)
+    return f"Cancelled. {len(pending)} staged actions discarded — nothing was changed."
+
+
+def cmd_pending() -> str:
+    """Show current staged actions waiting for approval."""
+    con = init_db()
+    summaries = load_pending(con)
+    if not summaries:
+        return "No pending actions staged."
+    return build_staging_report(summaries, dry_run=True)
+
+
+def cmd_adjust(sender_email: str, action: str) -> str:
+    """Change the staged action for a specific sender before executing."""
+    con = init_db()
+    return adjust_pending(con, sender_email, action)
+
+
+# keep `run` as an alias so heartbeat/drain callers still work
+def run(batch_size: int = DEFAULT_BATCH_SIZE, dry_run: bool = DRY_RUN) -> str:
+    if dry_run:
+        return stage(batch_size)
+    result = stage(batch_size)
+    con = init_db()
+    summaries = load_pending(con)
+    if any(s.action != "keep" for s in summaries):
+        result += "\n" + cmd_execute()
+    return result
 
 
 def purge_archive(batch_size: int = 500):
@@ -489,9 +651,21 @@ if __name__ == "__main__":
     import sys
 
     con = init_db()
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "stage"
 
-    if cmd == "purge_archive":
+    if cmd in ("stage", "run"):
+        print(stage())
+    elif cmd == "execute":
+        print(cmd_execute())
+    elif cmd == "cancel":
+        print(cmd_cancel())
+    elif cmd == "pending":
+        print(cmd_pending())
+    elif cmd == "adjust":
+        sender = sys.argv[2] if len(sys.argv) > 2 else ""
+        action = sys.argv[3] if len(sys.argv) > 3 else ""
+        print(cmd_adjust(sender, action))
+    elif cmd == "purge_archive":
         purge_archive()
     elif cmd == "drain_categories":
         drain_categories()
@@ -509,4 +683,5 @@ if __name__ == "__main__":
         action = sys.argv[3] if len(sys.argv) > 3 else ""
         print(override_rule(con, sender, action))
     else:
-        print(run())
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
