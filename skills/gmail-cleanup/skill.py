@@ -32,6 +32,9 @@ HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 ACTIONS = ("archive", "trash", "unsubscribe", "keep")
 
+# Senders whose action depends on subject — never cache, always classify via Haiku
+NEVER_CACHE_SENDERS = {"message@amisgest.com"}
+
 TAGS = ("receipts", "bills", "job-search", "health", "family", "projects", "none")
 LABEL_PREFIX = "jarvis"
 
@@ -152,7 +155,7 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
         subject = headers.get("Subject", "(no subject)")
         name, email = parse_sender(raw_from)
 
-        cached = get_cached_action(con, email)
+        cached = None if email in NEVER_CACHE_SENDERS else get_cached_action(con, email)
         if cached:
             results.append(
                 EmailSummary(
@@ -177,10 +180,10 @@ Rules:
 - unsubscribe: marketing/promotional email, retail sale announcements, newsletters the user did not explicitly request
 - trash: spam, irrelevant bulk mail, duplicate notifications, automated alerts with no action required, ANY email from a retailer or vendor that does not contain a specific order number, tracking number, or account-specific transaction detail — generic "sale", "new arrivals", "don't miss out" emails from stores are always trash even if the store is known
 
-PRIORITY RULES:
-- message@amisgest.com with subject containing "journal de bord": trash — user gets app notifications, email is redundant
-- message@amisgest.com (all other subjects): keep — caregiver messages and important school communications
-- Any email referencing "Ellie", "Polina Poole", or "Polina Serebryakova" (user's daughter and wife): always keep
+PRIORITY RULES (apply in order, first match wins):
+1. message@amisgest.com AND subject contains "journal de bord": ALWAYS trash — redundant app push notification. Applies even if subject mentions Ellie or family names.
+2. message@amisgest.com (all other subjects): keep, tag=family — daycare (Le Royaume des enfants) operational messages and bulletins
+3. Any email referencing "Ellie", "Polina Poole", or "Polina Serebryakova": always keep
 
 Also assign a tag from: receipts, bills, job-search, health, family, projects, none
 
@@ -229,7 +232,8 @@ Emails:
                     tag=tag,
                 )
             )
-            cache_rule(con, email, action, confirmed=False)
+            if email not in NEVER_CACHE_SENDERS:
+                cache_rule(con, email, action, confirmed=False)
 
     return results
 
@@ -239,7 +243,8 @@ def build_staging_report(summaries: list[EmailSummary], dry_run: bool) -> str:
     for s in summaries:
         grouped[s.action].append(s)
 
-    lines = [f"**Gmail cleanup — {'DRY RUN ' if dry_run else ''}staged actions**\n"]
+    total = sum(len(v) for v in grouped.values())
+    lines = [f"**Gmail cleanup — {'DRY RUN ' if dry_run else ''}staged actions** ({total} emails fetched)\n"]
     for action in ("trash", "unsubscribe", "archive", "keep"):
         items = grouped[action]
         if not items:
