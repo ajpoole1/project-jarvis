@@ -6,7 +6,8 @@
       "Bash(gh pr *)",
       "Bash(gh run *)",
       "Bash(git pull *)",
-      "Bash(npm --version)"
+      "Bash(npm --version)",
+      "Bash(git remote *)"
     ],
     "additionalDirectories": [
       "/mnt/c/Users/aaron/Documents/python/project-jarvis"
