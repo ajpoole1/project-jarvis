@@ -52,29 +52,71 @@ _RULES = _load_rules()
 
 NEVER_CACHE_SENDERS: set[str] = {s.lower() for s in _RULES.get("never_cache_senders", [])}
 
-CALENDAR_SUBJECT_KEYWORDS = frozenset({
-    "appointment", "reminder", "booking", "reservation",
-    "confirmation", "your visit", "scheduled", "upcoming",
-    "check-up", "checkup", "follow-up", "follow up",
-})
+CALENDAR_SUBJECT_KEYWORDS = frozenset(
+    {
+        "appointment",
+        "reminder",
+        "booking",
+        "reservation",
+        "confirmation",
+        "your visit",
+        "scheduled",
+        "upcoming",
+        "check-up",
+        "checkup",
+        "follow-up",
+        "follow up",
+    }
+)
 
 PRIORITY_TAGS = frozenset({"family"})
-SECURITY_KEYWORDS = frozenset({
-    "security alert", "unauthorized", "suspicious", "breach",
-    "password reset", "verify your", "login attempt", "new sign-in",
-    "two-factor", "account locked",
-})
-FINANCIAL_KEYWORDS = frozenset({
-    "low balance", "fraud alert", "unusual activity",
-    "cra ", "revenue canada", "payment declined",
-    "refund issued", "tax notice",
-})
-AUTOMATED_PREFIXES = frozenset({
-    "noreply", "no-reply", "donotreply", "do-not-reply",
-    "notifications", "updates", "newsletter", "mailer",
-    "info", "support", "help", "admin", "system",
-    "automated", "auto", "bounce", "postmaster",
-})
+SECURITY_KEYWORDS = frozenset(
+    {
+        "security alert",
+        "unauthorized",
+        "suspicious",
+        "breach",
+        "password reset",
+        "verify your",
+        "login attempt",
+        "new sign-in",
+        "two-factor",
+        "account locked",
+    }
+)
+FINANCIAL_KEYWORDS = frozenset(
+    {
+        "low balance",
+        "fraud alert",
+        "unusual activity",
+        "cra ",
+        "revenue canada",
+        "payment declined",
+        "refund issued",
+        "tax notice",
+    }
+)
+AUTOMATED_PREFIXES = frozenset(
+    {
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "do-not-reply",
+        "notifications",
+        "updates",
+        "newsletter",
+        "mailer",
+        "info",
+        "support",
+        "help",
+        "admin",
+        "system",
+        "automated",
+        "auto",
+        "bounce",
+        "postmaster",
+    }
+)
 
 
 def _build_priority_rules() -> str:
@@ -170,9 +212,7 @@ def init_db():
 
 
 def get_heartbeat_state(con: sqlite3.Connection, key: str) -> str | None:
-    row = con.execute(
-        "SELECT value FROM gmail_heartbeat_state WHERE key = ?", (key,)
-    ).fetchone()
+    row = con.execute("SELECT value FROM gmail_heartbeat_state WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
 
 
@@ -457,7 +497,9 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
                 {"action": "keep", "reason": "parse error — defaulting to keep"} for _ in chunk
             ]
 
-        for (msg_id, name, email, subject, _snippet), cls in zip(chunk, classifications, strict=False):
+        for (msg_id, name, email, subject, _snippet), cls in zip(
+            chunk, classifications, strict=False
+        ):
             action = cls.get("action", "keep")
             if action not in ACTIONS:
                 action = "keep"
@@ -746,7 +788,9 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
         existing_json = get_heartbeat_state(con, "digest_queue") or "[]"
         queue = json.loads(existing_json)
         for s in digest_items:
-            queue.append({"sender": s.sender, "subject": s.subject, "action": s.action, "tag": s.tag})
+            queue.append(
+                {"sender": s.sender, "subject": s.subject, "action": s.action, "tag": s.tag}
+            )
         set_heartbeat_state(con, "digest_queue", json.dumps(queue))
         output_parts.append(
             f"DIGEST ADDED: {len(digest_items)} emails queued ({len(queue)} total pending)."
