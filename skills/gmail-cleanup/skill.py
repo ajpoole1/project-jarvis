@@ -32,11 +32,54 @@ DRY_RUN = os.environ.get("GMAIL_DRY_RUN", "true").lower() == "true"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 ACTIONS = ("archive", "trash", "unsubscribe", "keep")
-
-# Senders whose action depends on subject — never cache, always classify via Haiku
-NEVER_CACHE_SENDERS = {"message@amisgest.com"}
-
 TAGS = ("receipts", "bills", "job-search", "health", "family", "projects", "none")
+
+RULES_PATH = CONFIG_DIR / "gmail_rules.json"
+RULES_EXAMPLE_PATH = Path(__file__).parents[2] / "config" / "examples" / "gmail_rules.json"
+
+
+def _load_rules() -> dict:
+    path = RULES_PATH if RULES_PATH.exists() else RULES_EXAMPLE_PATH
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+_RULES = _load_rules()
+
+NEVER_CACHE_SENDERS: set[str] = {s.lower() for s in _RULES.get("never_cache_senders", [])}
+
+
+def _build_priority_rules() -> str:
+    """Build the PRIORITY RULES prompt section from gmail_rules.json."""
+    lines = ["PRIORITY RULES (apply in order, first match wins):"]
+    idx = 1
+
+    for sender in _RULES.get("priority_senders", []):
+        email = sender["email"]
+        for rule in sender.get("rules", []):
+            action = rule["action"]
+            reason = rule.get("reason", "")
+            tag = f", tag={rule['tag']}" if "tag" in rule else ""
+            subject_cond = rule.get("subject_contains")
+            if subject_cond:
+                lines.append(
+                    f'{idx}. {email} AND subject contains "{subject_cond}": '
+                    f"ALWAYS {action} — {reason}. Applies even if subject mentions family names."
+                )
+            else:
+                lines.append(f"{idx}. {email} (all other subjects): {action}{tag} — {reason}")
+            idx += 1
+
+    names = _RULES.get("always_keep_names", [])
+    if names:
+        quoted = ", ".join(f'"{n}"' for n in names)
+        lines.append(f"{idx}. Any email referencing {quoted}: always keep")
+
+    return "\n".join(lines) if idx > 1 else ""
+
+
 LABEL_PREFIX = "jarvis"
 
 
@@ -261,29 +304,30 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
 
     CLASSIFY_CHUNK = 50
     calendar_context = fetch_calendar_context()
-    PROMPT_TEMPLATE = """Classify each email as one of: archive, trash, unsubscribe, keep.
+    priority_rules = _build_priority_rules()
 
-{calendar_section}Rules:
-- keep: personal correspondence from real people, financial alerts (low balance, fraud, CRA/tax), health/medical, travel bookings, anything related to the user's daughter Ellie or wife Polina
-- archive: invoices, receipts, and billing statements from non-Amazon vendors (banks, insurance, software, professional services), job applications, account statements
-- trash: ALL Amazon order confirmations and shipping notifications, ALL Shopify merchant shipping/delivery emails, any order or tracking email from a retail store or marketplace
-- unsubscribe: marketing/promotional email, retail sale announcements, newsletters the user did not explicitly request
-- trash: spam, irrelevant bulk mail, duplicate notifications, automated alerts with no action required, ANY email from a retailer or vendor that does not contain a specific order number, tracking number, or account-specific transaction detail — generic "sale", "new arrivals", "don't miss out" emails from stores are always trash even if the store is known
-
-PRIORITY RULES (apply in order, first match wins):
-1. message@amisgest.com AND subject contains "journal de bord": ALWAYS trash — redundant app push notification. Applies even if subject mentions Ellie or family names.
-2. message@amisgest.com (all other subjects): keep, tag=family — daycare (Le Royaume des enfants) operational messages and bulletins
-3. Any email referencing "Ellie", "Polina Poole", or "Polina Serebryakova": always keep
-
-APPOINTMENT RULE: If an email is a confirmation, reminder, or scheduling notice for an appointment already listed in the calendar above, archive it — it is already saved. If it is appointment-related but NOT on the calendar, keep it.
-
-Also assign a tag from: receipts, bills, job-search, health, family, projects, none
-
-Respond with a JSON array, one object per email, in the same order:
-[{{"action": "archive", "tag": "receipts", "reason": "brief reason"}}, ...]
-
-Emails:
-{batch_input}"""
+    def _build_prompt(batch_input: str) -> str:
+        parts = ["Classify each email as one of: archive, trash, unsubscribe, keep.\n"]
+        if calendar_context:
+            parts.append(calendar_context + "\n")
+        parts.append(
+            "Rules:\n"
+            "- keep: personal correspondence from real people, financial alerts (low balance, fraud, CRA/tax), health/medical, travel bookings, anything related to the user's family\n"
+            "- archive: invoices, receipts, and billing statements from non-Amazon vendors (banks, insurance, software, professional services), job applications, account statements\n"
+            "- trash: ALL Amazon order confirmations and shipping notifications, ALL Shopify merchant shipping/delivery emails, any order or tracking email from a retail store or marketplace\n"
+            "- unsubscribe: marketing/promotional email, retail sale announcements, newsletters the user did not explicitly request\n"
+            '- trash: spam, irrelevant bulk mail, duplicate notifications, automated alerts with no action required, ANY email from a retailer or vendor that does not contain a specific order number, tracking number, or account-specific transaction detail — generic "sale", "new arrivals", "don\'t miss out" emails from stores are always trash even if the store is known\n'
+        )
+        if priority_rules:
+            parts.append(f"\n{priority_rules}\n")
+        parts.append(
+            "\nAPPOINTMENT RULE: If an email is a confirmation, reminder, or scheduling notice for an appointment already listed in the calendar above, archive it — it is already saved. If it is appointment-related but NOT on the calendar, keep it.\n"
+            "\nAlso assign a tag from: receipts, bills, job-search, health, family, projects, none\n"
+            "\nRespond with a JSON array, one object per email, in the same order:\n"
+            '[{"action": "archive", "tag": "receipts", "reason": "brief reason"}, ...]\n'
+            f"\nEmails:\n{batch_input}"
+        )
+        return "\n".join(parts)
 
     for chunk_start in range(0, len(uncached), CLASSIFY_CHUNK):
         chunk = uncached[chunk_start : chunk_start + CLASSIFY_CHUNK]
@@ -291,19 +335,10 @@ Emails:
             f'{i+1}. From: "{name}" <{email}> | Subject: {subject}'
             for i, (_, name, email, subject) in enumerate(chunk)
         )
-        calendar_section = calendar_context + "\n\n" if calendar_context else ""
         response = client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=4096,
-            messages=[
-                {
-                    "role": "user",
-                    "content": PROMPT_TEMPLATE.format(
-                        calendar_section=calendar_section,
-                        batch_input=batch_input,
-                    ),
-                }
-            ],
+            messages=[{"role": "user", "content": _build_prompt(batch_input)}],
         )
         raw = response.content[0].text.strip()
         if raw.startswith("```"):
