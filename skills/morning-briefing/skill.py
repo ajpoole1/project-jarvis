@@ -23,7 +23,9 @@ CONFIG_DIR = Path(os.environ.get("JARVIS_CONFIG_DIR", "/config/personal"))
 CITY = os.environ.get("JARVIS_CITY", "Montreal")
 
 INTERESTS_PATH = CONFIG_DIR / "briefing_interests.json"
-INTERESTS_EXAMPLE_PATH = Path(__file__).parents[2] / "config" / "examples" / "briefing_interests.json"
+INTERESTS_EXAMPLE_PATH = (
+    Path(__file__).parents[2] / "config" / "examples" / "briefing_interests.json"
+)
 
 FETCH_TIMEOUT = 10  # seconds
 
@@ -195,7 +197,9 @@ def run() -> str:
         context_parts.append(f"WEATHER: {weather}")
 
     context_parts.append(
-        f"CALENDAR TODAY:\n{calendar_text}" if calendar_text else "CALENDAR TODAY: Nothing scheduled."
+        f"CALENDAR TODAY:\n{calendar_text}"
+        if calendar_text
+        else "CALENDAR TODAY: Nothing scheduled."
     )
 
     if priority_text:
