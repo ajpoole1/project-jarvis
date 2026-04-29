@@ -457,7 +457,7 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
                 {"action": "keep", "reason": "parse error — defaulting to keep"} for _ in chunk
             ]
 
-        for (msg_id, name, email, subject, snippet), cls in zip(chunk, classifications, strict=False):
+        for (msg_id, name, email, subject, _snippet), cls in zip(chunk, classifications, strict=False):
             action = cls.get("action", "keep")
             if action not in ACTIONS:
                 action = "keep"
