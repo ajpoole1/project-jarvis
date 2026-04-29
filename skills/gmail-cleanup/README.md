@@ -94,6 +94,44 @@ Only `confirmed=1` rules are used as cache hits. Senders in `NEVER_CACHE_SENDERS
 
 Cleared on each `stage` run and on `execute` / `cancel`.
 
+## Personal classification rules
+
+Subject-conditional sender rules, always-keep names, and the `NEVER_CACHE_SENDERS` list are stored in `JARVIS_CONFIG_DIR/gmail_rules.json` — gitignored, never committed.
+
+Copy `config/examples/gmail_rules.json` as a starting point:
+
+```bash
+cp config/examples/gmail_rules.json config/personal/gmail_rules.json
+```
+
+Then edit with your own senders and names. Schema:
+
+```json
+{
+  "never_cache_senders": ["sender@example.com"],
+  "always_keep_names": ["Name One", "Name Two"],
+  "priority_senders": [
+    {
+      "email": "sender@example.com",
+      "rules": [
+        {
+          "subject_contains": "keyword",
+          "action": "trash",
+          "reason": "why this rule exists"
+        },
+        {
+          "action": "keep",
+          "tag": "family",
+          "reason": "fallback for all other subjects"
+        }
+      ]
+    }
+  ]
+}
+```
+
+If `config/personal/gmail_rules.json` is absent the skill falls back to the example file.
+
 ## Tagging
 
 Applied Gmail labels: `jarvis/receipts`, `jarvis/bills`, `jarvis/job-search`, `jarvis/health`, `jarvis/family`, `jarvis/projects`. Labels are created automatically on first run if they don't exist.
