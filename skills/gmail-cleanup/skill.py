@@ -162,6 +162,7 @@ class EmailSummary:
     tag: str = "none"
     calendar_hint: bool = field(default=False)
     watch_label: str = ""
+    uncertain: bool = False
 
 
 def get_gmail_service():
@@ -221,6 +222,18 @@ def init_db():
         CREATE TABLE IF NOT EXISTS gmail_expire_policies (
             tag         TEXT PRIMARY KEY,
             retain_days INTEGER NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_flagged (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            msg_id       TEXT UNIQUE NOT NULL,
+            sender_email TEXT NOT NULL,
+            sender       TEXT NOT NULL,
+            subject      TEXT NOT NULL,
+            snippet      TEXT,
+            reason       TEXT,
+            flagged_at   TEXT DEFAULT (datetime('now'))
         )
     """)
     con.commit()
@@ -567,8 +580,9 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             "\nSet calendar_hint: true whenever the email contains scheduling information (date, time, location) for an appointment, booking, or event not already on the calendar — "
             "use the Preview field if the subject alone is ambiguous.\n"
             "\nAlso assign a tag from: receipts, bills, job-search, health, family, projects, none\n"
+            "\nSet uncertain: true if you genuinely cannot determine the correct action and want a human to decide.\n"
             "\nRespond with a JSON array, one object per email, in the same order:\n"
-            '[{"action": "keep", "tag": "health", "reason": "brief reason", "calendar_hint": true}, ...]\n'
+            '[{"action": "keep", "tag": "health", "reason": "brief reason", "calendar_hint": true, "uncertain": false}, ...]\n'
             f"\nEmails:\n{batch_input}"
         )
         return "\n".join(parts)
@@ -592,7 +606,7 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             classifications = json.loads(raw)
         except json.JSONDecodeError:
             classifications = [
-                {"action": "keep", "reason": "parse error — defaulting to keep"} for _ in chunk
+                {"action": "keep", "reason": "parse error", "uncertain": True} for _ in chunk
             ]
 
         for (msg_id, name, email, subject, _snippet), cls in zip(
@@ -604,6 +618,7 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             tag = cls.get("tag", "none")
             if tag not in TAGS:
                 tag = "none"
+            uncertain = bool(cls.get("uncertain", False))
             results.append(
                 EmailSummary(
                     msg_id=msg_id,
@@ -614,9 +629,10 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
                     reason=cls.get("reason", ""),
                     tag=tag,
                     calendar_hint=bool(cls.get("calendar_hint", False)),
+                    uncertain=uncertain,
                 )
             )
-            if email not in NEVER_CACHE_SENDERS:
+            if not uncertain and email not in NEVER_CACHE_SENDERS:
                 cache_rule(con, email, action, confirmed=False)
 
     return results
@@ -842,6 +858,97 @@ def fetch_body(service, msg_id: str, max_chars: int = 1500) -> str:
     return (body or msg.get("snippet", ""))[:max_chars].strip()
 
 
+def save_flagged(con: sqlite3.Connection, summaries: list[EmailSummary]) -> list[int]:
+    """Persist uncertain emails to gmail_flagged. Returns list of assigned IDs."""
+    ids = []
+    for s in summaries:
+        con.execute(
+            """INSERT OR IGNORE INTO gmail_flagged
+               (msg_id, sender_email, sender, subject, reason)
+               VALUES (?, ?, ?, ?, ?)""",
+            (s.msg_id, s.sender_email, s.sender, s.subject, s.reason),
+        )
+        row = con.execute("SELECT id FROM gmail_flagged WHERE msg_id = ?", (s.msg_id,)).fetchone()
+        if row:
+            ids.append(row[0])
+    con.commit()
+    return ids
+
+
+def list_flagged(con: sqlite3.Connection) -> str:
+    rows = con.execute(
+        "SELECT id, sender, subject, reason, flagged_at FROM gmail_flagged ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return "No flagged emails."
+    lines = ["**Flagged emails — need your decision**\n"]
+    for row_id, sender, subject, reason, flagged_at in rows:
+        date = flagged_at[:10] if flagged_at else ""
+        lines.append(f"  #{row_id} {sender} — {subject[:60]}")
+        if reason:
+            lines.append(f"       _{reason}_")
+        if date:
+            lines.append(f"       flagged {date}")
+    lines.append(f"\nUse `gmail flag decide <#> <action>` — actions: {', '.join(ACTIONS)}")
+    return "\n".join(lines)
+
+
+def decide_flagged(service, con: sqlite3.Connection, flag_id: int, action: str) -> str:
+    if action not in ACTIONS:
+        return f"Unknown action '{action}'. Choose from: {', '.join(ACTIONS)}"
+    row = con.execute(
+        "SELECT msg_id, sender_email, sender, subject FROM gmail_flagged WHERE id = ?",
+        (flag_id,),
+    ).fetchone()
+    if not row:
+        return f"No flagged email #{flag_id}."
+    msg_id, sender_email, sender, subject = row
+    summary = EmailSummary(
+        msg_id=msg_id,
+        sender=sender,
+        sender_email=sender_email,
+        subject=subject,
+        action=action,
+        reason="user decision",
+    )
+    execute_actions(service, [summary], con)
+    con.execute("DELETE FROM gmail_flagged WHERE id = ?", (flag_id,))
+    con.commit()
+    return f"#{flag_id} {sender} — {subject[:60]}\nDecision: {action}. Rule confirmed."
+
+
+def clear_flagged(con: sqlite3.Connection) -> str:
+    cursor = con.execute("DELETE FROM gmail_flagged")
+    con.commit()
+    return (
+        f"Cleared {cursor.rowcount} flagged email{'s' if cursor.rowcount != 1 else ''} — nothing was executed."
+        if cursor.rowcount
+        else "No flagged emails to clear."
+    )
+
+
+def cmd_flag(args: list[str]) -> str:
+    """Manage flagged uncertain emails. Subcommands: list, decide, clear."""
+    con = init_db()
+    sub = args[0] if args else "list"
+
+    if sub == "list" or not args:
+        return list_flagged(con)
+    elif sub == "decide":
+        if len(args) < 3:
+            return "Usage: flag decide <#> <action>"
+        try:
+            flag_id = int(args[1])
+        except ValueError:
+            return "Flag ID must be a number."
+        service = get_gmail_service()
+        return decide_flagged(service, con, flag_id, args[2])
+    elif sub == "clear":
+        return clear_flagged(con)
+    else:
+        return f"Unknown subcommand '{sub}'. Use: list, decide, clear"
+
+
 def set_expire_policy(con: sqlite3.Connection, tag: str, retain_days: int) -> str:
     if tag not in TAGS:
         return f"Unknown tag '{tag}'. Valid tags: {', '.join(t for t in TAGS if t != 'none')}"
@@ -1021,9 +1128,17 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
     if active_watches:
         check_watches(summaries, [{"label": w[0], "description": w[1]} for w in active_watches])
 
+    uncertain = [s for s in summaries if s.uncertain]
+    if uncertain:
+        flag_ids = save_flagged(con, uncertain)
+        for s, fid in zip(uncertain, flag_ids, strict=False):
+            s.watch_label = f"flagged #{fid}"
+
     priority = [s for s in summaries if _is_priority(s) or s.watch_label]
     digest_items = [
-        s for s in summaries if not _is_priority(s) and not s.watch_label and s.action != "keep"
+        s
+        for s in summaries
+        if not _is_priority(s) and not s.watch_label and not s.uncertain and s.action != "keep"
     ]
 
     output_parts = []
@@ -1032,8 +1147,13 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
         lines = ["IMMEDIATE:"]
         for s in priority:
             cal = " [needs calendar]" if s.calendar_hint else ""
-            watch = f" [watch: {s.watch_label}]" if s.watch_label else ""
-            lines.append(f"  • {s.sender} — {s.subject[:70]}{cal}{watch} [{s.tag}]")
+            if s.uncertain:
+                annotation = f" [{s.watch_label} — decide?]"
+            elif s.watch_label:
+                annotation = f" [watch: {s.watch_label}]"
+            else:
+                annotation = ""
+            lines.append(f"  • {s.sender} — {s.subject[:70]}{cal}{annotation} [{s.tag}]")
         lines.append("\nReply **gmail stage** to run full cleanup.")
         output_parts.append("\n".join(lines))
 
@@ -1236,6 +1356,8 @@ if __name__ == "__main__":
         print(cmd_watch(sys.argv[2:]))
     elif cmd == "expire":
         print(cmd_expire(sys.argv[2:]))
+    elif cmd == "flag":
+        print(cmd_flag(sys.argv[2:]))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
