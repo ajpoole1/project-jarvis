@@ -7,7 +7,13 @@
       "Bash(gh run *)",
       "Bash(git pull *)",
       "Bash(npm --version)",
-      "Bash(git remote *)"
+      "Bash(git remote *)",
+      "Bash(chmod +x /mnt/c/Users/aaron/Documents/python/project-jarvis/scripts/cron_heartbeat.sh /mnt/c/Users/aaron/Documents/python/project-jarvis/scripts/cron_digest.sh /mnt/c/Users/aaron/Documents/python/project-jarvis/scripts/cron_briefing.sh)",
+      "Bash(crontab -l)",
+      "Bash(sudo service *)",
+      "Bash(python3 /mnt/c/Users/aaron/Documents/python/project-jarvis/scripts/discord_post.py)",
+      "Bash(sqlite3 /data/jarvis.db \"SELECT key, value FROM gmail_heartbeat_state;\")",
+      "Bash(python3 -c ' *)"
     ],
     "additionalDirectories": [
       "/mnt/c/Users/aaron/Documents/python/project-jarvis"
