@@ -1,0 +1,27 @@
+{
+  "never_cache_senders": [
+    "app-notifications@example-daycare-app.com"
+  ],
+  "always_keep_names": [
+    "Child Name",
+    "Partner Full Name",
+    "Partner Maiden Name"
+  ],
+  "priority_senders": [
+    {
+      "email": "app-notifications@example-daycare-app.com",
+      "rules": [
+        {
+          "subject_contains": "daily report",
+          "action": "trash",
+          "reason": "redundant app push notification — already seen in the app"
+        },
+        {
+          "action": "keep",
+          "tag": "family",
+          "reason": "daycare operational messages and bulletins"
+        }
+      ]
+    }
+  ]
+}
