@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -694,6 +695,64 @@ def get_or_create_labels(service) -> dict[str, str]:
     return label_map
 
 
+def attempt_unsubscribe(service, msg_id: str) -> str:
+    """Fetch List-Unsubscribe header and attempt a real unsubscribe. Returns status string."""
+    try:
+        msg = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=msg_id,
+                format="metadata",
+                metadataHeaders=["List-Unsubscribe", "List-Unsubscribe-Post"],
+            )
+            .execute()
+        )
+        headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+        unsub_header = headers.get("List-Unsubscribe", "")
+        post_header = headers.get("List-Unsubscribe-Post", "")
+
+        if not unsub_header:
+            return "no List-Unsubscribe header"
+
+        http_url = None
+        for part in unsub_header.split(","):
+            part = part.strip().strip("<>")
+            if part.startswith("http"):
+                http_url = part
+                break
+
+        if not http_url:
+            return "only mailto: available — skipped"
+
+        if "List-Unsubscribe=One-Click" in post_header:
+            req = urllib.request.Request(
+                http_url,
+                data=b"List-Unsubscribe=One-Click",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+            return "one-click POST sent"
+
+        urllib.request.urlopen(http_url, timeout=10)
+        return "GET sent"
+
+    except Exception as exc:
+        return f"failed: {exc!s:.60}"
+
+
+def run_unsubscribes(service, summaries: list[EmailSummary]) -> list[tuple[str, str]]:
+    """Attempt real unsubscribe for every unsubscribe-action email.
+    Returns (sender_email, status) pairs."""
+    return [
+        (s.sender_email, attempt_unsubscribe(service, s.msg_id))
+        for s in summaries
+        if s.action == "unsubscribe"
+    ]
+
+
 def execute_actions(
     service,
     summaries: list[EmailSummary],
@@ -795,10 +854,16 @@ def cmd_execute() -> str:
     label_map = get_or_create_labels(service)
     non_keep = [s for s in summaries if s.action != "keep"]
     keep = [s for s in summaries if s.action == "keep"]
+    unsub_results = run_unsubscribes(service, non_keep)
     execute_actions(service, non_keep + keep, con, label_map)
     clear_pending(con)
     actioned = len(non_keep)
-    return f"Done. {actioned} email{'s' if actioned != 1 else ''} actioned, {len(keep)} kept."
+    lines = [f"Done. {actioned} email{'s' if actioned != 1 else ''} actioned, {len(keep)} kept."]
+    if unsub_results:
+        lines.append(f"\n**Unsubscribe attempts ({len(unsub_results)})**")
+        for sender, status in unsub_results:
+            lines.append(f"  • {sender}: {status}")
+    return "\n".join(lines)
 
 
 def cmd_cancel() -> str:
@@ -1302,6 +1367,9 @@ def drain(batch_size: int = DEFAULT_BATCH_SIZE):
         if not non_keep:
             print(f"Pass {run_count}: {len(summaries)} emails, all keep. Inbox is clean.")
             break
+        unsub_results = run_unsubscribes(service, non_keep)
+        for sender, status in unsub_results:
+            print(f"  unsub {sender}: {status}")
         execute_actions(service, summaries, con, label_map)
         total_actioned += len(non_keep)
         keep_count = len(summaries) - len(non_keep)
