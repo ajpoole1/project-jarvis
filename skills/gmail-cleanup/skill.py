@@ -161,6 +161,7 @@ class EmailSummary:
     reason: str
     tag: str = "none"
     calendar_hint: bool = field(default=False)
+    watch_label: str = ""
 
 
 def get_gmail_service():
@@ -207,6 +208,15 @@ def init_db():
             value TEXT NOT NULL
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_watches (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            label       TEXT NOT NULL,
+            description TEXT NOT NULL,
+            active      INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
     con.commit()
     return con
 
@@ -222,6 +232,88 @@ def set_heartbeat_state(con: sqlite3.Connection, key: str, value: str):
         (key, value),
     )
     con.commit()
+
+
+def add_watch(con: sqlite3.Connection, label: str, description: str) -> str:
+    con.execute(
+        "INSERT INTO gmail_watches (label, description) VALUES (?, ?)",
+        (label, description),
+    )
+    con.commit()
+    row_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return f"Watch rule #{row_id} added: [{label}] — {description}"
+
+
+def list_watches(con: sqlite3.Connection) -> str:
+    rows = con.execute(
+        "SELECT id, label, description, active FROM gmail_watches ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return "No watch rules set. Use `gmail watch add <label> <description>` to create one."
+    lines = ["**Gmail watch rules**\n"]
+    for row_id, label, description, active in rows:
+        status = "active" if active else "paused"
+        lines.append(f"  #{row_id} [{label}] — {description} ({status})")
+    return "\n".join(lines)
+
+
+def remove_watch(con: sqlite3.Connection, watch_id: int) -> str:
+    cursor = con.execute("DELETE FROM gmail_watches WHERE id = ?", (watch_id,))
+    con.commit()
+    return f"Watch rule #{watch_id} removed." if cursor.rowcount else f"No watch rule #{watch_id}."
+
+
+def pause_watch(con: sqlite3.Connection, watch_id: int) -> str:
+    cursor = con.execute("UPDATE gmail_watches SET active = 0 WHERE id = ?", (watch_id,))
+    con.commit()
+    return f"Watch rule #{watch_id} paused." if cursor.rowcount else f"No watch rule #{watch_id}."
+
+
+def resume_watch(con: sqlite3.Connection, watch_id: int) -> str:
+    cursor = con.execute("UPDATE gmail_watches SET active = 1 WHERE id = ?", (watch_id,))
+    con.commit()
+    return f"Watch rule #{watch_id} resumed." if cursor.rowcount else f"No watch rule #{watch_id}."
+
+
+def check_watches(summaries: list[EmailSummary], watches: list[dict]) -> None:
+    """Semantically match emails against active watch rules using Haiku. Mutates watch_label in-place."""
+    if not watches or not summaries:
+        return
+
+    client = anthropic.Anthropic()
+    watch_lines = "\n".join(
+        f'{i + 1}. [{w["label"]}]: "{w["description"]}"' for i, w in enumerate(watches)
+    )
+    email_lines = "\n".join(
+        f'{i + 1}. From: "{s.sender}" <{s.sender_email}> | Subject: {s.subject}'
+        for i, s in enumerate(summaries)
+    )
+    prompt = (
+        "Check each email against the watch rules below. "
+        "Match only when you are confident the email fits the rule's description.\n\n"
+        f"Watch rules:\n{watch_lines}\n\n"
+        f"Emails:\n{email_lines}\n\n"
+        "Return a JSON array of matches (empty array [] if none). "
+        "Use 1-based email indexes:\n"
+        '[{"email_idx": 1, "watch_label": "label_name"}, ...]'
+    )
+    response = client.messages.create(
+        model=HAIKU_MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    try:
+        matches = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    for match in matches:
+        idx = match.get("email_idx", 0) - 1
+        label = match.get("watch_label", "")
+        if 0 <= idx < len(summaries) and label:
+            summaries[idx].watch_label = label
 
 
 def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
@@ -744,6 +836,44 @@ def fetch_body(service, msg_id: str, max_chars: int = 1500) -> str:
     return (body or msg.get("snippet", ""))[:max_chars].strip()
 
 
+def cmd_watch(args: list[str]) -> str:
+    """Manage Gmail watch rules. Subcommands: add, list, remove, pause, resume."""
+    con = init_db()
+    sub = args[0] if args else "list"
+
+    if sub == "list" or not args:
+        return list_watches(con)
+    elif sub == "add":
+        if len(args) < 3:
+            return 'Usage: watch add <label> "<description>"'
+        label = args[1]
+        description = " ".join(args[2:])
+        return add_watch(con, label, description)
+    elif sub == "remove":
+        if len(args) < 2:
+            return "Usage: watch remove <id>"
+        try:
+            return remove_watch(con, int(args[1]))
+        except ValueError:
+            return "Watch rule ID must be a number."
+    elif sub == "pause":
+        if len(args) < 2:
+            return "Usage: watch pause <id>"
+        try:
+            return pause_watch(con, int(args[1]))
+        except ValueError:
+            return "Watch rule ID must be a number."
+    elif sub == "resume":
+        if len(args) < 2:
+            return "Usage: watch resume <id>"
+        try:
+            return resume_watch(con, int(args[1]))
+        except ValueError:
+            return "Watch rule ID must be a number."
+    else:
+        return f"Unknown subcommand '{sub}'. Use: add, list, remove, pause, resume"
+
+
 def cmd_body(msg_id: str) -> str:
     """Fetch and return the plain-text body of an email by message ID."""
     if not msg_id:
@@ -771,8 +901,17 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
         return "SILENT"
 
     summaries = classify_emails(messages, con)
-    priority = [s for s in summaries if _is_priority(s)]
-    digest_items = [s for s in summaries if not _is_priority(s) and s.action != "keep"]
+
+    active_watches = con.execute(
+        "SELECT label, description FROM gmail_watches WHERE active = 1"
+    ).fetchall()
+    if active_watches:
+        check_watches(summaries, [{"label": w[0], "description": w[1]} for w in active_watches])
+
+    priority = [s for s in summaries if _is_priority(s) or s.watch_label]
+    digest_items = [
+        s for s in summaries if not _is_priority(s) and not s.watch_label and s.action != "keep"
+    ]
 
     output_parts = []
 
@@ -780,7 +919,8 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
         lines = ["IMMEDIATE:"]
         for s in priority:
             cal = " [needs calendar]" if s.calendar_hint else ""
-            lines.append(f"  • {s.sender} — {s.subject[:70]}{cal} [{s.tag}]")
+            watch = f" [watch: {s.watch_label}]" if s.watch_label else ""
+            lines.append(f"  • {s.sender} — {s.subject[:70]}{cal}{watch} [{s.tag}]")
         lines.append("\nReply **gmail stage** to run full cleanup.")
         output_parts.append("\n".join(lines))
 
@@ -979,6 +1119,8 @@ if __name__ == "__main__":
     elif cmd == "body":
         msg_id = sys.argv[2] if len(sys.argv) > 2 else ""
         print(cmd_body(msg_id))
+    elif cmd == "watch":
+        print(cmd_watch(sys.argv[2:]))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
