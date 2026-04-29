@@ -217,6 +217,12 @@ def init_db():
             created_at  TEXT DEFAULT (datetime('now'))
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_expire_policies (
+            tag         TEXT PRIMARY KEY,
+            retain_days INTEGER NOT NULL
+        )
+    """)
     con.commit()
     return con
 
@@ -836,6 +842,113 @@ def fetch_body(service, msg_id: str, max_chars: int = 1500) -> str:
     return (body or msg.get("snippet", ""))[:max_chars].strip()
 
 
+def set_expire_policy(con: sqlite3.Connection, tag: str, retain_days: int) -> str:
+    if tag not in TAGS:
+        return f"Unknown tag '{tag}'. Valid tags: {', '.join(t for t in TAGS if t != 'none')}"
+    if retain_days <= 0:
+        return "retain_days must be a positive integer."
+    con.execute(
+        "INSERT OR REPLACE INTO gmail_expire_policies (tag, retain_days) VALUES (?, ?)",
+        (tag, retain_days),
+    )
+    con.commit()
+    return f"Expiry policy set: [{tag}] → {retain_days} days"
+
+
+def list_expire_policies(con: sqlite3.Connection) -> str:
+    rows = con.execute("SELECT tag, retain_days FROM gmail_expire_policies ORDER BY tag").fetchall()
+    if not rows:
+        return (
+            "No expiry policies set. Use `gmail expire set <tag> <days>` to configure one.\n"
+            f"Valid tags: {', '.join(t for t in TAGS if t != 'none')}"
+        )
+    lines = ["**Gmail archive expiry policies**\n"]
+    for tag, days in rows:
+        lines.append(f"  [{tag}]: trash after {days} days")
+    lines.append("\nAny tag without a policy is kept forever.")
+    return "\n".join(lines)
+
+
+def remove_expire_policy(con: sqlite3.Connection, tag: str) -> str:
+    cursor = con.execute("DELETE FROM gmail_expire_policies WHERE tag = ?", (tag,))
+    con.commit()
+    return (
+        f"Expiry policy removed for [{tag}] — emails with this tag now kept forever."
+        if cursor.rowcount
+        else f"No policy set for [{tag}]."
+    )
+
+
+def run_expire_purge(service, con: sqlite3.Connection, dry_run: bool = False) -> str:
+    """Trash archived emails that exceed their tag's retention period."""
+    rows = con.execute("SELECT tag, retain_days FROM gmail_expire_policies ORDER BY tag").fetchall()
+    if not rows:
+        return "No expiry policies configured. Use `gmail expire set <tag> <days>`."
+
+    total = 0
+    lines = []
+    for tag, days in rows:
+        query = f"label:jarvis/{tag} -in:inbox -in:trash -in:spam older_than:{days}d"
+        count = 0
+        page_token = None
+        while True:
+            kwargs = {"userId": "me", "q": query, "maxResults": 500}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            result = service.users().messages().list(**kwargs).execute()
+            messages = result.get("messages", [])
+            if not messages:
+                break
+            if not dry_run:
+                for msg in messages:
+                    service.users().messages().trash(userId="me", id=msg["id"]).execute()
+            count += len(messages)
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        if count:
+            verb = "would be trashed" if dry_run else "trashed"
+            lines.append(
+                f"  [{tag}]: {count} email{'s' if count != 1 else ''} {verb} (>{days}d old)"
+            )
+            total += count
+
+    if not lines:
+        return "Nothing to expire — no archived emails exceed their retention period."
+
+    prefix = (
+        "**Expire preview** (dry run — nothing changed)\n" if dry_run else "**Expire complete**\n"
+    )
+    suffix = f"\nTotal: {total} email{'s' if total != 1 else ''}"
+    return prefix + "\n".join(lines) + suffix
+
+
+def cmd_expire(args: list[str]) -> str:
+    """Manage archive expiry policies. Subcommands: set, list, remove, run, preview."""
+    con = init_db()
+    sub = args[0] if args else "list"
+
+    if sub == "list" or not args:
+        return list_expire_policies(con)
+    elif sub == "set":
+        if len(args) < 3:
+            return "Usage: expire set <tag> <days>"
+        try:
+            days = int(args[2])
+        except ValueError:
+            return "days must be a positive integer."
+        return set_expire_policy(con, args[1], days)
+    elif sub == "remove":
+        if len(args) < 2:
+            return "Usage: expire remove <tag>"
+        return remove_expire_policy(con, args[1])
+    elif sub in ("run", "preview"):
+        service = get_gmail_service()
+        return run_expire_purge(service, con, dry_run=(sub == "preview"))
+    else:
+        return f"Unknown subcommand '{sub}'. Use: set, list, remove, run, preview"
+
+
 def cmd_watch(args: list[str]) -> str:
     """Manage Gmail watch rules. Subcommands: add, list, remove, pause, resume."""
     con = init_db()
@@ -1121,6 +1234,8 @@ if __name__ == "__main__":
         print(cmd_body(msg_id))
     elif cmd == "watch":
         print(cmd_watch(sys.argv[2:]))
+    elif cmd == "expire":
+        print(cmd_expire(sys.argv[2:]))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
