@@ -3,16 +3,18 @@ services:
     build: ./openclaw
     restart: unless-stopped
     env_file: .env
+    environment:
+      - OPENCLAW_STATE_DIR=/openclaw-state
+      - OPENCLAW_CONFIG_PATH=/config/openclaw/openclaw.json
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
     volumes:
       - ./data:/data
       - ./logs:/logs
       - ./skills:/skills
       - ./config:/config
-    depends_on:
-      - placeholder
+      - openclaw_state:/openclaw-state
+    ports:
+      - "18789:18789"
 
-  # Placeholder service — remove when real services are added
-  # docker compose requires at least one service to validate cleanly
-  placeholder:
-    image: busybox
-    command: ["true"]
+volumes:
+  openclaw_state:
