@@ -237,6 +237,14 @@ def init_db():
             flagged_at   TEXT DEFAULT (datetime('now'))
         )
     """)
+    # Seed 30-day defaults for all tags on first run; INSERT OR IGNORE preserves custom policies.
+    no_policies = con.execute("SELECT COUNT(*) FROM gmail_expire_policies").fetchone()[0] == 0
+    if no_policies:
+        for tag in TAGS:
+            con.execute(
+                "INSERT OR IGNORE INTO gmail_expire_policies (tag, retain_days) VALUES (?, 30)",
+                (tag,),
+            )
     con.commit()
     return con
 
@@ -672,8 +680,6 @@ def get_or_create_labels(service) -> dict[str, str]:
     }
     label_map = {}
     for tag in TAGS:
-        if tag == "none":
-            continue
         name = f"{LABEL_PREFIX}/{tag}"
         if name in existing:
             label_map[tag] = existing[name]
@@ -761,7 +767,7 @@ def execute_actions(
 ):
     for s in summaries:
         add_labels = []
-        if label_map and s.tag and s.tag != "none" and s.tag in label_map:
+        if label_map and s.tag and s.tag in label_map:
             add_labels = [label_map[s.tag]]
         if s.action == "archive":
             service.users().messages().modify(
