@@ -92,5 +92,6 @@ secrets/
 credentials/
 service_account*.json
 config/personal/
+config/openclaw/
 data/
 logs/

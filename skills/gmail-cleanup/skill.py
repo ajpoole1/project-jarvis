@@ -9,7 +9,7 @@ import sqlite3
 import subprocess
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import anthropic
@@ -672,8 +672,6 @@ def get_or_create_labels(service) -> dict[str, str]:
     }
     label_map = {}
     for tag in TAGS:
-        if tag == "none":
-            continue
         name = f"{LABEL_PREFIX}/{tag}"
         if name in existing:
             label_map[tag] = existing[name]
@@ -761,7 +759,7 @@ def execute_actions(
 ):
     for s in summaries:
         add_labels = []
-        if label_map and s.tag and s.tag != "none" and s.tag in label_map:
+        if label_map and s.tag and s.tag in label_map:
             add_labels = [label_map[s.tag]]
         if s.action == "archive":
             service.users().messages().modify(
@@ -1174,11 +1172,14 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
 
     last_checked_str = get_heartbeat_state(con, "last_checked")
     if not last_checked_str:
-        set_heartbeat_state(con, "last_checked", datetime.utcnow().isoformat())
+        set_heartbeat_state(con, "last_checked", datetime.now(UTC).isoformat())
         return "SILENT"
 
-    since_epoch = int(datetime.fromisoformat(last_checked_str).timestamp())
-    now = datetime.utcnow()
+    dt = datetime.fromisoformat(last_checked_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    since_epoch = int(dt.timestamp())
+    now = datetime.now(UTC)
     messages = fetch_new_messages(service, since_epoch, batch_size)
     set_heartbeat_state(con, "last_checked", now.isoformat())
 
