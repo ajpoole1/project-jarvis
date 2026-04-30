@@ -1,0 +1,41 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/openclaw-state/workspace",
+      "agentRuntime": {
+        "id": "claude-cli"
+      },
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-6"
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "your-gateway-token-here"
+    },
+    "port": 18789,
+    "bind": "lan"
+  },
+  "channels": {
+    "discord": {
+      "enabled": true,
+      "token": "your-discord-bot-token-here",
+      "groupPolicy": "allowlist",
+      "guilds": {
+        "*": {
+          "requireMention": false
+        }
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "anthropic": {
+        "enabled": true
+      }
+    }
+  }
+}
