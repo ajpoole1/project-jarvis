@@ -9,7 +9,7 @@ import sqlite3
 import subprocess
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import anthropic
@@ -1174,11 +1174,14 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
 
     last_checked_str = get_heartbeat_state(con, "last_checked")
     if not last_checked_str:
-        set_heartbeat_state(con, "last_checked", datetime.utcnow().isoformat())
+        set_heartbeat_state(con, "last_checked", datetime.now(UTC).isoformat())
         return "SILENT"
 
-    since_epoch = int(datetime.fromisoformat(last_checked_str).timestamp())
-    now = datetime.utcnow()
+    dt = datetime.fromisoformat(last_checked_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    since_epoch = int(dt.timestamp())
+    now = datetime.now(UTC)
     messages = fetch_new_messages(service, since_epoch, batch_size)
     set_heartbeat_state(con, "last_checked", now.isoformat())
 
