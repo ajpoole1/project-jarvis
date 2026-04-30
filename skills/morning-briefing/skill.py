@@ -180,7 +180,7 @@ def _pop_digest_queue() -> dict:
     return {"count": len(queue), "breakdown": breakdown}
 
 
-def run() -> str:
+def run() -> list[str]:
     client = anthropic.Anthropic()
     interests = _load_interests()
 
@@ -191,20 +191,17 @@ def run() -> str:
     priority_text = _run_gmail_heartbeat()
     digest = _pop_digest_queue()
 
+    # --- msg1: Sonnet-generated opening (greeting + weather + calendar + inbox) ---
     context_parts = []
-
     if weather:
         context_parts.append(f"WEATHER: {weather}")
-
     context_parts.append(
         f"CALENDAR TODAY:\n{calendar_text}"
         if calendar_text
         else "CALENDAR TODAY: Nothing scheduled."
     )
-
     if priority_text:
         context_parts.append(f"PRIORITY INBOX (needs attention):\n{priority_text}")
-
     if digest["count"] > 0:
         breakdown_str = ", ".join(
             f"{count} {action}" for action, count in digest["breakdown"].items()
@@ -216,12 +213,31 @@ def run() -> str:
     else:
         context_parts.append("INBOX QUEUE: Clear.")
 
-    if world_news:
-        lines = [f"• {title} | {link}" if link else f"• {title}" for title, link in world_news]
-        context_parts.append("WORLD NEWS:\n" + "\n".join(lines))
+    prompt = (
+        "You are Jarvis, AJ's personal assistant. Write a brief morning briefing based on the data below. "
+        "Format for Discord: **bold** section headers, bullet points. One short greeting line to open. "
+        "Keep it tight — AJ reads this first thing, surface what matters and cut filler.\n\n"
+        + "\n\n".join(context_parts)
+    )
+    response = client.messages.create(
+        model=SONNET_MODEL,
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    msg1 = response.content[0].text.strip()
 
+    # --- msg2: world news (direct format) ---
+    msg2 = ""
+    if world_news:
+        lines = ["**World News**"]
+        for title, link in world_news:
+            lines.append(f"• [{title}](<{link}>)" if link else f"• {title}")
+        msg2 = "\n".join(lines)
+
+    # --- msg3: interest articles (direct format) ---
+    msg3 = ""
     if interest_articles:
-        lines = []
+        lines = ["**Today's Reading**"]
         for topic, title, link, source in interest_articles:
             if link and source:
                 ref = f"([{source}](<{link}>))"
@@ -229,30 +245,11 @@ def run() -> str:
                 ref = f"(<{link}>)"
             else:
                 ref = ""
-            lines.append(f"• [{topic}] {title} {ref}".strip())
-        context_parts.append("INTEREST ARTICLES:\n" + "\n".join(lines))
+            lines.append(f"• **[{topic}]** {title} {ref}".strip())
+        msg3 = "\n".join(lines)
 
-    context = "\n\n".join(context_parts)
-
-    prompt = (
-        "You are Jarvis, AJ's personal assistant. Write a brief morning briefing based on the data below. "
-        "Format for Discord: **bold** section headers, bullet points. One short greeting line to open. "
-        "Keep it tight — AJ reads this first thing, so surface what matters and cut filler. "
-        "For world news, write one short sentence per item summarising the story — don't repeat the headline verbatim — "
-        "and include the link after in the format: (<url>). "
-        "For interest articles, summarise each story in one sentence and preserve the source attribution "
-        "at the end exactly as formatted (e.g. ([Tom's Hardware](<url>))).\n\n"
-        f"{context}"
-    )
-
-    response = client.messages.create(
-        model=SONNET_MODEL,
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    return response.content[0].text.strip()
+    return [m for m in [msg1, msg2, msg3] if m]
 
 
 if __name__ == "__main__":
-    print(run())
+    print("---SPLIT---".join(run()))
