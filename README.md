@@ -8,9 +8,13 @@ This is an active portfolio project. Logic is public; personal data stays local.
 
 ## What it does today
 
-- **Reads and triages Gmail** using Claude Haiku as a classifier. Sender rules are cached in SQLite so repeat senders never hit the API. New senders are classified, staged, and surfaced to Discord for approval before anything is touched. Nothing executes without an explicit confirm.
+- **Triages Gmail** using Claude Haiku as a classifier. Sender rules are cached in SQLite — repeat senders never hit the API. New senders are classified and staged to Discord for approval before anything is touched. Supports watch rules (semantic alerts on named criteria), archive expiry (per-tag retention policies), real HTTP unsubscribes (RFC 8058 one-click POST + GET fallback), and a flag-and-remove flow for emails Haiku can't confidently classify. Nothing executes without an explicit confirm.
+
 - **Reads and writes Google Calendar** across personal and shared family calendars. Returns formatted daily/weekly views to Discord. Feeds upcoming events into the Gmail classifier so appointment confirmation emails are archived automatically.
-- **Runs on a heartbeat** — checks Gmail 3× per day during waking hours and only reaches out if there's something actionable. Stays silent otherwise.
+
+- **Runs a heartbeat** every 10 minutes during waking hours. Stays silent unless there's something actionable — priority emails, watch rule matches, or uncertain emails needing a decision. Non-priority emails accumulate in a digest queue posted at 13:00 and 18:00.
+
+- **Posts a daily briefing at 7am** via cron: weather, today's calendar, overnight priority inbox, BBC headlines, and personalized news by topic. Single Sonnet call, always posted verbatim to Discord.
 
 ---
 
@@ -18,7 +22,7 @@ This is an active portfolio project. Logic is public; personal data stays local.
 
 **Stage then approve.** The agent never takes an irreversible action without a human checkpoint. Propose, present, wait. This applies to email deletion, event creation, anything with consequences. Enforced at the skill level — it can't be bypassed by a confused agent.
 
-**Graceful degradation.** Never fail silently. If a skill can't run, surface the problem. If a classification is uncertain, flag it rather than guess. Always leave the user better off than before the run.
+**Graceful degradation.** Never fail silently. If a skill can't run, surface the problem. If a classification is uncertain, flag it for the user rather than guess. Always leave the user better off than before the run.
 
 **Single surface.** Everything flows through Discord. No separate apps, no dashboards to check. One place, one context.
 
@@ -38,7 +42,7 @@ This is an active portfolio project. Logic is public; personal data stays local.
 ┌──────────────────▼──────────────────┐
 │  OpenClaw (agent runtime)           │
 │  Claude Sonnet · workspace context  │
-│  Heartbeat poller · Discord gateway │
+│  Discord gateway                    │
 └──────────────────┬──────────────────┘
                    │ bash
 ┌──────────────────▼──────────────────┐
@@ -52,12 +56,14 @@ This is an active portfolio project. Logic is public; personal data stays local.
 └─────────────────────────────────────┘
 ```
 
+Scheduled tasks (heartbeat, digest, briefing) run via WSL cron and post to Discord directly via webhook — they do not go through OpenClaw.
+
 ### Infrastructure layers
 
 | Layer | Where | What runs |
 |---|---|---|
-| Local brain | Windows PC / WSL2 | OpenClaw, Python skills, SQLite |
-| Cloud brain | Hetzner VPS + Cloudflare tunnel *(Phase 4)* | Discord bot, job scraper, morning briefing |
+| Local brain | Windows PC / WSL2 | OpenClaw, Python skills, SQLite, cron |
+| Cloud brain | Hetzner VPS + Cloudflare tunnel *(Phase 4)* | Discord bot, job scraper |
 | Hardware controller | Raspberry Pi 5 *(Phase 4)* | Home Assistant, Zigbee2MQTT, irrigation DAGs |
 
 ### Key decisions
@@ -76,7 +82,7 @@ This is an active portfolio project. Logic is public; personal data stays local.
 |---|---|---|
 | Phase 1 | ✅ Done | Foundation — OpenClaw, Discord bot, dev environment |
 | Phase 2 | 🔄 In progress | Core integrations — Gmail, Calendar, Home Assistant, Spotify |
-| Phase 3 | 🔲 Planned | Agentic skills — morning briefing, job search, garden planning |
+| Phase 3 | 🔄 In progress | Agentic skills — morning briefing ✅, job search, garden planning |
 | Phase 4 | 🔲 Planned | Infrastructure — VPS migration, Raspberry Pi deployment, Tailscale mesh |
 | Phase 5 | 🔲 Planned | Jarvis Android app (Flutter, sideloaded APK) |
 
@@ -86,16 +92,15 @@ This is an active portfolio project. Logic is public; personal data stays local.
 
 | Skill | Status | Description |
 |---|---|---|
-| `gmail-cleanup` | ✅ Live | Haiku classifier, SQLite rule cache, stage/execute/adjust flow, Calendar integration |
+| `gmail-cleanup` | ✅ Live | Haiku classifier, SQLite rule cache, stage/execute/adjust, watch rules, archive expiry, flag-and-remove, real unsubscribe |
 | `calendar` | ✅ Live | Google Calendar read/write, multi-calendar, Discord formatting, JSON output for integrations |
-| `morning-briefing` | 🔲 Planned | Daily 9am Sonnet call: calendar events, inbox flags, overnight activity |
+| `morning-briefing` | ✅ Live | Daily 7am briefing: weather, calendar, priority inbox, BBC headlines, personalized news |
 | `home-assistant` | 🔲 Planned | Control lights, fan, cameras via HA REST API |
 | `spotify` | 🔲 Planned | Playback control, queue management |
 | `job-search` | 🔲 Planned | Scrape listings, deduplicate via SQLite, surface matches |
 | `garden` | 🔲 Planned | Hardiness zone 4-5 planting calendar, irrigation scheduling via Pi GPIO |
 | `notes` | 🔲 Planned | Quick capture to SQLite, searchable via Discord |
 | `tasks` | 🔲 Planned | Task tracking with Discord interface |
-| `browser-automation` | 🔲 Planned | Form filling, login flows, scraping |
 | `pc-control` | 🔲 Planned | Shutdown, sleep, app control via WSL |
 
 ---
@@ -109,8 +114,8 @@ This is an active portfolio project. Logic is public; personal data stays local.
 | Skill language | Python 3.12 |
 | Persistent memory | SQLite |
 | Control surface | Discord |
-| Smart home | Home Assistant + Zigbee2MQTT |
-| Automation | Apache Airflow *(Phase 4)* |
+| Scheduled tasks | WSL cron → Discord webhook |
+| Smart home | Home Assistant + Zigbee2MQTT *(Phase 4)* |
 | CI/CD | GitHub Actions — security scan, ruff + pytest, docker validation |
 
 ---
@@ -153,9 +158,11 @@ See each skill's `README.md` for credential setup and first-run instructions.
 
 ```
 jarvis/
+├── scripts/               # Cron scripts — heartbeat, digest, briefing
 ├── skills/
 │   ├── gmail-cleanup/     # Gmail classifier and triage
-│   └── calendar/          # Google Calendar read/write
+│   ├── calendar/          # Google Calendar read/write
+│   └── morning-briefing/  # Daily 7am Discord briefing
 ├── config/
 │   ├── personal/          # gitignored — OAuth tokens, personal config
 │   └── examples/          # committed — fake data showing structure

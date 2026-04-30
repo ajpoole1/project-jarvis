@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -161,6 +162,8 @@ class EmailSummary:
     reason: str
     tag: str = "none"
     calendar_hint: bool = field(default=False)
+    watch_label: str = ""
+    uncertain: bool = False
 
 
 def get_gmail_service():
@@ -207,6 +210,33 @@ def init_db():
             value TEXT NOT NULL
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_watches (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            label       TEXT NOT NULL,
+            description TEXT NOT NULL,
+            active      INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_expire_policies (
+            tag         TEXT PRIMARY KEY,
+            retain_days INTEGER NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_flagged (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            msg_id       TEXT UNIQUE NOT NULL,
+            sender_email TEXT NOT NULL,
+            sender       TEXT NOT NULL,
+            subject      TEXT NOT NULL,
+            snippet      TEXT,
+            reason       TEXT,
+            flagged_at   TEXT DEFAULT (datetime('now'))
+        )
+    """)
     con.commit()
     return con
 
@@ -222,6 +252,88 @@ def set_heartbeat_state(con: sqlite3.Connection, key: str, value: str):
         (key, value),
     )
     con.commit()
+
+
+def add_watch(con: sqlite3.Connection, label: str, description: str) -> str:
+    con.execute(
+        "INSERT INTO gmail_watches (label, description) VALUES (?, ?)",
+        (label, description),
+    )
+    con.commit()
+    row_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return f"Watch rule #{row_id} added: [{label}] — {description}"
+
+
+def list_watches(con: sqlite3.Connection) -> str:
+    rows = con.execute(
+        "SELECT id, label, description, active FROM gmail_watches ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return "No watch rules set. Use `gmail watch add <label> <description>` to create one."
+    lines = ["**Gmail watch rules**\n"]
+    for row_id, label, description, active in rows:
+        status = "active" if active else "paused"
+        lines.append(f"  #{row_id} [{label}] — {description} ({status})")
+    return "\n".join(lines)
+
+
+def remove_watch(con: sqlite3.Connection, watch_id: int) -> str:
+    cursor = con.execute("DELETE FROM gmail_watches WHERE id = ?", (watch_id,))
+    con.commit()
+    return f"Watch rule #{watch_id} removed." if cursor.rowcount else f"No watch rule #{watch_id}."
+
+
+def pause_watch(con: sqlite3.Connection, watch_id: int) -> str:
+    cursor = con.execute("UPDATE gmail_watches SET active = 0 WHERE id = ?", (watch_id,))
+    con.commit()
+    return f"Watch rule #{watch_id} paused." if cursor.rowcount else f"No watch rule #{watch_id}."
+
+
+def resume_watch(con: sqlite3.Connection, watch_id: int) -> str:
+    cursor = con.execute("UPDATE gmail_watches SET active = 1 WHERE id = ?", (watch_id,))
+    con.commit()
+    return f"Watch rule #{watch_id} resumed." if cursor.rowcount else f"No watch rule #{watch_id}."
+
+
+def check_watches(summaries: list[EmailSummary], watches: list[dict]) -> None:
+    """Semantically match emails against active watch rules using Haiku. Mutates watch_label in-place."""
+    if not watches or not summaries:
+        return
+
+    client = anthropic.Anthropic()
+    watch_lines = "\n".join(
+        f'{i + 1}. [{w["label"]}]: "{w["description"]}"' for i, w in enumerate(watches)
+    )
+    email_lines = "\n".join(
+        f'{i + 1}. From: "{s.sender}" <{s.sender_email}> | Subject: {s.subject}'
+        for i, s in enumerate(summaries)
+    )
+    prompt = (
+        "Check each email against the watch rules below. "
+        "Match only when you are confident the email fits the rule's description.\n\n"
+        f"Watch rules:\n{watch_lines}\n\n"
+        f"Emails:\n{email_lines}\n\n"
+        "Return a JSON array of matches (empty array [] if none). "
+        "Use 1-based email indexes:\n"
+        '[{"email_idx": 1, "watch_label": "label_name"}, ...]'
+    )
+    response = client.messages.create(
+        model=HAIKU_MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    try:
+        matches = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    for match in matches:
+        idx = match.get("email_idx", 0) - 1
+        label = match.get("watch_label", "")
+        if 0 <= idx < len(summaries) and label:
+            summaries[idx].watch_label = label
 
 
 def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
@@ -469,8 +581,9 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             "\nSet calendar_hint: true whenever the email contains scheduling information (date, time, location) for an appointment, booking, or event not already on the calendar — "
             "use the Preview field if the subject alone is ambiguous.\n"
             "\nAlso assign a tag from: receipts, bills, job-search, health, family, projects, none\n"
+            "\nSet uncertain: true if you genuinely cannot determine the correct action and want a human to decide.\n"
             "\nRespond with a JSON array, one object per email, in the same order:\n"
-            '[{"action": "keep", "tag": "health", "reason": "brief reason", "calendar_hint": true}, ...]\n'
+            '[{"action": "keep", "tag": "health", "reason": "brief reason", "calendar_hint": true, "uncertain": false}, ...]\n'
             f"\nEmails:\n{batch_input}"
         )
         return "\n".join(parts)
@@ -494,7 +607,7 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             classifications = json.loads(raw)
         except json.JSONDecodeError:
             classifications = [
-                {"action": "keep", "reason": "parse error — defaulting to keep"} for _ in chunk
+                {"action": "keep", "reason": "parse error", "uncertain": True} for _ in chunk
             ]
 
         for (msg_id, name, email, subject, _snippet), cls in zip(
@@ -506,6 +619,7 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             tag = cls.get("tag", "none")
             if tag not in TAGS:
                 tag = "none"
+            uncertain = bool(cls.get("uncertain", False))
             results.append(
                 EmailSummary(
                     msg_id=msg_id,
@@ -516,9 +630,10 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
                     reason=cls.get("reason", ""),
                     tag=tag,
                     calendar_hint=bool(cls.get("calendar_hint", False)),
+                    uncertain=uncertain,
                 )
             )
-            if email not in NEVER_CACHE_SENDERS:
+            if not uncertain and email not in NEVER_CACHE_SENDERS:
                 cache_rule(con, email, action, confirmed=False)
 
     return results
@@ -578,6 +693,64 @@ def get_or_create_labels(service) -> dict[str, str]:
             )
             label_map[tag] = created["id"]
     return label_map
+
+
+def attempt_unsubscribe(service, msg_id: str) -> str:
+    """Fetch List-Unsubscribe header and attempt a real unsubscribe. Returns status string."""
+    try:
+        msg = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=msg_id,
+                format="metadata",
+                metadataHeaders=["List-Unsubscribe", "List-Unsubscribe-Post"],
+            )
+            .execute()
+        )
+        headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+        unsub_header = headers.get("List-Unsubscribe", "")
+        post_header = headers.get("List-Unsubscribe-Post", "")
+
+        if not unsub_header:
+            return "no List-Unsubscribe header"
+
+        http_url = None
+        for part in unsub_header.split(","):
+            part = part.strip().strip("<>")
+            if part.startswith("http"):
+                http_url = part
+                break
+
+        if not http_url:
+            return "only mailto: available — skipped"
+
+        if "List-Unsubscribe=One-Click" in post_header:
+            req = urllib.request.Request(
+                http_url,
+                data=b"List-Unsubscribe=One-Click",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+            return "one-click POST sent"
+
+        urllib.request.urlopen(http_url, timeout=10)
+        return "GET sent"
+
+    except Exception as exc:
+        return f"failed: {exc!s:.60}"
+
+
+def run_unsubscribes(service, summaries: list[EmailSummary]) -> list[tuple[str, str]]:
+    """Attempt real unsubscribe for every unsubscribe-action email.
+    Returns (sender_email, status) pairs."""
+    return [
+        (s.sender_email, attempt_unsubscribe(service, s.msg_id))
+        for s in summaries
+        if s.action == "unsubscribe"
+    ]
 
 
 def execute_actions(
@@ -681,10 +854,16 @@ def cmd_execute() -> str:
     label_map = get_or_create_labels(service)
     non_keep = [s for s in summaries if s.action != "keep"]
     keep = [s for s in summaries if s.action == "keep"]
+    unsub_results = run_unsubscribes(service, non_keep)
     execute_actions(service, non_keep + keep, con, label_map)
     clear_pending(con)
     actioned = len(non_keep)
-    return f"Done. {actioned} email{'s' if actioned != 1 else ''} actioned, {len(keep)} kept."
+    lines = [f"Done. {actioned} email{'s' if actioned != 1 else ''} actioned, {len(keep)} kept."]
+    if unsub_results:
+        lines.append(f"\n**Unsubscribe attempts ({len(unsub_results)})**")
+        for sender, status in unsub_results:
+            lines.append(f"  • {sender}: {status}")
+    return "\n".join(lines)
 
 
 def cmd_cancel() -> str:
@@ -744,6 +923,242 @@ def fetch_body(service, msg_id: str, max_chars: int = 1500) -> str:
     return (body or msg.get("snippet", ""))[:max_chars].strip()
 
 
+def save_flagged(con: sqlite3.Connection, summaries: list[EmailSummary]) -> list[int]:
+    """Persist uncertain emails to gmail_flagged. Returns list of assigned IDs."""
+    ids = []
+    for s in summaries:
+        con.execute(
+            """INSERT OR IGNORE INTO gmail_flagged
+               (msg_id, sender_email, sender, subject, reason)
+               VALUES (?, ?, ?, ?, ?)""",
+            (s.msg_id, s.sender_email, s.sender, s.subject, s.reason),
+        )
+        row = con.execute("SELECT id FROM gmail_flagged WHERE msg_id = ?", (s.msg_id,)).fetchone()
+        if row:
+            ids.append(row[0])
+    con.commit()
+    return ids
+
+
+def list_flagged(con: sqlite3.Connection) -> str:
+    rows = con.execute(
+        "SELECT id, sender, subject, reason, flagged_at FROM gmail_flagged ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return "No flagged emails."
+    lines = ["**Flagged emails — need your decision**\n"]
+    for row_id, sender, subject, reason, flagged_at in rows:
+        date = flagged_at[:10] if flagged_at else ""
+        lines.append(f"  #{row_id} {sender} — {subject[:60]}")
+        if reason:
+            lines.append(f"       _{reason}_")
+        if date:
+            lines.append(f"       flagged {date}")
+    lines.append(f"\nUse `gmail flag decide <#> <action>` — actions: {', '.join(ACTIONS)}")
+    return "\n".join(lines)
+
+
+def decide_flagged(service, con: sqlite3.Connection, flag_id: int, action: str) -> str:
+    if action not in ACTIONS:
+        return f"Unknown action '{action}'. Choose from: {', '.join(ACTIONS)}"
+    row = con.execute(
+        "SELECT msg_id, sender_email, sender, subject FROM gmail_flagged WHERE id = ?",
+        (flag_id,),
+    ).fetchone()
+    if not row:
+        return f"No flagged email #{flag_id}."
+    msg_id, sender_email, sender, subject = row
+    summary = EmailSummary(
+        msg_id=msg_id,
+        sender=sender,
+        sender_email=sender_email,
+        subject=subject,
+        action=action,
+        reason="user decision",
+    )
+    execute_actions(service, [summary], con)
+    con.execute("DELETE FROM gmail_flagged WHERE id = ?", (flag_id,))
+    con.commit()
+    return f"#{flag_id} {sender} — {subject[:60]}\nDecision: {action}. Rule confirmed."
+
+
+def clear_flagged(con: sqlite3.Connection) -> str:
+    cursor = con.execute("DELETE FROM gmail_flagged")
+    con.commit()
+    return (
+        f"Cleared {cursor.rowcount} flagged email{'s' if cursor.rowcount != 1 else ''} — nothing was executed."
+        if cursor.rowcount
+        else "No flagged emails to clear."
+    )
+
+
+def cmd_flag(args: list[str]) -> str:
+    """Manage flagged uncertain emails. Subcommands: list, decide, clear."""
+    con = init_db()
+    sub = args[0] if args else "list"
+
+    if sub == "list" or not args:
+        return list_flagged(con)
+    elif sub == "decide":
+        if len(args) < 3:
+            return "Usage: flag decide <#> <action>"
+        try:
+            flag_id = int(args[1])
+        except ValueError:
+            return "Flag ID must be a number."
+        service = get_gmail_service()
+        return decide_flagged(service, con, flag_id, args[2])
+    elif sub == "clear":
+        return clear_flagged(con)
+    else:
+        return f"Unknown subcommand '{sub}'. Use: list, decide, clear"
+
+
+def set_expire_policy(con: sqlite3.Connection, tag: str, retain_days: int) -> str:
+    if tag not in TAGS:
+        return f"Unknown tag '{tag}'. Valid tags: {', '.join(t for t in TAGS if t != 'none')}"
+    if retain_days <= 0:
+        return "retain_days must be a positive integer."
+    con.execute(
+        "INSERT OR REPLACE INTO gmail_expire_policies (tag, retain_days) VALUES (?, ?)",
+        (tag, retain_days),
+    )
+    con.commit()
+    return f"Expiry policy set: [{tag}] → {retain_days} days"
+
+
+def list_expire_policies(con: sqlite3.Connection) -> str:
+    rows = con.execute("SELECT tag, retain_days FROM gmail_expire_policies ORDER BY tag").fetchall()
+    if not rows:
+        return (
+            "No expiry policies set. Use `gmail expire set <tag> <days>` to configure one.\n"
+            f"Valid tags: {', '.join(t for t in TAGS if t != 'none')}"
+        )
+    lines = ["**Gmail archive expiry policies**\n"]
+    for tag, days in rows:
+        lines.append(f"  [{tag}]: trash after {days} days")
+    lines.append("\nAny tag without a policy is kept forever.")
+    return "\n".join(lines)
+
+
+def remove_expire_policy(con: sqlite3.Connection, tag: str) -> str:
+    cursor = con.execute("DELETE FROM gmail_expire_policies WHERE tag = ?", (tag,))
+    con.commit()
+    return (
+        f"Expiry policy removed for [{tag}] — emails with this tag now kept forever."
+        if cursor.rowcount
+        else f"No policy set for [{tag}]."
+    )
+
+
+def run_expire_purge(service, con: sqlite3.Connection, dry_run: bool = False) -> str:
+    """Trash archived emails that exceed their tag's retention period."""
+    rows = con.execute("SELECT tag, retain_days FROM gmail_expire_policies ORDER BY tag").fetchall()
+    if not rows:
+        return "No expiry policies configured. Use `gmail expire set <tag> <days>`."
+
+    total = 0
+    lines = []
+    for tag, days in rows:
+        query = f"label:jarvis/{tag} -in:inbox -in:trash -in:spam older_than:{days}d"
+        count = 0
+        page_token = None
+        while True:
+            kwargs = {"userId": "me", "q": query, "maxResults": 500}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            result = service.users().messages().list(**kwargs).execute()
+            messages = result.get("messages", [])
+            if not messages:
+                break
+            if not dry_run:
+                for msg in messages:
+                    service.users().messages().trash(userId="me", id=msg["id"]).execute()
+            count += len(messages)
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        if count:
+            verb = "would be trashed" if dry_run else "trashed"
+            lines.append(
+                f"  [{tag}]: {count} email{'s' if count != 1 else ''} {verb} (>{days}d old)"
+            )
+            total += count
+
+    if not lines:
+        return "Nothing to expire — no archived emails exceed their retention period."
+
+    prefix = (
+        "**Expire preview** (dry run — nothing changed)\n" if dry_run else "**Expire complete**\n"
+    )
+    suffix = f"\nTotal: {total} email{'s' if total != 1 else ''}"
+    return prefix + "\n".join(lines) + suffix
+
+
+def cmd_expire(args: list[str]) -> str:
+    """Manage archive expiry policies. Subcommands: set, list, remove, run, preview."""
+    con = init_db()
+    sub = args[0] if args else "list"
+
+    if sub == "list" or not args:
+        return list_expire_policies(con)
+    elif sub == "set":
+        if len(args) < 3:
+            return "Usage: expire set <tag> <days>"
+        try:
+            days = int(args[2])
+        except ValueError:
+            return "days must be a positive integer."
+        return set_expire_policy(con, args[1], days)
+    elif sub == "remove":
+        if len(args) < 2:
+            return "Usage: expire remove <tag>"
+        return remove_expire_policy(con, args[1])
+    elif sub in ("run", "preview"):
+        service = get_gmail_service()
+        return run_expire_purge(service, con, dry_run=(sub == "preview"))
+    else:
+        return f"Unknown subcommand '{sub}'. Use: set, list, remove, run, preview"
+
+
+def cmd_watch(args: list[str]) -> str:
+    """Manage Gmail watch rules. Subcommands: add, list, remove, pause, resume."""
+    con = init_db()
+    sub = args[0] if args else "list"
+
+    if sub == "list" or not args:
+        return list_watches(con)
+    elif sub == "add":
+        if len(args) < 3:
+            return 'Usage: watch add <label> "<description>"'
+        label = args[1]
+        description = " ".join(args[2:])
+        return add_watch(con, label, description)
+    elif sub == "remove":
+        if len(args) < 2:
+            return "Usage: watch remove <id>"
+        try:
+            return remove_watch(con, int(args[1]))
+        except ValueError:
+            return "Watch rule ID must be a number."
+    elif sub == "pause":
+        if len(args) < 2:
+            return "Usage: watch pause <id>"
+        try:
+            return pause_watch(con, int(args[1]))
+        except ValueError:
+            return "Watch rule ID must be a number."
+    elif sub == "resume":
+        if len(args) < 2:
+            return "Usage: watch resume <id>"
+        try:
+            return resume_watch(con, int(args[1]))
+        except ValueError:
+            return "Watch rule ID must be a number."
+    else:
+        return f"Unknown subcommand '{sub}'. Use: add, list, remove, pause, resume"
+
+
 def cmd_body(msg_id: str) -> str:
     """Fetch and return the plain-text body of an email by message ID."""
     if not msg_id:
@@ -771,8 +1186,25 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
         return "SILENT"
 
     summaries = classify_emails(messages, con)
-    priority = [s for s in summaries if _is_priority(s)]
-    digest_items = [s for s in summaries if not _is_priority(s) and s.action != "keep"]
+
+    active_watches = con.execute(
+        "SELECT label, description FROM gmail_watches WHERE active = 1"
+    ).fetchall()
+    if active_watches:
+        check_watches(summaries, [{"label": w[0], "description": w[1]} for w in active_watches])
+
+    uncertain = [s for s in summaries if s.uncertain]
+    if uncertain:
+        flag_ids = save_flagged(con, uncertain)
+        for s, fid in zip(uncertain, flag_ids, strict=False):
+            s.watch_label = f"flagged #{fid}"
+
+    priority = [s for s in summaries if _is_priority(s) or s.watch_label]
+    digest_items = [
+        s
+        for s in summaries
+        if not _is_priority(s) and not s.watch_label and not s.uncertain and s.action != "keep"
+    ]
 
     output_parts = []
 
@@ -780,7 +1212,13 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
         lines = ["IMMEDIATE:"]
         for s in priority:
             cal = " [needs calendar]" if s.calendar_hint else ""
-            lines.append(f"  • {s.sender} — {s.subject[:70]}{cal} [{s.tag}]")
+            if s.uncertain:
+                annotation = f" [{s.watch_label} — decide?]"
+            elif s.watch_label:
+                annotation = f" [watch: {s.watch_label}]"
+            else:
+                annotation = ""
+            lines.append(f"  • {s.sender} — {s.subject[:70]}{cal}{annotation} [{s.tag}]")
         lines.append("\nReply **gmail stage** to run full cleanup.")
         output_parts.append("\n".join(lines))
 
@@ -929,6 +1367,9 @@ def drain(batch_size: int = DEFAULT_BATCH_SIZE):
         if not non_keep:
             print(f"Pass {run_count}: {len(summaries)} emails, all keep. Inbox is clean.")
             break
+        unsub_results = run_unsubscribes(service, non_keep)
+        for sender, status in unsub_results:
+            print(f"  unsub {sender}: {status}")
         execute_actions(service, summaries, con, label_map)
         total_actioned += len(non_keep)
         keep_count = len(summaries) - len(non_keep)
@@ -979,6 +1420,12 @@ if __name__ == "__main__":
     elif cmd == "body":
         msg_id = sys.argv[2] if len(sys.argv) > 2 else ""
         print(cmd_body(msg_id))
+    elif cmd == "watch":
+        print(cmd_watch(sys.argv[2:]))
+    elif cmd == "expire":
+        print(cmd_expire(sys.argv[2:]))
+    elif cmd == "flag":
+        print(cmd_flag(sys.argv[2:]))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
