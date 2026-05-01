@@ -424,6 +424,8 @@ def _looks_automated(email: str) -> bool:
 
 
 def _is_priority(summary: EmailSummary) -> bool:
+    if summary.action == "trash":
+        return False
     if summary.tag in PRIORITY_TAGS:
         return True
     if summary.calendar_hint:
