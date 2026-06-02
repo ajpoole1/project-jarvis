@@ -15,7 +15,7 @@ import feedparser
 import requests
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parents[2] / ".env")
+load_dotenv(Path.home() / ".jarvis.env")
 
 SONNET_MODEL = "claude-sonnet-4-6"
 DATA_DIR = Path(os.environ.get("JARVIS_DATA_DIR", "/data"))
@@ -211,6 +211,44 @@ def _pop_digest_queue() -> dict:
     return {"count": len(queue), "breakdown": breakdown}
 
 
+def _get_upcoming_deadlines(days: int = 14) -> str:
+    """Return a formatted string of deadlines due within the next N days."""
+    if not DB_PATH.exists():
+        return ""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(
+            """SELECT title, due_date, project, days_until
+               FROM (
+                   SELECT title, due_date, project,
+                          CAST(julianday(due_date) - julianday('now', 'localtime') AS INTEGER) AS days_until
+                   FROM deadlines
+                   WHERE completed = 0
+               )
+               WHERE days_until <= ?
+               ORDER BY due_date ASC""",
+            (days,),
+        ).fetchall()
+        con.close()
+        if not rows:
+            return ""
+        lines = []
+        for title, due_date_str, project, delta in rows:
+            proj_label = f" [{project}]" if project else ""
+            if delta < 0:
+                urgency = f"OVERDUE by {-delta}d"
+            elif delta == 0:
+                urgency = "due TODAY"
+            elif delta == 1:
+                urgency = "due TOMORROW"
+            else:
+                urgency = f"due in {delta}d ({due_date_str})"
+            lines.append(f"• {title}{proj_label} — {urgency}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def run() -> list[str]:
     if _check_and_stamp_run():
         return []  # already ran within the last hour — suppress duplicate
@@ -224,6 +262,7 @@ def run() -> list[str]:
     interest_articles = _get_interest_articles(interests)
     priority_text = _run_gmail_heartbeat()
     digest = _pop_digest_queue()
+    deadlines_text = _get_upcoming_deadlines(days=14)
 
     # --- msg1: Sonnet-generated opening (greeting + weather + calendar + inbox) ---
     context_parts = []
@@ -234,6 +273,8 @@ def run() -> list[str]:
         if calendar_text
         else "CALENDAR TODAY: Nothing scheduled."
     )
+    if deadlines_text:
+        context_parts.append(f"UPCOMING DEADLINES (next 14 days):\n{deadlines_text}")
     if priority_text:
         context_parts.append(f"PRIORITY INBOX (needs attention):\n{priority_text}")
     if digest["count"] > 0:

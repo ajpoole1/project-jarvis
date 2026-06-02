@@ -207,6 +207,19 @@ Only `confirmed=1` rules are used as cache hits. Uncertain emails are never cach
 | `reason` | TEXT | Haiku's uncertainty reason |
 | `flagged_at` | TEXT | ISO datetime |
 
+### `deadlines`
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Auto-increment ID — used in `tasks complete` |
+| `title` | TEXT | Deadline description |
+| `due_date` | TEXT | ISO date YYYY-MM-DD |
+| `project` | TEXT | Category (e.g. `school`, `altaforma`) |
+| `notes` | TEXT | Context for Jarvis — what the deadline gates |
+| `completed` | INTEGER | 0 = pending, 1 = done |
+| `created_at` | TEXT | ISO datetime |
+
+Owned by the `tasks` skill. Created by `init_db()` here so the morning briefing can query it from the shared DB without a cross-skill dependency.
+
 ## Personal classification rules
 
 Subject-conditional sender rules, always-keep names, and `NEVER_CACHE_SENDERS` live in `JARVIS_CONFIG_DIR/gmail_rules.json` — gitignored.

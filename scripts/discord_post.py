@@ -8,7 +8,7 @@ import urllib.request
 from pathlib import Path
 
 # Manual .env parse — stdlib only, no dotenv dependency
-_env_path = Path(__file__).parents[1] / ".env"
+_env_path = Path.home() / ".jarvis.env"
 if _env_path.exists():
     for _line in _env_path.read_text().splitlines():
         _line = _line.strip()

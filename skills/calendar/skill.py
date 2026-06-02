@@ -15,7 +15,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-load_dotenv(Path(__file__).parents[2] / ".env")
+load_dotenv(Path.home() / ".jarvis.env")
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
@@ -196,6 +196,7 @@ def cmd_add(
     time_str: str = "",
     duration_min: int = 60,
     calendar_id: str = "primary",
+    recurrence: str = "",
 ) -> str:
     tz = _tz()
     try:
@@ -223,15 +224,21 @@ def cmd_add(
             "end": {"date": next_day.isoformat()},
         }
 
+    if recurrence:
+        # Accept bare RRULE string or prefixed — normalise to prefixed form
+        rule = recurrence if recurrence.startswith("RRULE:") else f"RRULE:{recurrence}"
+        body["recurrence"] = [rule]
+
     event = service.events().insert(calendarId=calendar_id, body=body).execute()
     start_label = event["start"].get("dateTime", event["start"].get("date", ""))
-    return f"Event created: **{title}** on {start_label}\n{event.get('htmlLink', '')}"
+    recur_label = f" (recurring: {recurrence})" if recurrence else ""
+    return f"Event created: **{title}** on {start_label}{recur_label}\n{event.get('htmlLink', '')}"
 
 
 def cmd_calendars(service) -> str:
     """List all calendars — use this to find IDs for GOOGLE_CALENDAR_IDS."""
     result = service.calendarList().list().execute()
-    lines = ["**Your calendars** (add IDs to GOOGLE_CALENDAR_IDS in .env)\n"]
+    lines = ["**Your calendars** (add IDs to GOOGLE_CALENDAR_IDS in ~/.jarvis.env)\n"]
     for cal in result.get("items", []):
         primary = " ← primary" if cal.get("primary") else ""
         lines.append(f"  • {cal['summary']}{primary}")
@@ -255,19 +262,23 @@ if __name__ == "__main__":
         print(cmd_upcoming(service, days))
     elif cmd == "add":
         if len(sys.argv) < 4:
-            print("Usage: skill.py add <title> <YYYY-MM-DD> [HH:MM] [duration_min] [calendar_id]")
+            print(
+                "Usage: skill.py add <title> <YYYY-MM-DD> [HH:MM] [duration_min] [calendar_id] [RRULE]"
+            )
             sys.exit(1)
         title = sys.argv[2]
         date_arg = sys.argv[3]
         time_arg = sys.argv[4] if len(sys.argv) > 4 else ""
         dur = int(sys.argv[5]) if len(sys.argv) > 5 else 60
         cal = sys.argv[6] if len(sys.argv) > 6 else "primary"
-        print(cmd_add(service, title, date_arg, time_arg, dur, cal))
+        rrule = sys.argv[7] if len(sys.argv) > 7 else ""
+        print(cmd_add(service, title, date_arg, time_arg, dur, cal, rrule))
     elif cmd == "calendars":
         print(cmd_calendars(service))
     else:
         print(f"Unknown command: {cmd}")
         print(
-            "Commands: today, week, check <date>, upcoming [days], add <title> <date> [time] [duration] [cal_id], calendars"
+            "Commands: today, week, check <date>, upcoming [days], "
+            "add <title> <date> [time] [duration] [cal_id] [RRULE], calendars"
         )
         sys.exit(1)

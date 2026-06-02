@@ -8,9 +8,12 @@ Daily 7am Discord briefing. Single Sonnet call covering weather, today's calenda
 2. Fetches today's calendar events via the `calendar` skill (`upcoming 0` — current day only)
 3. Runs `gmail heartbeat` to pick up overnight priority emails and advance `last_checked`
 4. Reads and clears the Gmail digest queue from SQLite (briefing owns the 7am slot)
-5. Fetches BBC World News RSS — top 5 headlines
-6. Fetches Google News RSS per interest from `config/personal/briefing_interests.json`
-7. Feeds all data into one Sonnet call and posts the result verbatim to Discord
+5. Queries `deadlines` table in SQLite — surfaces any incomplete deadlines due within 14 days
+6. Fetches BBC World News RSS — top 5 headlines
+7. Fetches Google News RSS per interest from `config/personal/briefing_interests.json`
+8. Feeds all data into one Sonnet call and posts the result verbatim to Discord
+
+Deadlines surface as an `UPCOMING DEADLINES` block in the Sonnet prompt when any are within the 14-day window. Overdue items appear as "OVERDUE by Nd". The `tasks` skill owns the `deadlines` table.
 
 ## Scheduling
 
@@ -48,6 +51,7 @@ cp config/examples/briefing_interests.json config/personal/briefing_interests.js
 - `skills/calendar/.venv` must exist and be installed
 - `skills/gmail-cleanup/.venv` must exist and be installed
 - `JARVIS_DATA_DIR/jarvis.db` must exist (created on first gmail skill run)
+- `deadlines` table must exist — created by `gmail-cleanup`'s `init_db()`, or by running the `tasks` skill against an existing DB
 
 ## Testing
 

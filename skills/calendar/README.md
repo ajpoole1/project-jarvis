@@ -17,8 +17,22 @@ Reads and writes Google Calendar events across configured calendars. Used standa
 | `python skill.py week` | Events for the next 7 days |
 | `python skill.py check YYYY-MM-DD` | Events on a specific date, returns JSON |
 | `python skill.py upcoming [days]` | Events in the next N days as JSON (default: 30) |
-| `python skill.py add "title" YYYY-MM-DD [HH:MM] [duration_min] [calendar_id]` | Create an event |
+| `python skill.py add "title" YYYY-MM-DD [HH:MM] [duration_min] [calendar_id] [RRULE]` | Create an event (recurring if RRULE provided) |
 | `python skill.py calendars` | List all calendars with their IDs (setup helper) |
+
+### Recurring events
+
+Pass an RRULE string as the last argument to `add`. The `RRULE:` prefix is optional — the skill normalises it.
+
+```bash
+# Weekly Wednesday school block until end of August
+python skill.py add "COMP 378 — Study" 2026-06-04 20:30 60 primary "FREQ=WEEKLY;BYDAY=WE;UNTIL=20260831T000000Z"
+
+# Ongoing weekly slot (no end date)
+python skill.py add "Jarvis dev" 2026-06-05 21:30 60 primary "FREQ=WEEKLY;BYDAY=TH"
+```
+
+Standard RRULE fields: `FREQ` (DAILY/WEEKLY/MONTHLY), `BYDAY` (MO/TU/WE/TH/FR/SA/SU), `INTERVAL`, `UNTIL` (UTC datetime), `COUNT`.
 
 ## Setup
 
