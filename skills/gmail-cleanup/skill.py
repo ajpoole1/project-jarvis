@@ -145,6 +145,16 @@ def _build_priority_rules() -> str:
     if names:
         quoted = ", ".join(f'"{n}"' for n in names)
         lines.append(f"{idx}. Any email referencing {quoted}: always keep")
+        idx += 1
+
+    for p in _RULES.get("priority_sender_patterns", []):
+        pattern = p["pattern"]
+        tag = p.get("tag", "family")
+        reason = p.get("reason", "")
+        lines.append(
+            f'{idx}. Any sender email containing "{pattern}": ALWAYS keep, tag={tag}, NEVER trash — {reason}'
+        )
+        idx += 1
 
     return "\n".join(lines) if idx > 1 else ""
 
@@ -175,7 +185,7 @@ def get_gmail_service():
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=0, open_browser=False)
         TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
         TOKEN_PATH.write_text(creds.to_json())
     return build("gmail", "v1", credentials=creds)
@@ -423,7 +433,15 @@ def _looks_automated(email: str) -> bool:
     return any(local == p or local.startswith(p) for p in AUTOMATED_PREFIXES)
 
 
+_PRIORITY_PATTERNS: list[str] = [
+    p["pattern"].lower() for p in _RULES.get("priority_sender_patterns", [])
+]
+
+
 def _is_priority(summary: EmailSummary) -> bool:
+    sender_lower = summary.sender_email.lower()
+    if any(pat in sender_lower for pat in _PRIORITY_PATTERNS):
+        return True  # pattern-matched senders always priority regardless of action
     if summary.action == "trash":
         return False
     if summary.tag in PRIORITY_TAGS:
@@ -504,6 +522,17 @@ def fetch_new_messages(service, since_epoch: int | None, batch_size: int) -> lis
     return messages
 
 
+def _has_ics_attachment(msg: dict) -> bool:
+    """Return True if the email has a text/calendar MIME part (ICS attachment)."""
+
+    def _check(payload: dict) -> bool:
+        if payload.get("mimeType") == "text/calendar":
+            return True
+        return any(_check(p) for p in payload.get("parts", []))
+
+    return _check(msg.get("payload", {}))
+
+
 def fetch_calendar_context(days: int = 30) -> str:
     """Return upcoming calendar events as a prompt-ready string. Empty string if unavailable."""
     skill_path = Path(__file__).parents[1] / "calendar" / "skill.py"
@@ -544,7 +573,16 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
         name, email = parse_sender(raw_from)
 
         snippet = msg.get("snippet", "")
-        cached = None if email in NEVER_CACHE_SENDERS else get_cached_action(con, email)
+        _email_lower = email.lower()
+        _is_priority_sender = any(pat in _email_lower for pat in _PRIORITY_PATTERNS)
+        cached = (
+            None
+            if (email in NEVER_CACHE_SENDERS or _is_priority_sender)
+            else get_cached_action(con, email)
+        )
+        # Force keep for priority-pattern senders even if cache somehow had trash
+        if cached == "trash" and _is_priority_sender:
+            cached = "keep"
         if cached:
             results.append(
                 EmailSummary(
@@ -557,10 +595,10 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
                 )
             )
         else:
-            uncached.append((msg["id"], name, email, subject, snippet))
+            uncached.append((msg["id"], name, email, subject, snippet, _has_ics_attachment(msg)))
 
     CLASSIFY_CHUNK = 50
-    calendar_context = fetch_calendar_context()
+    calendar_context = fetch_calendar_context(days=14)
     priority_rules = _build_priority_rules()
 
     def _build_prompt(batch_input: str) -> str:
@@ -570,18 +608,19 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
         parts.append(
             "Rules:\n"
             "- keep: personal correspondence from real people, financial alerts (low balance, fraud, CRA/tax), health/medical, travel bookings, anything related to the user's family\n"
-            "- archive: invoices, receipts, and billing statements from non-Amazon vendors (banks, insurance, software, professional services), job applications, account statements\n"
-            "- trash: ALL Amazon order confirmations and shipping notifications, ALL Shopify merchant shipping/delivery emails, any order or tracking email from a retail store or marketplace\n"
+            "- archive: invoices, receipts, billing statements, order confirmations, shipping/delivery notifications, and purchase receipts from any retailer or marketplace (Amazon, Shopify, etc.) — tag these as receipts; also archive account statements\n"
+            "- archive: job applications, application confirmations, recruiter outreach, interview invitations, hiring process emails — tag these as job-search\n"
             "- unsubscribe: marketing/promotional email, retail sale announcements, newsletters the user did not explicitly request\n"
-            '- trash: spam, irrelevant bulk mail, duplicate notifications, automated alerts with no action required, ANY email from a retailer or vendor that does not contain a specific order number, tracking number, or account-specific transaction detail — generic "sale", "new arrivals", "don\'t miss out" emails from stores are always trash even if the store is known\n'
+            '- trash: spam, irrelevant bulk mail, duplicate notifications, automated alerts with no action required; gamification/rewards emails ("you\'ve earned points", "you\'ve earned sparkles", "reward available", loyalty program fluff with no transaction detail); ANY email from a retailer or vendor that does not contain a specific order number, tracking number, or account-specific transaction detail — generic "sale", "new arrivals", "don\'t miss out" emails from stores are always trash even if the store is known\n'
         )
         if priority_rules:
             parts.append(f"\n{priority_rules}\n")
         parts.append(
-            "\nAPPOINTMENT RULE: If an email is a confirmation, reminder, or scheduling notice for an appointment already listed in the calendar above, archive it — it is already saved. "
-            "If it is appointment-related but NOT on the calendar, keep it AND set calendar_hint: true.\n"
-            "\nSet calendar_hint: true whenever the email contains scheduling information (date, time, location) for an appointment, booking, or event not already on the calendar — "
-            "use the Preview field if the subject alone is ambiguous.\n"
+            "\nAPPOINTMENT RULE:\n"
+            "- If the email is marked [ICS attached], the calendar event was automatically imported — archive it, tag=job-search if interview-related, do NOT set calendar_hint.\n"
+            "- If the email subject or preview references an appointment already listed in the calendar context above, archive it — it is already saved, do NOT set calendar_hint.\n"
+            "- If the email is appointment-related but no matching event appears in the calendar, keep it AND set calendar_hint: true.\n"
+            "- Only set calendar_hint: true when there is genuinely no matching event in the calendar — avoid flagging confirmations for events that are already there.\n"
             "\nAlso assign a tag from: receipts, bills, job-search, health, family, projects, none\n"
             "\nSet uncertain: true if you genuinely cannot determine the correct action and want a human to decide.\n"
             "\nRespond with a JSON array, one object per email, in the same order:\n"
@@ -594,8 +633,9 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
         chunk = uncached[chunk_start : chunk_start + CLASSIFY_CHUNK]
         batch_input = "\n".join(
             f'{i+1}. From: "{name}" <{email}> | Subject: {subject}'
+            + (" [ICS attached]" if has_ics else "")
             + (f"\n   Preview: {snippet[:150]}" if snippet else "")
-            for i, (_, name, email, subject, snippet) in enumerate(chunk)
+            for i, (_, name, email, subject, snippet, has_ics) in enumerate(chunk)
         )
         response = client.messages.create(
             model=HAIKU_MODEL,
@@ -612,7 +652,7 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
                 {"action": "keep", "reason": "parse error", "uncertain": True} for _ in chunk
             ]
 
-        for (msg_id, name, email, subject, _snippet), cls in zip(
+        for (msg_id, name, email, subject, _snippet, _has_ics), cls in zip(
             chunk, classifications, strict=False
         ):
             action = cls.get("action", "keep")
@@ -856,6 +896,16 @@ def cmd_execute() -> str:
     keep = [s for s in summaries if s.action == "keep"]
     unsub_results = run_unsubscribes(service, non_keep)
     execute_actions(service, non_keep + keep, con, label_map)
+
+    # Purge executed msg_ids from the digest queue so the next scheduled digest
+    # doesn't report emails that were already actioned via manual stage/execute.
+    executed_ids = {s.msg_id for s in non_keep}
+    if executed_ids:
+        existing_json = get_heartbeat_state(con, "digest_queue") or "[]"
+        queue = json.loads(existing_json)
+        queue = [item for item in queue if item.get("msg_id") not in executed_ids]
+        set_heartbeat_state(con, "digest_queue", json.dumps(queue))
+
     clear_pending(con)
     actioned = len(non_keep)
     lines = [f"Done. {actioned} email{'s' if actioned != 1 else ''} actioned, {len(keep)} kept."]
@@ -1222,7 +1272,7 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
             else:
                 annotation = ""
             lines.append(f"  • {s.sender} — {s.subject[:70]}{cal}{annotation} [{s.tag}]")
-        lines.append("\nReply **gmail stage** to run full cleanup.")
+        lines.append("\nSay **Jarvis, gmail stage** to run full cleanup.")
         output_parts.append("\n".join(lines))
 
     if digest_items:
@@ -1230,7 +1280,13 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
         queue = json.loads(existing_json)
         for s in digest_items:
             queue.append(
-                {"sender": s.sender, "subject": s.subject, "action": s.action, "tag": s.tag}
+                {
+                    "msg_id": s.msg_id,
+                    "sender": s.sender,
+                    "subject": s.subject,
+                    "action": s.action,
+                    "tag": s.tag,
+                }
             )
         set_heartbeat_state(con, "digest_queue", json.dumps(queue))
         output_parts.append(
@@ -1264,7 +1320,7 @@ def cmd_digest() -> str:
             lines.append(f"  • {item['subject'][:60]}")
         if len(items) > 8:
             lines.append(f"  _…and {len(items) - 8} more_")
-    lines.append("\nReply **gmail stage** to review and execute cleanup.")
+    lines.append("\nSay **Jarvis, gmail stage** to review and execute cleanup.")
     set_heartbeat_state(con, "digest_queue", "[]")
     return "\n".join(lines)
 

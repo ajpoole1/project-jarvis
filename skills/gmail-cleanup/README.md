@@ -130,6 +130,7 @@ Results are shown in the `execute` output per sender.
 2. Enable the **Gmail API**
 3. Create **OAuth 2.0 credentials** (Desktop app) → download JSON
 4. Rename to `gmail_credentials.json` and place in `JARVIS_CONFIG_DIR`
+5. On the OAuth consent screen, set publishing status to **Production** — Testing mode expires refresh tokens after 7 days
 
 ### 2. Environment variables
 
@@ -148,7 +149,7 @@ python -m pip install -r requirements.txt
 python skill.py stage
 ```
 
-The first run opens a browser for Gmail OAuth consent. Token saved to `JARVIS_CONFIG_DIR/gmail_token.json` — gitignored.
+On first run (and after token expiry), the skill prints a URL to the terminal instead of opening a browser — works correctly in WSL2 headless environments. Open the URL in your Windows browser, grant access, and the token is saved automatically to `JARVIS_CONFIG_DIR/gmail_token.json` — gitignored.
 
 ## SQLite schema
 

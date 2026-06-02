@@ -2,6 +2,7 @@ FROM node:24-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip \
+    psmisc \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g openclaw@2026.4.27

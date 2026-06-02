@@ -5,7 +5,7 @@ Daily 7am Discord briefing. Single Sonnet call covering weather, today's calenda
 ## What it does
 
 1. Fetches weather from `wttr.in` for `JARVIS_CITY`
-2. Fetches today's calendar events via the `calendar` skill
+2. Fetches today's calendar events via the `calendar` skill (`upcoming 0` — current day only)
 3. Runs `gmail heartbeat` to pick up overnight priority emails and advance `last_checked`
 4. Reads and clears the Gmail digest queue from SQLite (briefing owns the 7am slot)
 5. Fetches BBC World News RSS — top 5 headlines

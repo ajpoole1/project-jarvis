@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -105,7 +106,7 @@ def _get_calendar_today() -> str:
         return ""
     try:
         result = subprocess.run(
-            [str(python_path), str(skill_path), "upcoming", "1"],
+            [str(python_path), str(skill_path), "upcoming", "0"],
             capture_output=True,
             text=True,
             timeout=15,
@@ -156,6 +157,36 @@ def _run_gmail_heartbeat() -> str:
         return ""
 
 
+_BRIEFING_DEDUP_SECONDS = 3600  # refuse to run twice within one hour
+
+
+def _check_and_stamp_run() -> bool:
+    """Return True if briefing already ran within the dedup window; stamp DB if not."""
+    if not DB_PATH.exists():
+        return False
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute(
+            "SELECT value FROM gmail_heartbeat_state WHERE key = 'briefing_last_run'"
+        ).fetchone()
+        if row:
+            last = datetime.fromisoformat(row[0])
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=UTC)
+            if (datetime.now(UTC) - last).total_seconds() < _BRIEFING_DEDUP_SECONDS:
+                con.close()
+                return True
+        con.execute(
+            "INSERT OR REPLACE INTO gmail_heartbeat_state (key, value) VALUES ('briefing_last_run', ?)",
+            (datetime.now(UTC).isoformat(),),
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+    return False
+
+
 def _pop_digest_queue() -> dict:
     """Read and clear the overnight Gmail digest queue."""
     if not DB_PATH.exists():
@@ -181,6 +212,9 @@ def _pop_digest_queue() -> dict:
 
 
 def run() -> list[str]:
+    if _check_and_stamp_run():
+        return []  # already ran within the last hour — suppress duplicate
+
     client = anthropic.Anthropic()
     interests = _load_interests()
 
