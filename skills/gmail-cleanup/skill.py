@@ -35,7 +35,17 @@ DRY_RUN = os.environ.get("GMAIL_DRY_RUN", "true").lower() == "true"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 ACTIONS = ("archive", "trash", "unsubscribe", "keep")
-TAGS = ("receipts", "bills", "job-search", "health", "family", "projects", "none")
+TAGS = (
+    "receipts",
+    "bills",
+    "financial",
+    "job-search",
+    "health",
+    "family",
+    "projects",
+    "security",
+    "none",
+)
 
 RULES_PATH = CONFIG_DIR / "gmail_rules.json"
 RULES_EXAMPLE_PATH = Path(__file__).parents[2] / "config" / "examples" / "gmail_rules.json"
@@ -436,11 +446,12 @@ def _looks_automated(email: str) -> bool:
 _PRIORITY_PATTERNS: list[str] = [
     p["pattern"].lower() for p in _RULES.get("priority_sender_patterns", [])
 ]
+_SELF_EMAILS: set[str] = {e.lower() for e in _RULES.get("self_emails", [])}
 
 
 def _is_priority(summary: EmailSummary) -> bool:
     sender_lower = summary.sender_email.lower()
-    if any(pat in sender_lower for pat in _PRIORITY_PATTERNS):
+    if sender_lower not in _SELF_EMAILS and any(pat in sender_lower for pat in _PRIORITY_PATTERNS):
         return True  # pattern-matched senders always priority regardless of action
     if summary.action == "trash":
         return False
@@ -574,7 +585,9 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
 
         snippet = msg.get("snippet", "")
         _email_lower = email.lower()
-        _is_priority_sender = any(pat in _email_lower for pat in _PRIORITY_PATTERNS)
+        _is_priority_sender = _email_lower not in _SELF_EMAILS and any(
+            pat in _email_lower for pat in _PRIORITY_PATTERNS
+        )
         cached = (
             None
             if (email in NEVER_CACHE_SENDERS or _is_priority_sender)
@@ -621,7 +634,16 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             "- If the email subject or preview references an appointment already listed in the calendar context above, archive it — it is already saved, do NOT set calendar_hint.\n"
             "- If the email is appointment-related but no matching event appears in the calendar, keep it AND set calendar_hint: true.\n"
             "- Only set calendar_hint: true when there is genuinely no matching event in the calendar — avoid flagging confirmations for events that are already there.\n"
-            "\nAlso assign a tag from: receipts, bills, job-search, health, family, projects, none\n"
+            "\nAlso assign a tag — use 'none' only as a last resort. Tag definitions:\n"
+            "  receipts: purchase order confirmations, shipping notifications, retail receipts (Amazon, Shopify, Home Depot, Costco, etc.)\n"
+            "  bills: recurring service invoices and statements — telecom (Bell, Telus), utilities (gas, hydro), subscriptions, insurance\n"
+            "  financial: bank and credit card statements (RBC, MBNA, TD, Desjardins), payment confirmations (Flexiti, Affirm, Shop Pay), investment/crypto alerts (Wealthsimple), financial notifications of any kind\n"
+            "  job-search: job applications, recruiter outreach, interview invitations, hiring process emails, application confirmations\n"
+            "  health: medical appointments, pharmacy, insurance (health/dental/vision), therapy, wellness\n"
+            "  family: anything involving family members or childcare (daycare, school, family events)\n"
+            "  projects: software tools, developer notifications, GitHub, cloud services, SaaS — work-related technical emails\n"
+            "  security: account security alerts — sign-in notifications, password changes, 2FA codes, MFA prompts, account recovery emails (Microsoft, Google, Steam, Apple, etc.)\n"
+            "  none: only if the email genuinely does not fit any of the above categories\n"
             "\nSet uncertain: true if you genuinely cannot determine the correct action and want a human to decide.\n"
             "\nRespond with a JSON array, one object per email, in the same order:\n"
             '[{"action": "keep", "tag": "health", "reason": "brief reason", "calendar_hint": true, "uncertain": false}, ...]\n'
