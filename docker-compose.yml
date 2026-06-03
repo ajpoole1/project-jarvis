@@ -2,7 +2,9 @@ services:
   openclaw:
     build: ./openclaw
     restart: unless-stopped
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     environment:
       - OPENCLAW_STATE_DIR=/openclaw-state
       - OPENCLAW_CONFIG_PATH=/config/openclaw/openclaw.json
@@ -15,6 +17,16 @@ services:
       - openclaw_state:/openclaw-state
     ports:
       - "18789:18789"
+
+  go2rtc:
+    image: alexxit/go2rtc
+    container_name: go2rtc
+    restart: unless-stopped
+    volumes:
+      - ./config/personal/go2rtc.yaml:/config/go2rtc.yaml
+    ports:
+      - "1984:1984"
+      - "8554:8554"
 
 volumes:
   openclaw_state:
