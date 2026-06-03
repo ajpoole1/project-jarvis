@@ -18,6 +18,7 @@ ENTITY_FAN_SPEED = "select.ellie_s_register_fan_fan_speed"
 ENTITY_FAN_MODE = "select.ellie_s_register_fan_mode"
 ENTITY_FAN_CHILDLOCK = "switch.ellie_s_register_fan_child_lock"
 ENTITY_FAN_TARGET_TEMP = "number.ellie_s_register_fan_target_temp"
+ENTITY_FAN_DISPLAY = "switch.ellie_s_register_fan_display"
 
 
 def _ha(method, path, data=None):
@@ -54,14 +55,21 @@ def cmd_fan(args):
         temp = _state(ENTITY_FAN_TEMP)
         speed = _state(ENTITY_FAN_SPEED)
         mode = _state(ENTITY_FAN_MODE)
-        target = _state(ENTITY_FAN_TARGET_TEMP)
+        child_lock = _state(ENTITY_FAN_CHILDLOCK)
+        display = _state(ENTITY_FAN_DISPLAY)
+        try:
+            target = round((float(_state(ENTITY_FAN_TARGET_TEMP)) - 32) * 5 / 9, 1)
+        except ValueError:
+            target = _state(ENTITY_FAN_TARGET_TEMP)
         return (
             f"**Fan status**\n"
             f"Power: {power}\n"
             f"Mode: {mode}\n"
-            f"Indoor temp: {temp}°F\n"
-            f"Target temp: {target}°F\n"
-            f"Speed: {speed}/10"
+            f"Indoor temp: {temp}°C\n"
+            f"Target temp: {target}°C\n"
+            f"Speed: {speed}/10\n"
+            f"Child lock: {child_lock}\n"
+            f"Display: {display}"
         )
 
     sub = args[0].lower()
@@ -73,16 +81,16 @@ def cmd_fan(args):
 
     if sub == "temp":
         if len(args) < 2:
-            current = _state(ENTITY_FAN_TEMP)
-            return f"Current indoor temp: {current}°F"
+            return f"Current indoor temp: {_state(ENTITY_FAN_TEMP)}°C"
         try:
-            temp = int(args[1])
+            temp_c = float(args[1])
         except ValueError:
-            return "Usage: fan temp <degrees F>"
-        if not 32 <= temp <= 122:
-            return "Temperature must be between 32–122°F."
-        _service("number", "set_value", entity_id=ENTITY_FAN_TARGET_TEMP, value=temp)
-        return f"Fan target temp set to {temp}°F."
+            return "Usage: fan temp <degrees C>"
+        if not 0 <= temp_c <= 50:
+            return "Temperature must be between 0–50°C."
+        temp_f = round(temp_c * 9 / 5 + 32)
+        _service("number", "set_value", entity_id=ENTITY_FAN_TARGET_TEMP, value=temp_f)
+        return f"Fan target temp set to {temp_c}°C."
 
     if sub == "mode":
         if len(args) < 2:
@@ -108,6 +116,16 @@ def cmd_fan(args):
         _service("switch", service, entity_id=ENTITY_FAN_CHILDLOCK)
         return f"Fan child lock turned {state}."
 
+    if sub == "display":
+        state = args[1].lower() if len(args) > 1 else None
+        if state is None:
+            return f"Display is {_state(ENTITY_FAN_DISPLAY)}."
+        if state not in ("on", "off"):
+            return "Usage: fan display on|off"
+        service = "turn_on" if state == "on" else "turn_off"
+        _service("switch", service, entity_id=ENTITY_FAN_DISPLAY)
+        return f"Fan display turned {state}."
+
     if sub == "status":
         return cmd_fan([])
 
@@ -118,7 +136,8 @@ def cmd_fan(args):
         "  `fan temp <F>` — set target temperature\n"
         "  `fan mode <Fan|Cool|Heat|Sleep>` — set mode\n"
         "  `fan speed <1-10>` — set speed\n"
-        "  `fan lock on|off` — child lock"
+        "  `fan lock on|off` — child lock\n"
+        "  `fan display on|off` — display brightness"
     )
 
 
