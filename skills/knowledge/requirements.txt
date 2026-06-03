@@ -1,0 +1,2 @@
+# No third-party dependencies.
+# Requires Python 3.11+ (sqlite3 with FTS5 support included in stdlib).
