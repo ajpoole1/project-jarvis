@@ -1505,7 +1505,7 @@ def cmd_digest() -> str:
     queue = json.loads(queue_json)
 
     if not queue:
-        return "DIGEST EMPTY"
+        return ""
 
     grouped: dict[str, list] = {a: [] for a in ACTIONS}
     for item in queue:

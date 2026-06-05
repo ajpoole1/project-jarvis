@@ -8,13 +8,24 @@ PROJECT=/mnt/c/Users/aaron/Documents/python/project-jarvis
 mkdir -p "$PROJECT/logs"
 cd "$PROJECT" || exit 1
 
-# Belt-and-suspenders: load .jarvis.env so JARVIS_DATA_DIR is set even if cron
-# didn't inherit it. The skills also self-load, so this is defense in depth.
+# Belt-and-suspenders: export vars from .jarvis.env without executing the file
+# as bash. "source" chokes on values containing <, ;, {, and other shell special
+# chars (e.g. Tuya device keys). This while-read loop treats values as literals.
 if [ -f "$HOME/.jarvis.env" ]; then
-    set -a
-    # shellcheck source=/dev/null
-    source "$HOME/.jarvis.env"
-    set +a
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Skip blank lines and comments
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        # Match KEY=VALUE; strip surrounding single or double quotes from value
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            if [[ "$val" =~ ^\'(.*)\'$ ]] || [[ "$val" =~ ^\"(.*)\"$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
+            export "$key"="$val"
+        fi
+    done < "$HOME/.jarvis.env"
 fi
 
 # Reap expired window_until watches — no output unless something lapsed
