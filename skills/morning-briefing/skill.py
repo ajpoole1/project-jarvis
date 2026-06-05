@@ -17,6 +17,23 @@ from dotenv import load_dotenv
 
 load_dotenv(Path.home() / ".jarvis.env")
 
+_DISCORD_SCRIPT = Path(__file__).parents[2] / "scripts" / "discord_post.py"
+
+
+def _post_discord(message: str) -> None:
+    """Post one message to Discord. Runs discord_post.py as a subprocess — no crash on failure."""
+    try:
+        subprocess.run(
+            ["python3", str(_DISCORD_SCRIPT)],
+            input=message,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 SONNET_MODEL = "claude-sonnet-4-6"
 DATA_DIR = Path(os.environ.get("JARVIS_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "jarvis.db"
@@ -327,4 +344,5 @@ def run() -> list[str]:
 
 
 if __name__ == "__main__":
-    print("---SPLIT---".join(run()))
+    for part in run():
+        _post_discord(part)

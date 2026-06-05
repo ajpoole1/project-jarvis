@@ -25,6 +25,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# Load .jarvis.env so JARVIS_DATA_DIR resolves correctly whether called from cron or interactively.
+_env_path = Path.home() / ".jarvis.env"
+if _env_path.exists():
+    for _line in _env_path.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -32,6 +41,8 @@ from zoneinfo import ZoneInfo
 _DB_PATH = Path(os.environ.get("JARVIS_DATA_DIR", "/data")) / "jarvis.db"
 _LOCAL_TZ = ZoneInfo("America/Toronto")
 _SKILL_ROOT = Path(__file__).parents[2] / "skills"
+_DISCORD_SCRIPT = Path(__file__).parents[2] / "scripts" / "discord_post.py"
+_HEARTBEAT_GAP_MIN = 30  # alert if gap between ticks exceeds this many minutes
 
 # Shell metacharacter pattern — any arg matching this is rejected at propose time
 _SHELL_META = re.compile(r"[;&|><`\\]|\$\(|\$\{")
@@ -70,8 +81,55 @@ def _init_db() -> sqlite3.Connection:
             description TEXT NOT NULL DEFAULT ''
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS heartbeat (
+            id        INTEGER PRIMARY KEY CHECK (id = 1),
+            last_tick TEXT NOT NULL
+        )
+    """)
     conn.commit()
     return conn
+
+
+# ---------------------------------------------------------------------------
+# Health-signal helpers
+# ---------------------------------------------------------------------------
+
+
+def _post_discord(message: str) -> None:
+    """Fire-and-forget Discord post via discord_post.py. Never crashes the caller."""
+    if not _DISCORD_SCRIPT.exists():
+        return
+    try:
+        subprocess.run(
+            ["python3", str(_DISCORD_SCRIPT)],
+            input=message,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _tick_heartbeat(conn: sqlite3.Connection, now: datetime) -> None:
+    """Record this tick; alert if the gap since the last tick exceeded the threshold."""
+    row = conn.execute("SELECT last_tick FROM heartbeat WHERE id = 1").fetchone()
+    if row:
+        prev = datetime.fromisoformat(row[0])
+        if prev.tzinfo is None:
+            prev = prev.replace(tzinfo=UTC)
+        gap_min = (now - prev).total_seconds() / 60
+        if gap_min > _HEARTBEAT_GAP_MIN:
+            _post_discord(
+                f"⚠️ Jarvis heartbeat gap: last tick was {gap_min:.0f} min ago"
+                f" (threshold {_HEARTBEAT_GAP_MIN} min). System may have been offline."
+            )
+    conn.execute(
+        "INSERT OR REPLACE INTO heartbeat (id, last_tick) VALUES (1, ?)",
+        (now.isoformat(),),
+    )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -445,12 +503,16 @@ def cmd_dispatch(argv: list[str]) -> None:
     For each due job:
       - Validates skill still exists on disk
       - Invokes skills/<skill>/skill.py with args as argv (no shell=True)
+      - Forwards non-empty stdout to Discord
+      - Posts a Discord error alert on non-zero exit
       - Records exit status and recomputes next_run
     Failures are logged and recorded; they never crash the dispatcher.
     """
     now = _now_utc()
     conn = _init_db()
     try:
+        _tick_heartbeat(conn, now)
+
         rows = conn.execute(
             """SELECT id, skill, args, schedule, description
                FROM schedules
@@ -469,6 +531,9 @@ def cmd_dispatch(argv: list[str]) -> None:
                     f"[schedules] job={job_id} skill={skill_name} error=skill-not-found",
                     file=sys.stderr,
                 )
+                _post_discord(
+                    f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) — skill file not found"
+                )
                 continue
 
             try:
@@ -481,16 +546,40 @@ def cmd_dispatch(argv: list[str]) -> None:
                 )
                 continue
 
+            # Use the skill's own venv if present (e.g. gmail-cleanup needs google-auth).
+            # Falls back to system python3 for stdlib-only skills (followups, schedules).
+            venv_python = _SKILL_ROOT / skill_name / ".venv" / "bin" / "python"
+            python_bin = str(venv_python) if venv_python.exists() else "python3"
+
             # argv list — no shell=True, no string assembly, no metacharacters
-            cmd = ["python3", str(skill_py)] + skill_args
+            cmd = [python_bin, str(skill_py)] + skill_args
+            result = None
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
                 status = "ok" if result.returncode == 0 else f"exit:{result.returncode}"
             except subprocess.TimeoutExpired:
                 status = "error:timeout"
+                _post_discord(
+                    f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) timed out after 120s"
+                )
             except Exception as exc:  # noqa: BLE001
                 status = "error:exception"
                 print(f"[schedules] job={job_id} exception={exc}", file=sys.stderr)
+                _post_discord(
+                    f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) raised exception: {exc}"
+                )
+
+            if result is not None:
+                # Forward any skill output to Discord
+                if result.stdout.strip():
+                    _post_discord(result.stdout.strip())
+                # Alert on failure
+                if result.returncode != 0:
+                    err_tail = (result.stderr or "").strip()[-400:]
+                    _post_discord(
+                        f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) failed"
+                        f" ({status})\n```\n{err_tail}\n```"
+                    )
 
             _record_run(conn, job_id, schedule, now, status)
             print(f"[schedules] job={job_id} skill={skill_name} status={status}", file=sys.stderr)

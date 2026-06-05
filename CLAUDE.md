@@ -28,7 +28,7 @@ Private repo. Personal data and knowledge live here. Logic and personal state ar
 
 - **SQLite is the shared memory layer.** Skills query it on demand. It is never preloaded into Claude context.
 - **Two-root knowledge model.** `knowledge/` (committed) holds generic reference content (garden, recipes, preferences, projects). `~/.jarvis/knowledge/` (private, local-only, 700/600 perms, WSL2 home ext4) holds personal/people/home content. Agent reads both on demand (lazy RAG); writes route via the knowledge skill using `TIERS.md` domain mapping. See `knowledge/KNOWLEDGE.md` and `knowledge/TIERS.md` for full schema. FTS5 index rebuilt on each search call; no embeddings; no ingest-pdf. Both roots are agent-writable for `*.md` only — see Write Boundary section below.
-- **Python for all skill logic.** One virtualenv per skill. OpenClaw shells out to Python.
+- **Python for all skill logic.** One virtualenv per skill for skills with third-party dependencies. Stdlib-only skills (`followups`, `schedules`, `knowledge`, `price-monitor`) are intentionally venv-free — their `requirements.txt` documents this explicitly. The dispatcher auto-selects `skills/<name>/.venv/bin/python` if present, falling back to system `python3` for stdlib-only skills. OpenClaw shells out to Python.
 - **Home Assistant is the smart home API.** One skill controls all devices. Never bypass HA to talk to devices directly. HA runs natively in WSL2 (Python venv at `/srv/homeassistant`), not in Docker.
 - **VPS + Pi hybrid is Phase 4+.** Current setup is PC-only. Zigbee, Pi, and garden irrigation are 2027 scope.
 
@@ -57,7 +57,10 @@ Every skill lives in `/skills/<skill-name>/`:
 - Log to `/logs/<skill-name>.log` — gitignored
 
 **Scheduling:**
-- **One cron surface.** All scheduled work runs via the `schedules` skill + the fixed `cron_followups.sh` tick. Jarvis proposes jobs (`schedules propose`); AJ approves; the heartbeat dispatches them. Jarvis never writes crontab. Never create ad-hoc OpenClaw crons for user tasks.
+- **One cron surface — single line.** The crontab has exactly one job: `*/10 7-23 * * *  cron_followups.sh`. Everything runs through the `schedules` skill dispatcher. Jarvis proposes jobs (`schedules propose`); AJ approves; the heartbeat dispatches them. Jarvis never writes crontab. Never create ad-hoc crons for user tasks.
+- **Current approved schedules (in `jarvis.db`):** gmail-cleanup heartbeat (10m), gmail-cleanup digest (daily@13:00 + daily@18:00), morning-briefing (daily@07:00). All dispatched by the single heartbeat tick.
+- **Dispatcher Discord routing:** the dispatcher forwards any non-empty skill stdout to Discord. Skills that need multi-part posting (e.g. morning-briefing with its 3-message split) post to Discord themselves via a `_post_discord()` subprocess helper — they produce no stdout. Error alerts (non-zero exit, skill-not-found, timeout) are always posted by the dispatcher regardless.
+- **Heartbeat liveness:** the dispatcher writes `last_tick` to a `heartbeat` SQLite table on every tick and posts a Discord alert if the gap exceeds 30 min (catches outages and WSL restarts).
 - If a needed skill doesn't exist, say so and flag it as a coding task — do not improvise with a cron or a shell command.
 
 **Price monitor — run location:**
@@ -134,7 +137,7 @@ jarvis/
 ├── skills/
 │   ├── gmail-cleanup/         ← Gmail classifier, stage/execute, watch rules
 │   ├── calendar/              ← Google Calendar read/write
-│   ├── morning-briefing/      ← Daily 7am briefing via cron
+│   ├── morning-briefing/      ← Daily 7am briefing via schedules dispatcher (posts to Discord itself)
 │   ├── home-assistant/        ← Fan + cameras via HA REST API
 │   ├── garden/                ← Almanac reminders, logging, Q&A
 │   ├── knowledge/             ← FTS5 search + conversational capture loop
@@ -169,7 +172,7 @@ jarvis/
 |---|---|---|
 | Phase 1 | ✅ Done | Foundation — OpenClaw, Discord, first voice note |
 | Phase 2 | ✅ Done | Core integrations — HA (fan + LocalTuya LAN + Lorex cameras), Gmail, Calendar. Google Home + Spotify deferred. |
-| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, schedule registry ✅, price monitor (Firecrawl fetch layer) ✅. Write-boundary hardening ✅. Job search deferred. |
+| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, schedule registry ✅, price monitor (Firecrawl fetch layer) ✅, scheduler firing fix + single cron line + health signals ✅. Write-boundary hardening ✅. Job search deferred. |
 | Phase 4 | 🔲 Deferred | VPS migration + Pi deployment — deferred until Android app is ready and security is properly tested. Jarvis stays local-only until then. |
 | Phase 5 | 🔲 Not started | Jarvis Android app (Flutter, sideloaded APK) |
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from datetime import date, timedelta
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path.home() / ".jarvis.env")
 
-DATA_DIR = Path("/data")
+DATA_DIR = Path(os.environ.get("JARVIS_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "jarvis.db"
 
 
