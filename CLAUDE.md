@@ -56,6 +56,10 @@ Every skill lives in `/skills/<skill-name>/`:
 - No PII in logs — redact email subjects, names, message bodies
 - Log to `/logs/<skill-name>.log` — gitignored
 
+**Scheduling:**
+- **One cron surface.** All scheduled work runs via the `schedules` skill + the fixed `cron_followups.sh` tick. Jarvis proposes jobs (`schedules propose`); AJ approves; the heartbeat dispatches them. Jarvis never writes crontab. Never create ad-hoc OpenClaw crons for user tasks.
+- If a needed skill doesn't exist, say so and flag it as a coding task — do not improvise with a cron or a shell command.
+
 ---
 
 ## Security Rules — Hard rules, never break these
@@ -79,7 +83,7 @@ Three tiers, by who holds the pen:
 
 | Tier | Paths | Who may write | How |
 |---|---|---|---|
-| **Actions** (code/config) | `skills/`, `scripts/`, `.github/`, `docker-compose.yml`, `requirements*.txt`, `pyproject.toml`, `.claude/settings.json`, instruction files (`SOUL.md`, `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`, `TOOLS.md`) | **AJ / Claude Code only.** Agent tools are denied. | IDE / Claude Code authoring sessions |
+| **Actions** (code/config) | `skills/`, `scripts/`, `.github/`, `docker-compose.yml`, `requirements*.txt`, `pyproject.toml`, `.claude/settings.json`, instruction files (`SOUL.md`, `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`, `TOOLS.md`, `persona.md`, `voice.md`) | **AJ / Claude Code only.** Agent tools are denied. | IDE / Claude Code authoring sessions |
 | **State** | `/data/jarvis.db`, `/logs/` | Skill process code only | Python `sqlite3` / logging inside an invoked skill. Never raw `sqlite3 "UPDATE…"` from shell. |
 | **Memory** | `knowledge/**/*.md` and `~/.jarvis/knowledge/**/*.md` | Agent (via knowledge skill) + AJ / Claude Code | Edit/Write tools scoped to both roots; knowledge skill routes via `TIERS.md` + `os.path.realpath()` canonicalization |
 
@@ -94,7 +98,7 @@ The agent's settings (`~/.openclaw/workspace/.claude/settings.json`) use **defau
 ### Private knowledge root
 
 - Location: `/home/ajpoole/.jarvis/knowledge/` — WSL2 home (ext4), off DrvFs, perms `700` dirs / `600` files
-- Contains: `personal/` (profile, goals, school, shopping), `people/` (polina, ellie, PEOPLE.md), `home/`
+- Contains: `personal/` (profile, goals, school.md program overview, shopping), `people/` (polina, ellie, PEOPLE.md), `home/`, `school/` (SCHOOL.md index + per-course study notes: comp378.md, ...)
 - Has a **local-only git repo** for diff/revert — **no remote, never push**
 - Domain-to-tier routing defined in committed `knowledge/TIERS.md`; knowledge skill reads it on each call
 - History scrub for previously committed personal data: **declined**. Committed-to-date data (school schedule, Ellie food likes) judged non-damaging. Tiering protects *future* data only.
@@ -125,19 +129,14 @@ jarvis/
 ├── pyproject.toml             ← Ruff config
 ├── requirements-dev.txt       ← ruff, pytest, pytest-cov
 ├── skills/
-│   ├── gmail-cleanup/
-│   ├── job-search/
-│   ├── morning-briefing/
-│   ├── home-assistant/
-│   ├── garden/
-│   ├── knowledge/             ← FTS5 search + knowledge file updates
-│   ├── airflow-monitor/
-│   ├── calendar/
-│   ├── tasks/
-│   ├── notes/
-│   ├── browser-automation/
-│   ├── pc-control/
-│   └── spotify/
+│   ├── gmail-cleanup/         ← Gmail classifier, stage/execute, watch rules
+│   ├── calendar/              ← Google Calendar read/write
+│   ├── morning-briefing/      ← Daily 7am briefing via cron
+│   ├── home-assistant/        ← Fan + cameras via HA REST API
+│   ├── garden/                ← Almanac reminders, logging, Q&A
+│   ├── knowledge/             ← FTS5 search + conversational capture loop
+│   ├── tasks/                 ← Deadline tracking
+│   └── followups/             ← Active follow-ups + anti-nag engine
 ├── knowledge/                 ← committed root (no real PII)
 │   ├── KNOWLEDGE.md           ← index and schema reference
 │   ├── TIERS.md               ← domain tier manifest (committed, not sensitive)
@@ -166,7 +165,7 @@ jarvis/
 |---|---|---|
 | Phase 1 | ✅ Done | Foundation — OpenClaw, Discord, first voice note |
 | Phase 2 | ✅ Done | Core integrations — HA (fan + LocalTuya LAN + Lorex cameras), Gmail, Calendar. Google Home + Spotify deferred. |
-| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge skill (FTS5) ✅. Write-boundary hardening ✅. Job search deferred. |
+| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, schedule registry ✅. Write-boundary hardening ✅. Job search deferred. |
 | Phase 4 | 🔲 Deferred | VPS migration + Pi deployment — deferred until Android app is ready and security is properly tested. Jarvis stays local-only until then. |
 | Phase 5 | 🔲 Not started | Jarvis Android app (Flutter, sideloaded APK) |
 

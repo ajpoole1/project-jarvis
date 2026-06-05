@@ -12,9 +12,19 @@ This is an active portfolio project. Logic is public; personal data stays local.
 
 - **Reads and writes Google Calendar** across personal and shared family calendars. Returns formatted daily/weekly views to Discord. Feeds upcoming events into the Gmail classifier so appointment confirmation emails are archived automatically.
 
+- **Controls smart home devices** via Home Assistant. Fan: full local control (mode, speed, temp, child lock) over LocalTuya protocol 3.5. Cameras: 4 Lorex cameras proxied through go2rtc as WebRTC streams in HA.
+
 - **Runs a heartbeat** every 10 minutes during waking hours. Stays silent unless there's something actionable — priority emails, watch rule matches, or uncertain emails needing a decision. Non-priority emails accumulate in a digest queue posted at 13:00 and 18:00.
 
-- **Posts a daily briefing at 7am** via cron: weather, today's calendar, overnight priority inbox, BBC headlines, and personalized news by topic. Single Sonnet call, always posted verbatim to Discord.
+- **Posts a daily briefing at 7am** via cron: weather, today's calendar, overnight priority inbox, upcoming deadlines, BBC headlines, and personalized news by topic. Single Sonnet call, always posted verbatim to Discord.
+
+- **Tracks garden tasks** with zone-aware reminders, observation logs, and natural-language questions answered from the almanac. Hardiness zone 4–5, Quebec.
+
+- **Maintains a two-root knowledge base** — committed `knowledge/` for generic content (recipes, garden, preferences, projects) and a private local root for personal/people/home. FTS5 full-text search across both. The conversational capture loop detects explicit save requests and offers implicit captures for high-signal durable facts, staging every write for approval before anything is written.
+
+- **Tracks deadlines** in SQLite; surfaces upcoming ones in the morning briefing. Tasks and deadlines are AJ's obligations — distinct from Jarvis-owned follow-ups.
+
+- **Manages active follow-ups** — time-conditioned watches Jarvis owns and surfaces proactively. An anti-nag engine gates every proactive outreach: quiet hours, channel-quiet (AJ not mid-conversation), daily budget (max 2/day), and spacing between fires. Each outreach is a single subject, never injected into AJ-initiated threads or the morning briefing. Overflow queues silently; time-sensitive items lapse if the window passes.
 
 ---
 
@@ -81,10 +91,10 @@ Scheduled tasks (heartbeat, digest, briefing) run via WSL cron and post to Disco
 | Phase | Status | Goal |
 |---|---|---|
 | Phase 1 | ✅ Done | Foundation — OpenClaw, Discord bot, dev environment |
-| Phase 2 | 🔄 In progress | Core integrations — Gmail, Calendar, Home Assistant, Spotify |
-| Phase 3 | 🔄 In progress | Agentic skills — morning briefing ✅, job search, garden planning |
-| Phase 4 | 🔲 Planned | Infrastructure — VPS migration, Raspberry Pi deployment, Tailscale mesh |
-| Phase 5 | 🔲 Planned | Jarvis Android app (Flutter, sideloaded APK) |
+| Phase 2 | ✅ Done | Core integrations — Gmail ✅, Calendar ✅, Home Assistant (fan + cameras) ✅ |
+| Phase 3 | 🔄 In progress | Agentic skills — morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅. Job search deferred. |
+| Phase 4 | 🔲 Deferred | VPS migration + Pi deployment — deferred until Android app ready |
+| Phase 5 | 🔲 Not started | Jarvis Android app (Flutter, sideloaded APK) |
 
 ---
 
@@ -94,14 +104,12 @@ Scheduled tasks (heartbeat, digest, briefing) run via WSL cron and post to Disco
 |---|---|---|
 | `gmail-cleanup` | ✅ Live | Haiku classifier, SQLite rule cache, stage/execute/adjust, watch rules, archive expiry, flag-and-remove, real unsubscribe |
 | `calendar` | ✅ Live | Google Calendar read/write, multi-calendar, Discord formatting, JSON output for integrations |
-| `morning-briefing` | ✅ Live | Daily 7am briefing: weather, calendar, priority inbox, BBC headlines, personalized news |
-| `home-assistant` | 🔲 Planned | Control lights, fan, cameras via HA REST API |
-| `spotify` | 🔲 Planned | Playback control, queue management |
-| `job-search` | 🔲 Planned | Scrape listings, deduplicate via SQLite, surface matches |
-| `garden` | 🔲 Planned | Hardiness zone 4-5 planting calendar, irrigation scheduling via Pi GPIO |
-| `notes` | 🔲 Planned | Quick capture to SQLite, searchable via Discord |
-| `tasks` | 🔲 Planned | Task tracking with Discord interface |
-| `pc-control` | 🔲 Planned | Shutdown, sleep, app control via WSL |
+| `morning-briefing` | ✅ Live | Daily 7am briefing: weather, calendar, priority inbox, upcoming deadlines, BBC headlines, personalized news |
+| `home-assistant` | ✅ Live | Fan control (LocalTuya LAN, protocol 3.5): mode, speed, temp, child lock. Cameras: 4 Lorex via go2rtc WebRTC |
+| `garden` | ✅ Live | Zone-aware reminders, observation logging, natural-language almanac queries. Zone 4–5, Quebec |
+| `knowledge` | ✅ Live | FTS5 search across two-root knowledge base. Conversational capture loop: stage-then-approve writes, implicit capture detection, undo |
+| `tasks` | ✅ Live | Deadline tracking in SQLite; upcoming deadlines surfaced in morning briefing |
+| `followups` | ✅ Live | Active follow-up watches with anti-nag engine (quiet hours + channel-quiet + 2/day budget + spacing). Policies: check_once, periodic, persistent, passive |
 
 ---
 
@@ -158,15 +166,33 @@ See each skill's `README.md` for credential setup and first-run instructions.
 
 ```
 jarvis/
-├── scripts/               # Cron scripts — heartbeat, digest, briefing
+├── scripts/
+│   ├── discord_post.py        # Webhook poster (stdlib, chunks at 1900 chars)
+│   ├── cron_briefing.sh       # 7am daily briefing
+│   ├── cron_heartbeat.sh      # Gmail heartbeat every 10 min
+│   ├── cron_digest.sh         # Gmail digest at 13:00 and 18:00
+│   └── cron_followups.sh      # Follow-up proactive outreach every 10 min
 ├── skills/
-│   ├── gmail-cleanup/     # Gmail classifier and triage
-│   ├── calendar/          # Google Calendar read/write
-│   └── morning-briefing/  # Daily 7am Discord briefing
+│   ├── gmail-cleanup/         # Gmail classifier and triage
+│   ├── calendar/              # Google Calendar read/write
+│   ├── morning-briefing/      # Daily 7am Discord briefing
+│   ├── home-assistant/        # HA REST API — fan, cameras
+│   ├── garden/                # Almanac reminders, logging, Q&A
+│   ├── knowledge/             # FTS5 search + conversational capture loop
+│   ├── tasks/                 # Deadline tracking
+│   └── followups/             # Active follow-ups + anti-nag engine
+├── knowledge/                 # Committed knowledge root (no PII)
+│   ├── KNOWLEDGE.md           # Index and schema
+│   ├── TIERS.md               # Domain → committed/private routing
+│   ├── garden/                # Almanac
+│   ├── recipes/               # Recipe library
+│   ├── preferences/           # Generic preferences
+│   ├── projects/              # Altaforma, Bolas
+│   └── examples/              # Fake-data schema for private domains
 ├── config/
-│   ├── personal/          # gitignored — OAuth tokens, personal config
-│   └── examples/          # committed — fake data showing structure
-├── data/                  # gitignored — SQLite DB
-├── logs/                  # gitignored
-└── .github/workflows/     # CI/CD pipelines
+│   ├── personal/              # gitignored — OAuth tokens, personal config
+│   └── examples/              # committed — fake data showing structure
+├── data/                      # gitignored — SQLite DB
+├── logs/                      # gitignored
+└── .github/workflows/         # CI/CD pipelines
 ```
