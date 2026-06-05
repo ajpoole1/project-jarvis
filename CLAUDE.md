@@ -169,7 +169,7 @@ jarvis/
 |---|---|---|
 | Phase 1 | ✅ Done | Foundation — OpenClaw, Discord, first voice note |
 | Phase 2 | ✅ Done | Core integrations — HA (fan + LocalTuya LAN + Lorex cameras), Gmail, Calendar. Google Home + Spotify deferred. |
-| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, schedule registry ✅, price monitor ✅. Write-boundary hardening ✅. Job search deferred. |
+| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, schedule registry ✅, price monitor (Firecrawl fetch layer) ✅. Write-boundary hardening ✅. Job search deferred. |
 | Phase 4 | 🔲 Deferred | VPS migration + Pi deployment — deferred until Android app is ready and security is properly tested. Jarvis stays local-only until then. |
 | Phase 5 | 🔲 Not started | Jarvis Android app (Flutter, sideloaded APK) |
 

@@ -1,7 +1,11 @@
 """
-Price monitor skill — watches product URLs for price drops using free structured data.
+Price monitor skill — watches product URLs for price drops.
+
+Fetch layer: Firecrawl HTTP scrape API (bypasses anti-bot / JS rendering), falling back
+to direct urllib GET when FIRECRAWL_API_KEY is absent.
 
 Parse cascade (in order): Shopify JSON endpoint → JSON-LD → Open Graph / meta → regex.
+If the HTML cascade fails, Firecrawl LLM extraction is tried as a last resort (extra credits).
 Unreadable URLs degrade to follow_ups reminders rather than silent dead watches.
 Stdlib only; no virtualenv needed.
 """
@@ -49,6 +53,8 @@ _UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+_FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape"
+
 
 # ---------------------------------------------------------------------------
 # DB
@@ -89,7 +95,7 @@ def _init_db() -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
-# HTTP fetch
+# HTTP fetch (direct urllib — used for Shopify .json endpoint and key-absent fallback)
 # ---------------------------------------------------------------------------
 
 
@@ -119,6 +125,124 @@ def _fetch(url: str) -> tuple[int, str]:
         return e.code, ""
     except Exception:
         return 0, ""
+
+
+# ---------------------------------------------------------------------------
+# Firecrawl fetch layer
+# ---------------------------------------------------------------------------
+
+
+def _firecrawl_scrape(url: str) -> tuple[str | None, str | None]:
+    """
+    Fetch rendered HTML via Firecrawl scrape API (1 credit per page).
+    Bypasses anti-bot JS rendering that blocks direct urllib GET.
+
+    Returns (html, None) on success.
+    Returns (None, error_type) on failure:
+        'no_key'    — FIRECRAWL_API_KEY not set
+        'quota'     — 402 or credit-exhaustion response
+        'rate_limit'— 429
+        'error'     — any other failure
+    """
+    api_key = os.environ.get("FIRECRAWL_API_KEY", "")
+    if not api_key:
+        return None, "no_key"
+
+    payload = json.dumps({"url": url, "formats": ["rawHtml"]}).encode()
+    req = urllib.request.Request(
+        _FIRECRAWL_SCRAPE_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if not data.get("success"):
+                return None, "error"
+            page = data.get("data") or {}
+            html = page.get("rawHtml") or page.get("html")
+            if not html:
+                return None, "error"
+            credits = page.get("metadata", {}).get("creditsUsed")
+            if credits is not None:
+                print(f"[price-monitor] firecrawl credits_used={credits}", file=sys.stderr)
+            return html, None
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode("utf-8", errors="replace")
+            body_data = json.loads(body_text)
+            if "credit" in str(body_data).lower() or "quota" in str(body_data).lower():
+                return None, "quota"
+        except Exception:
+            pass
+        if e.code == 402:
+            return None, "quota"
+        if e.code == 429:
+            return None, "rate_limit"
+        return None, "error"
+    except Exception:
+        return None, "error"
+
+
+def _firecrawl_extract(url: str) -> tuple[float | None, str | None]:
+    """
+    Firecrawl LLM-based JSON extraction — extra credits, last resort only.
+    Used when the cheap rawHtml parse cascade comes up empty.
+
+    Returns (price, currency) or (None, None) on any failure.
+    """
+    api_key = os.environ.get("FIRECRAWL_API_KEY", "")
+    if not api_key:
+        return None, None
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "price": {"type": "number"},
+            "currency": {"type": "string"},
+        },
+        "required": ["price"],
+    }
+    payload = json.dumps(
+        {
+            "url": url,
+            "formats": ["extract"],
+            "extract": {
+                "schema": schema,
+                "prompt": "Extract the current product price as a number and the currency code (e.g. CAD, USD).",
+            },
+        }
+    ).encode()
+    req = urllib.request.Request(
+        _FIRECRAWL_SCRAPE_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if not data.get("success"):
+                return None, None
+            extracted = (data.get("data") or {}).get("extract")
+            if not isinstance(extracted, dict):
+                return None, None
+            price_raw = extracted.get("price")
+            currency = extracted.get("currency")
+            if price_raw is None:
+                return None, None
+            return float(price_raw), currency or None
+    except Exception:
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -284,40 +408,62 @@ def _probe(url: str) -> tuple[float | None, str, str | None]:
     """
     Run the full parse cascade.
     Returns (price, method, currency) or (None, 'blocked', None).
-    method: shopify | jsonld | og | regex | blocked
+    method: shopify | jsonld | og | regex | firecrawl_extract | blocked
+
+    Fetch order:
+      1. Shopify .json endpoint (direct urllib — JSON API, no bot-block)
+      2. Firecrawl rawHtml scrape (bypasses anti-bot / JS rendering)
+         Fallback to direct urllib GET when FIRECRAWL_API_KEY is absent
+      3. HTML parse cascade: JSON-LD → Open Graph → regex
+      4. Firecrawl LLM extraction (extra credits, only when cascade fails)
     """
-    # Step 1: Shopify — uses its own fetch of the .json endpoint
+    # Step 1: Shopify JSON endpoint (server-side JSON API, no rendering needed)
     price, method, currency = _try_shopify(url)
     if price is not None:
         return price, method, currency
 
-    # Fetch the HTML page once for the remaining three methods
-    status, html = _fetch(url)
-    if status == 0 or status >= 400 or not html:
-        return None, "blocked", None
+    # Step 2: Fetch rendered HTML
+    html: str | None = None
+    quota_exhausted = False
 
-    # Bail on obvious bot-block / CAPTCHA pages
-    snippet = html[:3000].lower()
-    if any(
-        kw in snippet
-        for kw in ("captcha", "access denied", "bot detection", "cf-browser-verification")
-    ):
-        return None, "blocked", None
+    if os.environ.get("FIRECRAWL_API_KEY", ""):
+        fc_html, fc_err = _firecrawl_scrape(url)
+        if fc_html:
+            html = fc_html
+        elif fc_err == "quota":
+            # Credit exhaustion — degrade immediately, no point trying extraction
+            quota_exhausted = True
 
-    # Step 2: JSON-LD
-    price, method, currency = _try_jsonld(html)
-    if price is not None:
-        return price, method, currency
+    if html is None and not quota_exhausted:
+        # No Firecrawl key, or Firecrawl errored (non-quota) — fall back to urllib
+        status, raw = _fetch(url)
+        if status and status < 400 and raw:
+            snippet = raw[:3000].lower()
+            if not any(
+                kw in snippet
+                for kw in ("captcha", "access denied", "bot detection", "cf-browser-verification")
+            ):
+                html = raw
 
-    # Step 3: Open Graph / itemprop
-    price, method, currency = _try_og(html)
-    if price is not None:
-        return price, method, currency
+    # Step 3: HTML parse cascade (JSON-LD → OG → regex)
+    if html:
+        price, method, currency = _try_jsonld(html)
+        if price is not None:
+            return price, method, currency
 
-    # Step 4: Regex (low confidence, flagged in method name)
-    price, method, currency = _try_regex(html)
-    if price is not None:
-        return price, "regex", currency
+        price, method, currency = _try_og(html)
+        if price is not None:
+            return price, method, currency
+
+        price, method, currency = _try_regex(html)
+        if price is not None:
+            return price, "regex", currency
+
+    # Step 4: Firecrawl LLM extraction — last resort when HTML parse came up empty
+    if not quota_exhausted and os.environ.get("FIRECRAWL_API_KEY", ""):
+        price, currency = _firecrawl_extract(url)
+        if price is not None:
+            return price, "firecrawl_extract", currency
 
     return None, "blocked", None
 
