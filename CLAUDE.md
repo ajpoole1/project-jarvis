@@ -172,7 +172,7 @@ jarvis/
 |---|---|---|
 | Phase 1 | ✅ Done | Foundation — OpenClaw, Discord, first voice note |
 | Phase 2 | ✅ Done | Core integrations — HA (fan + LocalTuya LAN + Lorex cameras), Gmail, Calendar. Google Home + Spotify deferred. |
-| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, schedule registry ✅, price monitor (Firecrawl fetch layer) ✅, scheduler firing fix + single cron line + health signals ✅. Write-boundary hardening ✅. Job search deferred. |
+| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, schedule registry ✅, price monitor (Firecrawl fetch layer) ✅, scheduler firing fix + single cron line + health signals ✅, briefing overhaul (BriefBlock model + news radar + reads coda + interests.md) ✅. Write-boundary hardening ✅. Job search deferred. |
 | Phase 4 | 🔲 Deferred | VPS migration + Pi deployment — deferred until Android app is ready and security is properly tested. Jarvis stays local-only until then. |
 | Phase 5 | 🔲 Not started | Jarvis Android app (Flutter, sideloaded APK) |
 
@@ -229,7 +229,7 @@ HA Core 2025.1.4 runs as a systemd service in WSL2 (`/srv/homeassistant` venv, P
 
 - Steady state API cost: $5–15 USD/month
 - Use Haiku for classification to stay in this range
-- Morning briefing = one batched Sonnet call per day (most predictable cost)
+- Morning briefing = 1 Sonnet + 2 Haiku calls per day (brief composition + news radar + reads scoring); reads coda adds 1 more Sonnet for the final pick and why-lines
 
 ---
 
