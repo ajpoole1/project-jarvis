@@ -6,9 +6,10 @@ The dispatcher runs only allowlisted skills with argv-passed args — no shell
 string assembly, no metacharacters, no arbitrary command field.
 
 Supported schedule formats:
-  30m, 2h, 7d          — repeat every N minutes / hours / days
-  daily@HH:MM          — fire once per day at a local time
-  weekly@DOW@HH:MM     — fire once per week (mon/tue/wed/thu/fri/sat/sun)
+  30m, 2h, 7d              — repeat every N minutes / hours / days
+  daily@HH:MM              — fire once per day at a local time
+  weekly@DOW@HH:MM         — fire once per week (mon/tue/wed/thu/fri/sat/sun)
+  once@YYYY-MM-DDTHH:MM   — fire once at a fixed local time, then retire
 
 No virtualenv needed: stdlib only.
 """
@@ -145,6 +146,10 @@ def _now_local() -> datetime:
     return datetime.now(_LOCAL_TZ)
 
 
+def _is_oneoff(schedule: str) -> bool:
+    return schedule.strip().lower().startswith("once@")
+
+
 def _compute_next_run(schedule: str, from_dt: datetime) -> datetime:
     """Compute the next run time given a schedule string and a reference time."""
     s = schedule.strip()
@@ -187,8 +192,21 @@ def _compute_next_run(schedule: str, from_dt: datetime) -> datetime:
         candidate += timedelta(days=days_ahead)
         return candidate.astimezone(UTC)
 
+    # once@YYYY-MM-DDTHH:MM — fire at a fixed local time, then retire
+    if s.lower().startswith("once@"):
+        val = s[5:]
+        try:
+            naive = datetime.strptime(val, "%Y-%m-%dT%H:%M")
+        except ValueError as exc:
+            raise ValueError(
+                f"Malformed once@ datetime: {val!r}. "
+                "Expected format: once@YYYY-MM-DDTHH:MM (e.g. once@2026-06-10T14:30)"
+            ) from exc
+        return naive.replace(tzinfo=_LOCAL_TZ).astimezone(UTC)
+
     raise ValueError(
-        f"Unsupported schedule format: {s!r}. " "Use: 30m, 2h, 7d, daily@HH:MM, weekly@mon@HH:MM"
+        f"Unsupported schedule format: {s!r}. "
+        "Use: 30m, 2h, 7d, daily@HH:MM, weekly@mon@HH:MM, once@YYYY-MM-DDTHH:MM"
     )
 
 
@@ -595,6 +613,14 @@ def _record_run(
     status: str,
 ) -> None:
     """Update last_run, last_status, and recompute next_run."""
+    if _is_oneoff(schedule):
+        conn.execute(
+            "UPDATE schedules SET last_run = ?, last_status = ?, enabled = 0 WHERE id = ?",
+            (ran_at.isoformat(), f"{status} (fired, one-off retired)", job_id),
+        )
+        conn.commit()
+        return
+
     try:
         next_run = _compute_next_run(schedule, ran_at)
     except ValueError:
@@ -631,7 +657,13 @@ def main() -> None:
             "  enable  <id>\n"
             "  disable <id>\n"
             "  delete  <id>\n"
-            "  dispatch        (called by heartbeat — not for manual use)",
+            "  dispatch        (called by heartbeat — not for manual use)\n"
+            "\n"
+            "Schedule formats:\n"
+            "  30m, 2h, 7d              repeat every N minutes/hours/days\n"
+            "  daily@HH:MM              once per day at local time\n"
+            "  weekly@mon@HH:MM         once per week on given day at local time\n"
+            "  once@YYYY-MM-DDTHH:MM   fire once at a fixed local time, then retire",
             file=sys.stderr,
         )
         sys.exit(1)
