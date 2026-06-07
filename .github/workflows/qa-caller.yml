@@ -1,0 +1,53 @@
+name: QA Gate
+
+# Calls the reusable Tom QA workflow on PRs to main.
+# Scoped to: PRs labelled 'dev-loop', OR PRs touching skills/ docs/dev-loop/ scripts/dev-loop/ scripts/dev-crew/
+#
+# Branch protection: add 'QA Gate / Tom QA' as a required status check on main.
+# Auto-merge must remain OFF (DEV_LOOP_REFERENCE §3, invariant 2).
+#
+# Secrets required in repo settings:
+#   QA_MODEL_API_KEY        — Google AI Studio key (gemini-3.5-flash); add $5/mo hard spend cap
+#   DISCORD_DEVLOOP_WEBHOOK — Discord webhook for verdict pings
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "skills/**"
+      - "scripts/dev-loop/**"
+      - "scripts/dev-crew/**"
+      - "docs/dev-loop/**"
+      - "knowledge/dev-crew/**"
+      - ".github/workflows/qa*.yml"
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  check-scope:
+    name: Check QA scope
+    runs-on: ubuntu-latest
+    outputs:
+      run_qa: ${{ steps.scope.outputs.run_qa }}
+    steps:
+      - name: Determine if QA should run
+        id: scope
+        run: |
+          # Always run on dev-loop label
+          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | grep -q "dev-loop"; then
+            echo "run_qa=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # paths filter already scopes this workflow; if we're here, run it
+          echo "run_qa=true" >> "$GITHUB_OUTPUT"
+
+  tom-qa:
+    name: Tom QA
+    needs: check-scope
+    if: needs.check-scope.outputs.run_qa == 'true'
+    uses: ./.github/workflows/qa.yml
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+    secrets:
+      QA_MODEL_API_KEY: ${{ secrets.QA_MODEL_API_KEY }}
+      DISCORD_DEVLOOP_WEBHOOK: ${{ secrets.DISCORD_DEVLOOP_WEBHOOK }}

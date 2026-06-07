@@ -1,0 +1,18 @@
+{
+  "profiles": {
+    "builder": {
+      "auth": "subscription",
+      "description": "Claude Code builder session — uses Max OAuth, never API key"
+    },
+    "orchestrator": {
+      "auth": "subscription",
+      "description": "OpenClaw interactive orchestrator — uses Max OAuth. VERIFY: OpenClaw must not inject ANTHROPIC_API_KEY into its own daemon process; a single global key reintroduces the ambient-key default this design removes."
+    },
+    "classifier": {
+      "auth": "api",
+      "description": "Headless classifier — requires API key; billed metered"
+    }
+  },
+  "key_source": "~/.config/dev-crew/api.key",
+  "_note": "key_source is read only for api-profile launches. Never globally exported. See scripts/dev-crew/launch.sh."
+}

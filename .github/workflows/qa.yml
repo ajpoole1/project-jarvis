@@ -1,0 +1,314 @@
+name: Tom QA (reusable)
+
+# Reusable workflow — called by qa-caller.yml (and future repo callers).
+# Tom is a non-Claude model (Gemini) by design: see DEV_LOOP_REFERENCE §3, invariant 4.
+# Fail-closed: if Tom errors, the check is red. Never green on outage.
+#
+# Secrets required (set in repo Actions secrets):
+#   QA_MODEL_API_KEY       — Google AI Studio key for gemini-3.5-flash
+#   DISCORD_DEVLOOP_WEBHOOK — Discord webhook URL for verdict notifications
+#
+# Branch protection: add 'qa / Tom QA' as a required check on main.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+      item_id:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      QA_MODEL_API_KEY:
+        required: true
+      DISCORD_DEVLOOP_WEBHOOK:
+        required: false
+
+jobs:
+  tom-qa:
+    name: Tom QA
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Compute diff
+        id: diff
+        run: |
+          git fetch origin main
+          DIFF=$(git diff origin/main...HEAD -- . ':(exclude).github/' | head -c 40000)
+          echo "diff<<DIFF_EOF" >> "$GITHUB_OUTPUT"
+          echo "$DIFF" >> "$GITHUB_OUTPUT"
+          echo "DIFF_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Load spec
+        id: spec
+        run: |
+          ITEM_ID="${{ inputs.item_id }}"
+
+          # Try to extract item_id from PR body if not passed directly
+          if [ -z "$ITEM_ID" ]; then
+            ITEM_ID=$(gh pr view ${{ inputs.pr_number }} --json body -q '.body' \
+              | grep -oP '(?<=item-id: `)[\w-]+(?=`)' | head -1 || true)
+          fi
+
+          if [ -z "$ITEM_ID" ]; then
+            echo "spec=none" >> "$GITHUB_OUTPUT"
+            echo "item_id=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Fetch spec from dev-queue branch
+          git fetch origin dev-queue 2>/dev/null || true
+          SPEC=$(git show "origin/dev-queue:knowledge/dev-notes/queue/$ITEM_ID.md" 2>/dev/null || echo "")
+
+          echo "item_id=$ITEM_ID" >> "$GITHUB_OUTPUT"
+          echo "spec<<SPEC_EOF" >> "$GITHUB_OUTPUT"
+          echo "$SPEC" >> "$GITHUB_OUTPUT"
+          echo "SPEC_EOF" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Load repo context
+        id: context
+        run: |
+          CLAUDE_MD=$(cat CLAUDE.md 2>/dev/null | head -c 8000 || echo "(not found)")
+          echo "claude_md<<CTX_EOF" >> "$GITHUB_OUTPUT"
+          echo "$CLAUDE_MD" >> "$GITHUB_OUTPUT"
+          echo "CTX_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Run Tom (Gemini QA)
+        id: qa
+        env:
+          QA_MODEL_API_KEY: ${{ secrets.QA_MODEL_API_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys, requests
+
+          api_key = os.environ["QA_MODEL_API_KEY"]
+          diff = """${{ steps.diff.outputs.diff }}"""
+          spec = """${{ steps.spec.outputs.spec }}"""
+          item_id = """${{ steps.spec.outputs.item_id }}"""
+          claude_md = """${{ steps.context.outputs.claude_md }}"""
+
+          system_prompt = """You are Tom, a senior code reviewer. You review pull requests for the Jarvis project.
+          You are NOT Claude — you are Gemini, a different model family. This is intentional: the decorrelation between builder and reviewer catches blind spots neither would catch alone.
+
+          Your job: review the diff against the spec and repo conventions. Be precise, be complete, be fair.
+
+          Return ONLY valid JSON matching this exact schema — no prose, no markdown fences:
+          {
+            "spec_conformance": [
+              {"deviation": "string", "severity": "blocking|advisory"}
+            ],
+            "defects": [
+              {"type": "bug|edge|security|missing-test", "location": "string", "description": "string", "severity": "blocking|advisory"}
+            ],
+            "architecture_notes": ["string"]
+          }
+
+          Rules:
+          - severity=blocking means this must be fixed before merge
+          - severity=advisory means it should be logged to the backlog but does not block
+          - If spec is 'none' or empty, review against repo conventions (CLAUDE.md) only
+          - If there are no issues in a category, return an empty array for that key
+          - Never return null — return [] for empty arrays
+          """
+
+          user_content = f"""## Spec (item: {item_id})
+          {spec if spec and spec != 'none' else '(no spec provided — review against repo conventions)'}
+
+          ## Repo conventions (CLAUDE.md excerpt)
+          {claude_md}
+
+          ## Diff (PR #{os.environ.get('PR_NUMBER', '?')})
+          {diff}
+          """
+
+          payload = {
+            "model": "gemini-3.5-flash",
+            "messages": [
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": user_content}
+            ],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 4096,
+          }
+
+          resp = requests.post(
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            headers={
+              "Authorization": f"Bearer {api_key}",
+              "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=120,
+          )
+
+          if resp.status_code != 200:
+            print(f"Tom API error {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
+            sys.exit(1)
+
+          raw = resp.json()["choices"][0]["message"]["content"]
+          findings = json.loads(raw)
+
+          # Validate shape
+          for key in ("spec_conformance", "defects", "architecture_notes"):
+            if key not in findings:
+              findings[key] = []
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write("findings<<FINDINGS_EOF\n")
+            f.write(json.dumps(findings, indent=2))
+            f.write("\nFINDINGS_EOF\n")
+
+          # Determine verdict
+          blocking_conformance = [x for x in findings["spec_conformance"] if x.get("severity") == "blocking"]
+          blocking_defects = [x for x in findings["defects"] if x.get("severity") == "blocking"]
+          has_blocking = bool(blocking_conformance or blocking_defects)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"verdict={'FAIL' if has_blocking else 'PASS'}\n")
+            f.write(f"blocking_count={len(blocking_conformance) + len(blocking_defects)}\n")
+
+          print(f"Verdict: {'FAIL' if has_blocking else 'PASS'} — {len(blocking_defects)} blocking defect(s), {len(blocking_conformance)} blocking conformance deviation(s)")
+          PYEOF
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+
+      - name: Write qa-findings artifact
+        if: always()
+        run: |
+          mkdir -p /tmp/qa-artifacts
+          cat > /tmp/qa-artifacts/qa-findings.json <<'EOF'
+          ${{ steps.qa.outputs.findings || '{"error": "Tom did not produce findings"}' }}
+          EOF
+
+      - name: Upload qa-findings artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-findings
+          path: /tmp/qa-artifacts/qa-findings.json
+          retention-days: 30
+
+      - name: Post PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FINDINGS: ${{ steps.qa.outputs.findings || '' }}
+          VERDICT: ${{ steps.qa.outputs.verdict || 'ERROR' }}
+          BLOCKING: ${{ steps.qa.outputs.blocking_count || '?' }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess
+
+          verdict = os.environ.get("VERDICT", "ERROR")
+          findings_raw = os.environ.get("FINDINGS", "")
+          pr_number = "${{ inputs.pr_number }}"
+
+          if not findings_raw:
+            body = "## Tom QA — ERROR\n\nTom could not produce findings. This check is **red** by design (fail-closed). Investigate the workflow logs."
+          else:
+            try:
+              findings = json.loads(findings_raw)
+            except json.JSONDecodeError:
+              body = f"## Tom QA — ERROR\n\nCould not parse Tom's response. Raw output:\n```\n{findings_raw[:1000]}\n```"
+            else:
+              emoji = "✅" if verdict == "PASS" else "🚫"
+              lines = [f"## Tom QA — {emoji} {verdict}", ""]
+
+              blocking_d = [x for x in findings.get("defects", []) if x.get("severity") == "blocking"]
+              advisory_d = [x for x in findings.get("defects", []) if x.get("severity") != "blocking"]
+              blocking_c = [x for x in findings.get("spec_conformance", []) if x.get("severity") == "blocking"]
+              advisory_c = [x for x in findings.get("spec_conformance", []) if x.get("severity") != "blocking"]
+              notes = findings.get("architecture_notes", [])
+
+              if blocking_d or blocking_c:
+                lines.append("### 🚫 Blocking (must fix before merge)")
+                for x in blocking_c:
+                  lines.append(f"- **[conformance]** {x.get('deviation', x)}")
+                for x in blocking_d:
+                  loc = x.get("location", "")
+                  lines.append(f"- **[{x.get('type','defect')}]** {loc}: {x.get('description', x)}")
+                lines.append("")
+
+              if advisory_d or advisory_c:
+                lines.append("### Advisory (backlog)")
+                for x in advisory_c:
+                  lines.append(f"- [conformance] {x.get('deviation', x)}")
+                for x in advisory_d:
+                  loc = x.get("location", "")
+                  lines.append(f"- [{x.get('type','defect')}] {loc}: {x.get('description', x)}")
+                lines.append("")
+
+              if notes:
+                lines.append("### Architecture notes")
+                for n in notes:
+                  lines.append(f"- {n}")
+                lines.append("")
+
+              lines.append("---")
+              lines.append("*Reviewed by Tom (Gemini) — non-Claude QA gate. See [DEV_LOOP_REFERENCE](docs/dev-loop/DEV_LOOP_REFERENCE.md) §8.5.*")
+              body = "\n".join(lines)
+
+          result = subprocess.run(
+            ["gh", "pr", "comment", pr_number, "--body", body],
+            capture_output=True, text=True
+          )
+          if result.returncode != 0:
+            print(f"Warning: could not post PR comment: {result.stderr}", file=sys.stderr)
+          PYEOF
+
+      - name: Discord notification
+        if: always()
+        env:
+          DISCORD_DEVLOOP_WEBHOOK: ${{ secrets.DISCORD_DEVLOOP_WEBHOOK }}
+          VERDICT: ${{ steps.qa.outputs.verdict || 'ERROR' }}
+          BLOCKING: ${{ steps.qa.outputs.blocking_count || '?' }}
+        run: |
+          WEBHOOK="${DISCORD_DEVLOOP_WEBHOOK}"
+          [ -z "$WEBHOOK" ] && exit 0
+
+          ITEM="${{ steps.spec.outputs.item_id }}"
+          VERDICT="${VERDICT}"
+          BLOCKING="${BLOCKING}"
+          PR="${{ inputs.pr_number }}"
+          REPO="${{ github.repository }}"
+          RUN_URL="https://github.com/$REPO/actions/runs/${{ github.run_id }}"
+
+          if [ "$VERDICT" = "PASS" ]; then
+            MSG="✅ Tom QA PASS — PR #$PR ($ITEM) — no blocking issues. Awaiting operator review."
+          elif [ "$VERDICT" = "FAIL" ]; then
+            MSG="🚫 Tom QA FAIL — PR #$PR ($ITEM) — $BLOCKING blocking issue(s). See: $RUN_URL"
+          else
+            MSG="⚠️ Tom QA ERROR — PR #$PR ($ITEM) — Tom could not run. Merge is blocked. See: $RUN_URL"
+          fi
+
+          python3 -c "
+          import json, urllib.request
+          data = json.dumps({'content': '$MSG'}).encode()
+          req = urllib.request.Request('$WEBHOOK', data=data, headers={'Content-Type': 'application/json'})
+          urllib.request.urlopen(req)
+          " 2>/dev/null || echo "Warning: Discord notification failed" >&2
+
+      - name: Fail on blocking issues or Tom error
+        if: always()
+        run: |
+          VERDICT="${{ steps.qa.outputs.verdict }}"
+          if [ -z "$VERDICT" ] || [ "$VERDICT" = "ERROR" ] || [ "$VERDICT" = "FAIL" ]; then
+            echo "::error::Tom QA $VERDICT — merge blocked. See findings above."
+            exit 1
+          fi

@@ -1,0 +1,3 @@
+# stdlib-only — no venv required
+# Dependencies: re, subprocess, json, datetime, pathlib — all Python stdlib.
+# Requires: git and gh CLI available on PATH.

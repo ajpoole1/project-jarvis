@@ -1,0 +1,49 @@
+name: Dev-Queue Schema Validator
+
+on:
+  push:
+    branches: ["dev-queue"]
+  pull_request:
+    branches: ["dev-queue"]
+
+jobs:
+  validate-specs:
+    name: Validate dev-notes frontmatter
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate all queue specs
+        run: |
+          set -e
+          ERRORS=0
+          CHECKED=0
+
+          for f in knowledge/dev-notes/queue/*.md knowledge/dev-notes/backlog/*.md knowledge/dev-notes/archive/*.md; do
+            # Skip .gitkeep and non-existent globs
+            [ -f "$f" ] || continue
+            [[ "$(basename "$f")" == ".gitkeep" ]] && continue
+
+            CHECKED=$((CHECKED + 1))
+            if ! python3 skills/devqueue/skill.py validate "$f"; then
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+
+          echo ""
+          echo "Checked $CHECKED spec(s). Errors: $ERRORS"
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS spec(s) failed validation. Fix the errors above."
+            exit 1
+          fi
+
+          if [ "$CHECKED" -eq 0 ]; then
+            echo "No spec files found — nothing to validate."
+          fi

@@ -1,0 +1,216 @@
+name: Dev-Loop Merge Cleanup
+
+# Fires when a PR into main is merged.
+# Responsibilities:
+#   1. Detect the dev-loop item id from the PR body
+#   2. Flip spec status built → merged on dev-queue
+#   3. Move spec from queue/ → archive/
+#   4. Reconcile dev-queue onto main (so it doesn't drift)
+#   5. Seed backlog/ stubs from the QA advisory notes (qa-findings artifact)
+#
+# If no item-id is found in the PR body, the workflow exits cleanly — not
+# every PR is a dev-loop item.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+jobs:
+  merge-cleanup:
+    name: Close dev-loop item
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Extract item id
+        id: item
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_BODY=$(gh pr view ${{ github.event.pull_request.number }} --json body -q '.body')
+          ITEM_ID=$(echo "$PR_BODY" | grep -oP '(?<=item-id: `)[\w-]+(?=`)' | head -1 || true)
+
+          if [ -z "$ITEM_ID" ]; then
+            echo "No dev-loop item-id found in PR body — skipping."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Item id: $ITEM_ID"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "item_id=$ITEM_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch dev-queue
+        if: steps.item.outputs.found == 'true'
+        run: git fetch origin dev-queue
+
+      - name: Flip status and archive spec
+        if: steps.item.outputs.found == 'true'
+        id: archive
+        run: |
+          ITEM_ID="${{ steps.item.outputs.item_id }}"
+          QUEUE_PATH="knowledge/dev-notes/queue/$ITEM_ID.md"
+          ARCHIVE_PATH="knowledge/dev-notes/archive/$ITEM_ID.md"
+
+          # Read spec from dev-queue
+          if ! SPEC=$(git show "origin/dev-queue:$QUEUE_PATH" 2>/dev/null); then
+            echo "Spec not found at dev-queue:$QUEUE_PATH — may already be archived or was never pushed."
+            echo "archived=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Flip status: built → merged (also handles authorized in edge cases)
+          UPDATED=$(echo "$SPEC" | python3 -c "
+          import re, sys
+          text = sys.stdin.read()
+          def replace_status(m):
+              return re.sub(r'^(status:\s*).*$', r'\g<1>merged', m.group(0), flags=re.MULTILINE)
+          print(re.sub(r'^---\n.*?^---\n', replace_status, text, count=1, flags=re.DOTALL | re.MULTILINE), end='')
+          ")
+
+          # Switch to dev-queue, write changes, commit
+          git checkout dev-queue
+
+          mkdir -p knowledge/dev-notes/archive
+          echo "$UPDATED" > "$ARCHIVE_PATH"
+          git rm -f "$QUEUE_PATH" 2>/dev/null || true
+          git add "$ARCHIVE_PATH"
+          git commit -m "merge: archive $ITEM_ID (merged)"
+
+          echo "archived=true" >> "$GITHUB_OUTPUT"
+          echo "archive_path=$ARCHIVE_PATH" >> "$GITHUB_OUTPUT"
+
+          # Store advisory notes for backlog seeding
+          echo "$UPDATED" > /tmp/merged-spec.md
+
+      - name: Seed backlog stubs from QA advisory notes
+        if: steps.item.outputs.found == 'true' && steps.archive.outputs.archived == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ITEM_ID="${{ steps.item.outputs.item_id }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          # Find the QA workflow run for this PR's head SHA
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          RUN_ID=$(gh run list \
+            --workflow=qa-caller.yml \
+            --branch="${{ github.event.pull_request.head.ref }}" \
+            --json databaseId,headSha,status \
+            --limit 10 \
+            -q ".[] | select(.headSha == \"$HEAD_SHA\" and .status == \"completed\") | .databaseId" \
+            | head -1 || true)
+
+          ADVISORY_NOTES="[]"
+          if [ -n "$RUN_ID" ]; then
+            mkdir -p /tmp/qa-artifacts
+            gh run download "$RUN_ID" --name qa-findings --dir /tmp/qa-artifacts 2>/dev/null || true
+            if [ -f /tmp/qa-artifacts/qa-findings.json ]; then
+              ADVISORY_NOTES=$(python3 -c "
+          import json, sys
+          with open('/tmp/qa-artifacts/qa-findings.json') as f:
+              data = json.load(f)
+          advisory = (
+              [x for x in data.get('spec_conformance', []) if x.get('severity') != 'blocking'] +
+              [x for x in data.get('defects', []) if x.get('severity') != 'blocking'] +
+              [{'note': n} for n in data.get('architecture_notes', [])]
+          )
+          print(json.dumps(advisory))
+          " 2>/dev/null || echo "[]")
+            fi
+          fi
+
+          # Create backlog stubs for each advisory item
+          NOTE_COUNT=$(echo "$ADVISORY_NOTES" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+
+          if [ "$NOTE_COUNT" -gt 0 ]; then
+            TODAY=$(date +%Y-%m-%d)
+            STUB_BASE="knowledge/dev-notes/backlog/${ITEM_ID}-advisory"
+
+            python3 - "$ADVISORY_NOTES" "$STUB_BASE" "$ITEM_ID" "$TODAY" <<'PYEOF'
+          import json, sys, re
+          from pathlib import Path
+
+          notes_raw, stub_base, item_id, today = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          notes = json.loads(notes_raw)
+
+          for i, note in enumerate(notes, 1):
+              if isinstance(note, dict):
+                  if 'deviation' in note:
+                      title = note['deviation'][:80]
+                      note_text = f"Conformance: {note['deviation']}"
+                  elif 'description' in note:
+                      title = note['description'][:80]
+                      note_text = f"[{note.get('type','defect')}] {note.get('location','')} — {note['description']}"
+                  elif 'note' in note:
+                      title = note['note'][:80]
+                      note_text = note['note']
+                  else:
+                      title = str(note)[:80]
+                      note_text = str(note)
+              else:
+                  title = str(note)[:80]
+                  note_text = str(note)
+
+              stub_id = f"{stub_base}-{i:02d}"
+              slug = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')[:40]
+              path = Path(f"{stub_base}-{i:02d}-{slug}.md")
+              path.parent.mkdir(parents=True, exist_ok=True)
+
+              content = f"""---
+          id: {path.stem}
+          title: "{title}"
+          status: proposed
+          scope: needs-design-pass
+          origin: iteration-backlog
+          author: tom
+          created: {today}
+          think_level: low
+          branch: null
+          pr: null
+          authorized_by: null
+          authorized_at: null
+          qa_artifact: null
+          ---
+          ## Intent
+          Advisory note from Tom QA on item {item_id} (PR merged {today}).
+
+          ## Scope
+          {note_text}
+
+          ## Acceptance criteria
+          (To be defined when authorized.)
+
+          ## Notes
+          Source: QA run on {item_id}.
+          """
+              path.write_text(content, encoding='utf-8')
+              print(f"Seeded backlog stub: {path}")
+          PYEOF
+
+            git add knowledge/dev-notes/backlog/
+            git commit -m "backlog: seed advisory stubs from $ITEM_ID QA" || true
+          fi
+
+      - name: Reconcile dev-queue onto main
+        if: steps.item.outputs.found == 'true'
+        run: |
+          # Merge main into dev-queue so it stays current.
+          # dev-queue holds devnotes only on top of main, so this is always fast-forwardable
+          # after a merge to main (main is an ancestor of dev-queue).
+          git fetch origin main
+          git merge origin/main --no-edit -m "reconcile: merge main into dev-queue after merge" || true
+
+      - name: Push dev-queue
+        if: steps.item.outputs.found == 'true'
+        run: git push origin dev-queue

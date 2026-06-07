@@ -1,0 +1,2 @@
+# stdlib-only — no venv required
+# Dependencies: re, subprocess, time, pathlib — all Python stdlib.

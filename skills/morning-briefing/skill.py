@@ -676,6 +676,30 @@ def _compose_brief(client: anthropic.Anthropic, blocks: list[BriefBlock]) -> str
 
 
 # ---------------------------------------------------------------------------
+# Dev-crew standup
+# ---------------------------------------------------------------------------
+
+
+def _get_dev_crew_standup() -> BriefBlock | None:
+    devloop_skill = Path(__file__).parents[1] / "devloop" / "skill.py"
+    if not devloop_skill.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["python3", str(devloop_skill), "standup"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        text = result.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return None
+    if not text or "Nothing active" in text:
+        return None
+    return BriefBlock(type="dev-crew", salience=20, take="Dev-crew has active items.", detail=text)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -689,7 +713,13 @@ def run() -> list[str]:
 
     # Gather body blocks
     blocks: list[BriefBlock] = []
-    for fn in (_get_weather, _get_calendar, _get_deadlines, _get_gmail_priority):
+    for fn in (
+        _get_weather,
+        _get_calendar,
+        _get_deadlines,
+        _get_gmail_priority,
+        _get_dev_crew_standup,
+    ):
         block = fn()
         if block:
             blocks.append(block)
