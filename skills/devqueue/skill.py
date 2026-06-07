@@ -290,7 +290,7 @@ def main() -> int:
         print("Usage: skill.py <validate|push|list> [args...]", file=sys.stderr)
         return 1
 
-    cmd, *rest = sys.argv[1], sys.argv[2:]
+    cmd, *rest = sys.argv[1:]
     if cmd == "validate":
         return cmd_validate(rest)
     elif cmd == "push":

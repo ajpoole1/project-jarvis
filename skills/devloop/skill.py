@@ -302,7 +302,7 @@ def main() -> int:
         print("Usage: skill.py standup", file=sys.stderr)
         return 1
 
-    cmd, *rest = sys.argv[1], sys.argv[2:]
+    cmd, *rest = sys.argv[1:]
     if cmd == "standup":
         return cmd_standup(rest)
     print(f"Unknown command '{cmd}'; use standup", file=sys.stderr)

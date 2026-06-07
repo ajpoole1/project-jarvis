@@ -318,7 +318,7 @@ def main() -> int:
         print("Usage: skill.py <summon|dismiss|reaper|status> [args...]", file=sys.stderr)
         return 1
 
-    cmd, *rest = sys.argv[1], sys.argv[2:]
+    cmd, *rest = sys.argv[1:]
     dispatch = {
         "summon": cmd_summon,
         "dismiss": cmd_dismiss,
