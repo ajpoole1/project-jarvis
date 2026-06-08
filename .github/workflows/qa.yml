@@ -48,7 +48,15 @@ jobs:
         id: diff
         run: |
           git fetch origin main
-          DIFF=$(git diff origin/main...HEAD -- . ':(exclude).github/' | head -c 40000)
+          # Capture full diff without piping to head — piping under bash -eo pipefail causes
+          # SIGPIPE when git diff is still writing after head closes the read end (>40 KB diffs
+          # would fail the step). Truncate in-process instead; append a note so Tom knows.
+          FULL_DIFF=$(git diff origin/main...HEAD -- . ':(exclude).github/')
+          if [ "${#FULL_DIFF}" -gt 40000 ]; then
+            DIFF="${FULL_DIFF:0:40000}"$'\n\n[diff truncated at 40 000 bytes — full diff is '"${#FULL_DIFF}"' bytes]'
+          else
+            DIFF="$FULL_DIFF"
+          fi
           echo "diff<<DIFF_EOF" >> "$GITHUB_OUTPUT"
           echo "$DIFF" >> "$GITHUB_OUTPUT"
           echo "DIFF_EOF" >> "$GITHUB_OUTPUT"
@@ -100,7 +108,7 @@ jobs:
           CLAUDE_MD: ${{ steps.context.outputs.claude_md }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, sys, requests
+          import json, os, sys, time, requests
 
           # Read untrusted inputs from the environment, never by templating GitHub
           # Actions expressions into the script source. The diff can contain triple-quotes,
@@ -178,15 +186,29 @@ jobs:
             "max_tokens": 4096,
           }
 
-          resp = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            headers={
-              "Authorization": f"Bearer {api_key}",
-              "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=120,
-          )
+          # Retry on transient 503/429 with exponential backoff (2s → 4s → 8s).
+          # A persistent transient or any other non-200 status fails closed.
+          _RETRY_STATUSES = {429, 503}
+          _MAX_ATTEMPTS = 3
+          resp = None
+          for _attempt in range(1, _MAX_ATTEMPTS + 1):
+            resp = requests.post(
+              "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+              headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+              },
+              json=payload,
+              timeout=120,
+            )
+            if resp.status_code not in _RETRY_STATUSES:
+              break
+            _delay = 2 * (2 ** (_attempt - 1))
+            if _attempt < _MAX_ATTEMPTS:
+              print(f"Tom transient {resp.status_code} (attempt {_attempt}/{_MAX_ATTEMPTS}) — retrying in {_delay}s", file=sys.stderr)
+              time.sleep(_delay)
+            else:
+              print(f"Tom transient {resp.status_code} persisted after {_MAX_ATTEMPTS} attempts — failing closed", file=sys.stderr)
 
           if resp.status_code != 200:
             print(f"Tom API error {resp.status_code}: {resp.text[:500]}", file=sys.stderr)

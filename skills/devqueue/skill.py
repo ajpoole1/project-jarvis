@@ -23,8 +23,10 @@ before git is invoked.
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -117,7 +119,8 @@ def run_git(*args: str, cwd: Path = PROJECT, capture: bool = True) -> str:
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
+        stderr_msg = result.stderr.strip() if result.stderr else "(stderr not captured)"
+        raise RuntimeError(f"git {' '.join(args)} failed:\n{stderr_msg}")
     return result.stdout.strip() if capture else ""
 
 
@@ -186,42 +189,59 @@ def cmd_push(args: list[str]) -> int:
     # Pre-push guard: hard-lock branch + path
     _assert_push_target(TARGET_BRANCH, str(PROJECT / dest_rel))
 
-    orig_branch = current_branch()
-
+    # Fetch latest remote state before any worktree operation.
     try:
-        # Fetch latest remote state
-        try:
-            run_git("fetch", "origin", TARGET_BRANCH)
-        except RuntimeError:
-            print(
-                f"Warning: could not fetch origin/{TARGET_BRANCH} — proceeding with local state",
-                file=sys.stderr,
+        run_git("fetch", "origin", TARGET_BRANCH)
+    except RuntimeError:
+        print(
+            f"Warning: could not fetch origin/{TARGET_BRANCH} — proceeding with local state",
+            file=sys.stderr,
+        )
+
+    # Check branch existence so we know how to create the worktree.
+    local_exists = True
+    try:
+        run_git("rev-parse", "--verify", TARGET_BRANCH)
+    except RuntimeError:
+        local_exists = False
+
+    remote_exists = True
+    try:
+        run_git("rev-parse", "--verify", f"origin/{TARGET_BRANCH}")
+    except RuntimeError:
+        remote_exists = False
+
+    # All mutations happen in an isolated git worktree so the active builder's
+    # working tree is never switched away from its feature branch.
+    wt_path = Path(tempfile.mkdtemp(prefix="devqueue-wt-"))
+    try:
+        if local_exists:
+            run_git("worktree", "add", str(wt_path), TARGET_BRANCH)
+            if remote_exists:
+                # Fast-forward to origin so a push never rejects as non-fast-forward.
+                try:
+                    run_git("merge", "--ff-only", f"origin/{TARGET_BRANCH}", cwd=wt_path)
+                except RuntimeError:
+                    print(
+                        f"Warning: {TARGET_BRANCH} diverged from origin/{TARGET_BRANCH} — continuing without fast-forward",
+                        file=sys.stderr,
+                    )
+        elif remote_exists:
+            run_git("worktree", "add", "-b", TARGET_BRANCH, str(wt_path), f"origin/{TARGET_BRANCH}")
+        else:
+            raise RuntimeError(
+                f"Branch '{TARGET_BRANCH}' does not exist locally or remotely. "
+                "Bootstrap it manually: git checkout --orphan dev-queue && git push -u origin dev-queue"
             )
 
-        # Switch to dev-queue branch (create if needed)
-        try:
-            run_git("checkout", TARGET_BRANCH)
-        except RuntimeError:
-            # Branch doesn't exist locally — track remote or create orphan
-            try:
-                run_git("checkout", "--track", f"origin/{TARGET_BRANCH}")
-            except RuntimeError:
-                run_git("checkout", "--orphan", TARGET_BRANCH)
-                run_git("rm", "-rf", ".")
-
-        # Ensure dest directory exists
-        dest_dir_path = PROJECT / dest_dir
+        # Write spec into worktree
+        dest_dir_path = wt_path / dest_dir
         dest_dir_path.mkdir(parents=True, exist_ok=True)
+        (wt_path / dest_rel).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
-        # Copy spec file
-        dest_path = PROJECT / dest_rel
-        dest_path.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-
-        run_git("add", dest_rel)
-        run_git("commit", "-m", f"queue: add {src.stem}")
-
-        # Push — guard verified above
-        run_git("push", "origin", TARGET_BRANCH, capture=False)
+        run_git("add", dest_rel, cwd=wt_path)
+        run_git("commit", "-m", f"queue: add {src.stem}", cwd=wt_path)
+        run_git("push", "origin", TARGET_BRANCH, capture=False, cwd=wt_path)
 
         print(f"Pushed {src.name} to {TARGET_BRANCH}:{dest_rel}")
         return 0
@@ -230,12 +250,10 @@ def cmd_push(args: list[str]) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     finally:
-        # Always return to original branch
         try:
-            if current_branch() != orig_branch:
-                run_git("checkout", orig_branch)
+            run_git("worktree", "remove", "--force", str(wt_path))
         except RuntimeError:
-            pass
+            shutil.rmtree(str(wt_path), ignore_errors=True)
 
 
 def cmd_list(args: list[str]) -> int:
