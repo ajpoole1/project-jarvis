@@ -20,6 +20,10 @@ on:
         required: false
         type: string
         default: ""
+      qa_min_diff_lines:
+        required: false
+        type: number
+        default: 20
     secrets:
       QA_MODEL_API_KEY:
         required: true
@@ -106,9 +110,12 @@ jobs:
           SPEC: ${{ steps.spec.outputs.spec }}
           ITEM_ID: ${{ steps.spec.outputs.item_id }}
           CLAUDE_MD: ${{ steps.context.outputs.claude_md }}
+          QA_MIN_DIFF_LINES: ${{ inputs.qa_min_diff_lines }}
         run: |
           python3 - <<'PYEOF'
           import json, os, re, sys, time, requests
+          sys.path.insert(0, "scripts/dev-loop")
+          from tom_qa_helpers import count_changed_lines, make_skip_findings, parse_min_diff_lines
 
           # Read untrusted inputs from the environment, never by templating GitHub
           # Actions expressions into the script source. The diff can contain triple-quotes,
@@ -139,12 +146,41 @@ jobs:
               print("No reviewable diff — PASS (nothing for Tom to review).")
               sys.exit(0)
 
+          # Cost-gate: skip the model call when the diff is too small to justify it.
+          # QA_MIN_DIFF_LINES is a workflow input (default 20); set it lower to review smaller PRs.
+          min_diff_lines = parse_min_diff_lines(os.environ.get("QA_MIN_DIFF_LINES", ""))
+          changed_lines = count_changed_lines(diff)
+          if changed_lines < min_diff_lines:
+              findings = make_skip_findings(changed_lines, min_diff_lines)
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("findings<<FINDINGS_EOF\n")
+                  f.write(json.dumps(findings, indent=2))
+                  f.write("\nFINDINGS_EOF\n")
+                  f.write("verdict=SKIP\n")
+                  f.write("blocking_count=0\n")
+              print(f"Trivial diff ({changed_lines} changed lines < threshold {min_diff_lines}) — QA skipped.")
+              sys.exit(0)
+
           api_key = os.environ["QA_MODEL_API_KEY"]
 
-          system_prompt = """You are Tom, a senior code reviewer. You review pull requests for the Jarvis project.
-          You are NOT Claude — you are Gemini, a different model family. This is intentional: the decorrelation between builder and reviewer catches blind spots neither would catch alone.
+          system_prompt = """You are Tom, an adversarial code reviewer for the Jarvis project.
+          You are NOT Claude — you are Gemini, a different model family. This decorrelation is intentional: you catch what the builder could not see.
 
-          Your job: review the diff against the spec and repo conventions. Be precise, be complete, be fair.
+          Your job: ASSUME there are issues and hunt for them. You are a skeptic, not a narrator. Do NOT summarize what the code does. Probe it for what can go wrong.
+
+          Work through every item on this probe list for every review:
+          1. Bugs and logic errors — wrong conditions, off-by-one, incorrect assumptions, silent data corruption
+          2. Edge cases — empty input, boundary values, None/null, type mismatches, large inputs, zero-length collections
+          3. Failure modes — crash mid-operation leaves partial state? what happens on retry? race conditions? SQLite write failures? flush interrupted?
+          4. Security — injection risks, secrets exposure, unvalidated external input, privilege escalation
+          5. Error handling — unhandled exceptions, silent failures, misleading error messages, missing rollback
+          6. Missing or weak tests — are acceptance criteria covered? are assertions real or trivially true? are failure paths tested?
+          7. Spec deviations — does the diff implement every acceptance criterion? does it omit anything the spec required?
+
+          PASS rule: PASS only when you find nothing genuinely blocking. But every PASS must explain WHY you are confident:
+          - State specifically what you checked from the probe list above
+          - Give concrete advisory notes: edges worth watching, improvements to file, things not blocking today that could become issues
+          - A bare "looks good", "clean implementation", or "well-structured" PASS is FORBIDDEN. Show your work.
 
           Return ONLY valid JSON matching this exact schema — no prose, no markdown fences:
           {
@@ -152,19 +188,20 @@ jobs:
               {"deviation": "string", "severity": "blocking|advisory"}
             ],
             "defects": [
-              {"type": "bug|edge|security|missing-test", "location": "string", "description": "string", "severity": "blocking|advisory"}
+              {"type": "bug|edge|security|missing-test|failure-mode", "location": "string", "description": "string", "severity": "blocking|advisory"}
             ],
             "architecture_notes": ["string"]
           }
 
           Rules:
-          - severity=blocking means this must be fixed before merge
-          - severity=advisory means it should be logged to the backlog but does not block
+          - severity=blocking: real defect or spec-break that must be fixed before merge
+          - severity=advisory: worth filing to backlog but does not block
+          - architecture_notes MUST be non-empty: real critique, concrete suggestions, or your confidence rationale (what you checked and why you're satisfied)
           - If spec is 'none' or empty, review against repo conventions (CLAUDE.md) only
           - If there are no issues in a category, return an empty array for that key
           - Never return null — return [] for empty arrays
           - Keep descriptions concise: each string value must be 120 characters or shorter
-          - Cap findings: return at most 8 items per array; if more exist, include the most important and add a single architecture_note summarising what was omitted
+          - Cap findings: at most 8 items per array; if more exist, include the most critical and add a single architecture_note summarising what was omitted
           """
 
           user_content = f"""## Spec (item: {item_id})
@@ -295,7 +332,7 @@ jobs:
             except json.JSONDecodeError:
               body = f"## Tom QA — ERROR\n\nCould not parse Tom's response. Raw output:\n```\n{findings_raw[:1000]}\n```"
             else:
-              emoji = "✅" if verdict == "PASS" else "🚫"
+              emoji = "✅" if verdict == "PASS" else ("⏭️" if verdict == "SKIP" else "🚫")
               lines = [f"## Tom QA — {emoji} {verdict}", ""]
 
               blocking_d = [x for x in findings.get("defects", []) if x.get("severity") == "blocking"]
@@ -359,6 +396,8 @@ jobs:
 
           if [ "$VERDICT" = "PASS" ]; then
             MSG="✅ Tom QA PASS — PR #$PR ($ITEM) — no blocking issues. Awaiting operator review."
+          elif [ "$VERDICT" = "SKIP" ]; then
+            MSG="⏭️ Tom QA SKIP — PR #$PR ($ITEM) — trivial diff, no review needed."
           elif [ "$VERDICT" = "FAIL" ]; then
             MSG="🚫 Tom QA FAIL — PR #$PR ($ITEM) — $BLOCKING blocking issue(s). See: $RUN_URL"
           else
