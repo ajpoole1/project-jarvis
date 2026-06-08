@@ -134,11 +134,13 @@ def test_watchdog_check_alerts_on_stall(tmp_db, monkeypatch, capsys):
     assert item in out
 
 
-def test_watchdog_check_silent_when_progressed(tmp_db, monkeypatch, capsys):
+def test_watchdog_check_silent_when_progressed_and_already_pinged(tmp_db, monkeypatch, capsys):
     from datetime import UTC, datetime
 
     item = "2026-0007-prog"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
+    # Mark PR already pinged so the milestone doesn't re-fire
+    _mod._set_pr_pinged(item, datetime.now(UTC))
     monkeypatch.setattr(_mod, "_branch_progressed", lambda *a, **k: True)
 
     rc = _mod.cmd_watchdog_check([item])
