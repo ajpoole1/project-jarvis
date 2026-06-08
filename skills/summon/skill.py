@@ -3,9 +3,11 @@
 summon skill — launch and manage named builder sessions via claude remote-control.
 
 Commands:
-  summon <persona> <id>     Launch a named RC builder for an authorized item
+  summon <persona> <id>             Launch a named RC builder for an authorized item
+  summon <persona> <id> --revise    Resume a refix cycle on the existing feature branch,
+                                    seeding Tom's QA findings + PR link into the kickoff
   ask <id> <question...>    (builder) post a blocking question to the dev-loop Discord
-  watchdog-check <id>       (scheduler) one-shot stall check; prints alert if stalled
+  watchdog-check <id> [min] (scheduler) stall check + milestone ping; prints if action needed
   dismiss <persona>         Kill the tmux session + worktree for a persona
   reaper                    Kill all crew tmux sessions idle past IDLE_MINUTES
   status                    List live crew sessions with idle times
@@ -84,8 +86,8 @@ CONCURRENCY_WARN_THRESHOLD = 2
 # Reaper kills sessions idle longer than this
 IDLE_MINUTES = 60
 
-# Watchdog: minutes after a summon to run the one-shot stall check.
-WATCHDOG_MINUTES = 30
+# Escalating watchdog: minutes after summon to run each stall/milestone check.
+WATCHDOG_CHECKS = [5, 15, 30]
 
 _LOCAL_TZ = ZoneInfo("America/Toronto")
 
@@ -206,6 +208,43 @@ def capture_rc_url(url_file: Path, timeout: int = 15) -> str | None:
     return None
 
 
+def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
+    """Return (pr_url, tom_findings_comment_body). Best-effort; ('', '') on failure."""
+    branch = f"feature/{item_id}"
+    try:
+        pr = subprocess.run(
+            ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number,url"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if pr.returncode != 0 or not pr.stdout.strip():
+            return "", ""
+        data = json.loads(pr.stdout or "[]")
+        if not isinstance(data, list) or not data:
+            return "", ""
+        pr_number = str(data[0]["number"])
+        pr_url = data[0]["url"]
+        comments = subprocess.run(
+            ["gh", "pr", "view", pr_number, "--json", "comments"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if comments.returncode != 0:
+            return pr_url, ""
+        cdata = json.loads(comments.stdout or "{}")
+        for c in reversed(cdata.get("comments", [])):
+            body = c.get("body", "")
+            if "Tom QA" in body:
+                return pr_url, body
+        return pr_url, ""
+    except Exception:  # noqa: BLE001
+        return "", ""
+
+
 # ── concurrency guard ─────────────────────────────────────────────────────────
 
 
@@ -247,6 +286,29 @@ def build_kickoff(persona_name: str, item_id: str) -> str:
     )
 
 
+def build_revise_kickoff(persona_name: str, item_id: str, pr_url: str, tom_findings: str) -> str:
+    """Single-line refix kickoff: resume on the existing feature branch with Tom's feedback.
+
+    Kept to one line for the same reason as build_kickoff.
+    """
+    spec_path = f"{DEVNOTES_QUEUE}/{item_id}.md"
+    if tom_findings:
+        findings_summary = (tom_findings[:2000] + "…") if len(tom_findings) > 2000 else tom_findings
+    else:
+        findings_summary = "(Tom findings unavailable — check the PR directly)"
+    pr_ref = pr_url if pr_url else f"(find open PR for feature/{item_id})"
+    return (
+        f"You are {persona_name}, a Jarvis dev-loop builder resuming a refix cycle for {item_id}. "
+        f"The branch feature/{item_id} already exists — do NOT run start-build.sh (it will abort). "
+        f"The spec is at {spec_path}. "
+        f"Tom QA findings (PR: {pr_ref}): {findings_summary}. "
+        f"Fix all blocking issues on feature/{item_id}, run `ruff check . && ruff format --check . && pytest`, "
+        f"commit, then push with: git push origin feature/{item_id}. "
+        f"If you need a decision, post: "
+        f'`python3 skills/summon/skill.py ask {item_id} "<question>"` then stop.'
+    )
+
+
 def is_stalled(row: dict, progressed: bool) -> bool:
     """A run is stalled iff there is no progress (PR/branch) and no blocking question."""
     return not progressed and not row.get("question_at")
@@ -265,14 +327,20 @@ def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS dev_crew_runs (
-            item        TEXT PRIMARY KEY,
-            persona     TEXT NOT NULL,
-            worktree    TEXT NOT NULL DEFAULT '',
-            summoned_at TEXT NOT NULL,
-            question_at TEXT
+            item         TEXT PRIMARY KEY,
+            persona      TEXT NOT NULL,
+            worktree     TEXT NOT NULL DEFAULT '',
+            summoned_at  TEXT NOT NULL,
+            question_at  TEXT,
+            pr_pinged_at TEXT
         )
     """)
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE dev_crew_runs ADD COLUMN pr_pinged_at TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     return conn
 
 
@@ -300,6 +368,18 @@ def _set_question(item_id: str, now: datetime) -> None:
     try:
         conn.execute(
             "UPDATE dev_crew_runs SET question_at = ? WHERE item = ? AND question_at IS NULL",
+            (now.isoformat(), item_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_pr_pinged(item_id: str, now: datetime) -> None:
+    conn = _db()
+    try:
+        conn.execute(
+            "UPDATE dev_crew_runs SET pr_pinged_at = ? WHERE item = ? AND pr_pinged_at IS NULL",
             (now.isoformat(), item_id),
         )
         conn.commit()
@@ -375,17 +455,16 @@ def _branch_progressed(repo_dir: str, item_id: str) -> bool:
 # ── watchdog arming (reuses the schedules skill's once@ one-shot) ─────────────
 
 
-def _arm_watchdog(item_id: str, minutes: int) -> None:
-    """Stage + approve a one-shot schedule that checks for a stall N minutes from now.
+def _arm_single_watchdog(item_id: str, minutes: int) -> None:
+    """Stage + approve a one-shot schedule that checks for stall/milestones N minutes from now.
 
     Reuses the schedules skill's once@ format: the heartbeat dispatcher fires it once,
-    runs `summon watchdog-check <item>`, forwards any stdout (the stall alert) to Discord,
-    then the one-off retires itself. summon is operator-initiated, so the watchdog it arms
-    is approved here rather than requiring a second manual approval. Best-effort: a
-    scheduling failure never blocks the (already-launched) build.
+    runs `summon watchdog-check <item> <minutes>`, forwards any stdout (alert/ping) to
+    Discord, then the one-off retires itself. Best-effort: a scheduling failure never
+    blocks the (already-launched) build.
     """
     if not SCHEDULES_SKILL.exists():
-        print("schedules skill not found — watchdog not armed", file=sys.stderr)
+        print(f"schedules skill not found — watchdog (+{minutes}m) not armed", file=sys.stderr)
         return
     fire_at = datetime.now(_LOCAL_TZ) + timedelta(minutes=minutes)
     schedule = "once@" + fire_at.strftime("%Y-%m-%dT%H:%M")
@@ -400,9 +479,9 @@ def _arm_watchdog(item_id: str, minutes: int) -> None:
                 "--schedule",
                 schedule,
                 "--description",
-                f"dev-crew stall watchdog for {item_id}",
+                f"dev-crew stall watchdog for {item_id} (+{minutes}m)",
                 "--args",
-                json.dumps(["watchdog-check", item_id]),
+                json.dumps(["watchdog-check", item_id, str(minutes)]),
                 "--created-by",
                 "summon",
             ],
@@ -411,7 +490,9 @@ def _arm_watchdog(item_id: str, minutes: int) -> None:
             timeout=20,
         )
         if proposed.returncode != 0:
-            print(f"watchdog propose failed: {proposed.stderr.strip()}", file=sys.stderr)
+            print(
+                f"watchdog (+{minutes}m) propose failed: {proposed.stderr.strip()}", file=sys.stderr
+            )
             return
         job_id = json.loads(proposed.stdout)["id"]
         approved = subprocess.run(
@@ -421,19 +502,30 @@ def _arm_watchdog(item_id: str, minutes: int) -> None:
             timeout=20,
         )
         if approved.returncode != 0:
-            print(f"watchdog approve failed: {approved.stderr.strip()}", file=sys.stderr)
+            print(
+                f"watchdog (+{minutes}m) approve failed: {approved.stderr.strip()}", file=sys.stderr
+            )
             return
-        print(f"Watchdog armed: stall check at {schedule} local (in ~{minutes} min).")
+        print(f"Watchdog armed: check at {schedule} local (in ~{minutes} min).")
     except Exception as exc:  # noqa: BLE001
-        print(f"watchdog arming error: {exc}", file=sys.stderr)
+        print(f"watchdog (+{minutes}m) arming error: {exc}", file=sys.stderr)
+
+
+def _arm_watchdog(item_id: str) -> None:
+    """Arm escalating stall/milestone checks at each interval in WATCHDOG_CHECKS."""
+    for minutes in WATCHDOG_CHECKS:
+        _arm_single_watchdog(item_id, minutes)
 
 
 # ── commands ──────────────────────────────────────────────────────────────────
 
 
 def cmd_summon(args: list[str]) -> int:
+    revise = "--revise" in args
+    args = [a for a in args if a != "--revise"]
+
     if len(args) < 2:
-        print("Usage: summon <persona> <id>", file=sys.stderr)
+        print("Usage: summon <persona> <id> [--revise]", file=sys.stderr)
         return 1
 
     persona_id, item_id = args[0], args[1]
@@ -477,14 +569,48 @@ def cmd_summon(args: list[str]) -> int:
             text=True,
         )
         subprocess.run(["git", "-C", repo_dir, "worktree", "prune"], capture_output=True, text=True)
-    add = subprocess.run(
-        ["git", "-C", repo_dir, "worktree", "add", "--detach", str(wt), "origin/main"],
-        capture_output=True,
-        text=True,
-    )
-    if add.returncode != 0:
-        print(f"Failed to create build worktree at {wt}: {add.stderr.strip()}", file=sys.stderr)
-        return 1
+
+    if revise:
+        # Refix mode: check out the existing feature branch rather than cutting from main.
+        branch = f"feature/{item_id}"
+        add = subprocess.run(
+            ["git", "-C", repo_dir, "worktree", "add", str(wt), branch],
+            capture_output=True,
+            text=True,
+        )
+        if add.returncode != 0:
+            # Local tracking branch doesn't exist yet; create it from origin.
+            add = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repo_dir,
+                    "worktree",
+                    "add",
+                    "--track",
+                    "-b",
+                    branch,
+                    str(wt),
+                    f"origin/{branch}",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        if add.returncode != 0:
+            print(
+                f"Failed to create revise worktree for {branch}: {add.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        add = subprocess.run(
+            ["git", "-C", repo_dir, "worktree", "add", "--detach", str(wt), "origin/main"],
+            capture_output=True,
+            text=True,
+        )
+        if add.returncode != 0:
+            print(f"Failed to create build worktree at {wt}: {add.stderr.strip()}", file=sys.stderr)
+            return 1
 
     url_file = Path(f"/tmp/claude-rc-{persona_id}.out")
     url_file.unlink(missing_ok=True)
@@ -492,7 +618,12 @@ def cmd_summon(args: list[str]) -> int:
     # Build the RC launch command via the Phase 1 auth wrapper. The kickoff is delivered
     # as a POSITIONAL prompt — the interactive RC session auto-submits it on startup.
     # No tmux send-keys: every argument is shell-quoted into one sh -c string.
-    kickoff = build_kickoff(persona["name"], item_id)
+    if revise:
+        pr_url, tom_findings = _fetch_pr_info(repo_dir, item_id)
+        kickoff = build_revise_kickoff(persona["name"], item_id, pr_url, tom_findings)
+    else:
+        kickoff = build_kickoff(persona["name"], item_id)
+
     launch_args = [
         str(LAUNCH_SH),
         auth_profile,
@@ -506,7 +637,8 @@ def cmd_summon(args: list[str]) -> int:
     rc_cmd = " ".join(shlex.quote(a) for a in launch_args)
     rc_cmd += f" > {shlex.quote(str(url_file))} 2>&1"
 
-    print(f"Launching {persona['name']} on {item_id} in {wt} ...")
+    mode_label = "refix" if revise else "build"
+    print(f"Launching {persona['name']} on {item_id} ({mode_label}) in {wt} ...")
     try:
         subprocess.run(
             ["tmux", "new-session", "-d", "-s", sname, "-c", str(wt), rc_cmd],
@@ -521,7 +653,7 @@ def cmd_summon(args: list[str]) -> int:
         return 1
 
     _record_summon(item_id, persona_id, str(wt), datetime.now(UTC))
-    _arm_watchdog(item_id, WATCHDOG_MINUTES)
+    _arm_watchdog(item_id)
 
     url = capture_rc_url(url_file, timeout=15)
     if url:
@@ -532,6 +664,13 @@ def cmd_summon(args: list[str]) -> int:
             "connect via claude.ai/code or the Claude mobile app",
             file=sys.stderr,
         )
+
+    if revise:
+        _post_discord(
+            f"🔁 Re-summoned **{persona['name']}** on `{item_id}` (refix) — applying Tom's feedback"
+        )
+    else:
+        _post_discord(f"🔨 Summoned **{persona['name']}** on `{item_id}` — building")
 
     print(f"Kickoff delivered to session '{sname}' (auto-submitted; zero paste).")
     print(f"\nSession '{sname}' live. Link: {url or '(connect via claude.ai/code)'}")
@@ -570,21 +709,25 @@ def cmd_ask(args: list[str]) -> int:
 
 
 def cmd_watchdog_check(args: list[str]) -> int:
-    """watchdog-check <id>  — one-shot stall check fired by the heartbeat dispatcher.
+    """watchdog-check <id> [minutes]  — stall check + milestone ping for the dispatcher.
 
-    Prints a stall alert to stdout (the dispatcher forwards it to Discord) iff the build
-    has neither opened a PR/pushed its branch nor posted a blocking question. Prints
-    nothing otherwise. Armed as a once@ schedule at summon time, which then retires.
+    Prints to stdout only when action is needed (the dispatcher forwards stdout to
+    Discord). Armed as escalating once@ schedules at summon time (+5, +15, +30 min).
+
+    milestone ping: fires once when a PR is opened (progressed=True, pr_pinged_at=None).
+    stall alert: fires when no progress and no question, with urgency scaled to minutes.
     """
     if not args:
-        print("Usage: watchdog-check <id>", file=sys.stderr)
+        print("Usage: watchdog-check <id> [minutes]", file=sys.stderr)
         return 1
     item_id = args[0]
+    check_minutes = int(args[1]) if len(args) > 1 else 30
 
     conn = _db()
     try:
         row = conn.execute(
-            "SELECT persona, question_at FROM dev_crew_runs WHERE item = ?", (item_id,)
+            "SELECT persona, question_at, pr_pinged_at FROM dev_crew_runs WHERE item = ?",
+            (item_id,),
         ).fetchone()
     finally:
         conn.close()
@@ -592,18 +735,37 @@ def cmd_watchdog_check(args: list[str]) -> int:
         # No record — nothing to watch (e.g. the persona was dismissed). Silent.
         return 0
 
-    persona_id, question_at = row
+    persona_id, question_at, pr_pinged_at = row
     persona = load_roster().get(persona_id, {})
     repo_dir = persona.get("repo_dir", str(PROJECT))
     progressed = _branch_progressed(repo_dir, item_id)
 
+    # ── PR milestone ping (fires once when PR is opened) ──────────────────────
+    if progressed and pr_pinged_at is None:
+        name = persona.get("name", persona_id)
+        print(f"🚀 PR opened for `{item_id}` — QA (Tom) running. Builder: {name}")
+        _set_pr_pinged(item_id, datetime.now(UTC))
+        return 0
+
+    # ── escalating stall alert ────────────────────────────────────────────────
     if is_stalled({"question_at": question_at}, progressed):
         name = persona.get("name", persona_id)
-        print(
-            f"⚠️ Builder {name} appears stalled on {item_id} — no PR and no posted "
-            f"question. Intervene: reconnect via claude.ai/code, or "
-            f"`summon dismiss {persona_id}` and re-summon."
-        )
+        if check_minutes <= 5:
+            print(
+                f"⏱️ Builder {name} on `{item_id}` — {check_minutes} min, no PR yet "
+                f"(may still be setting up or working fast)."
+            )
+        elif check_minutes <= 15:
+            print(
+                f"⚠️ Builder {name} quiet for {check_minutes} min on `{item_id}` — "
+                f"no PR and no question yet. May need attention."
+            )
+        else:
+            print(
+                f"🚨 Builder {name} appears stalled on `{item_id}` — no PR and no posted "
+                f"question after {check_minutes} min. Intervene: reconnect via claude.ai/code, "
+                f"or `summon dismiss {persona_id}` and re-summon."
+            )
     return 0
 
 

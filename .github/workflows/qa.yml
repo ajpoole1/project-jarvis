@@ -51,7 +51,7 @@ jobs:
           # Capture full diff without piping to head — piping under bash -eo pipefail causes
           # SIGPIPE when git diff is still writing after head closes the read end (>40 KB diffs
           # would fail the step). Truncate in-process instead; append a note so Tom knows.
-          FULL_DIFF=$(git diff origin/main...HEAD -- . ':(exclude).github/')
+          FULL_DIFF=$(git diff origin/main...HEAD)
           if [ "${#FULL_DIFF}" -gt 40000 ]; then
             DIFF="${FULL_DIFF:0:40000}"$'\n\n[diff truncated at 40 000 bytes — full diff is '"${#FULL_DIFF}"' bytes]'
           else
@@ -108,7 +108,7 @@ jobs:
           CLAUDE_MD: ${{ steps.context.outputs.claude_md }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, sys, time, requests
+          import json, os, re, sys, time, requests
 
           # Read untrusted inputs from the environment, never by templating GitHub
           # Actions expressions into the script source. The diff can contain triple-quotes,
@@ -118,17 +118,16 @@ jobs:
           item_id = os.environ.get("ITEM_ID", "none")
           claude_md = os.environ.get("CLAUDE_MD", "(not found)")
 
-          # Nothing to review (e.g. a workflow- or docs-only PR — .github is excluded from
-          # the diff). The Compute-diff step succeeded and produced no reviewable changes, so
-          # this is a legitimate PASS. Fail-closed is reserved for Tom being unable to run
-          # (diff computation error → that step fails the job; Gemini/parse errors → exit 1
-          # below); it is not triggered by an empty diff. No model call, so no API key needed.
+          # Nothing to review — the Compute-diff step produced an empty diff (e.g. a
+          # docs-only PR with no skill/config/workflow changes). Legitimate PASS.
+          # Fail-closed is reserved for Tom being unable to run (Gemini/parse errors →
+          # exit 1 below); it is not triggered by an empty diff. No model call needed.
           if not diff.strip():
               findings = {
                   "spec_conformance": [],
                   "defects": [],
                   "architecture_notes": [
-                      "No reviewable changes (diff is empty after the .github exclusion)."
+                      "No reviewable changes (diff is empty)."
                   ],
               }
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
@@ -186,36 +185,52 @@ jobs:
             "max_tokens": 4096,
           }
 
-          # Retry on transient 503/429 with exponential backoff (2s → 4s → 8s).
-          # A persistent transient or any other non-200 status fails closed.
+          # Outer loop: retry the full model call if JSON parse fails (up to _MAX_JSON_ATTEMPTS).
+          # Inner loop: retry on transient HTTP 503/429 with exponential backoff (2s → 4s → 8s).
+          # Persistent HTTP errors or all JSON retries exhausted → fail closed (sys.exit(1)).
           _RETRY_STATUSES = {429, 503}
           _MAX_ATTEMPTS = 3
-          resp = None
-          for _attempt in range(1, _MAX_ATTEMPTS + 1):
-            resp = requests.post(
-              "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-              headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-              },
-              json=payload,
-              timeout=120,
-            )
-            if resp.status_code not in _RETRY_STATUSES:
-              break
-            _delay = 2 * (2 ** (_attempt - 1))
-            if _attempt < _MAX_ATTEMPTS:
-              print(f"Tom transient {resp.status_code} (attempt {_attempt}/{_MAX_ATTEMPTS}) — retrying in {_delay}s", file=sys.stderr)
-              time.sleep(_delay)
-            else:
-              print(f"Tom transient {resp.status_code} persisted after {_MAX_ATTEMPTS} attempts — failing closed", file=sys.stderr)
+          _MAX_JSON_ATTEMPTS = 3
+          findings = None
+          _last_raw = ""
 
-          if resp.status_code != 200:
-            print(f"Tom API error {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
-            sys.exit(1)
+          for _json_attempt in range(1, _MAX_JSON_ATTEMPTS + 1):
+            resp = None
+            for _attempt in range(1, _MAX_ATTEMPTS + 1):
+              resp = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=120,
+              )
+              if resp.status_code not in _RETRY_STATUSES:
+                break
+              _delay = 2 * (2 ** (_attempt - 1))
+              if _attempt < _MAX_ATTEMPTS:
+                print(f"Tom transient {resp.status_code} (attempt {_attempt}/{_MAX_ATTEMPTS}) — retrying in {_delay}s", file=sys.stderr)
+                time.sleep(_delay)
+              else:
+                print(f"Tom transient {resp.status_code} persisted after {_MAX_ATTEMPTS} attempts — failing closed", file=sys.stderr)
 
-          raw = resp.json()["choices"][0]["message"]["content"]
-          findings = json.loads(raw)
+            if resp.status_code != 200:
+              print(f"Tom API error {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
+              sys.exit(1)
+
+            _last_raw = resp.json()["choices"][0]["message"]["content"]
+            try:
+              _m = re.search(r'\{.*\}', _last_raw, re.DOTALL)
+              findings = json.loads(_m.group(0) if _m else _last_raw)
+              break  # clean parse — exit JSON retry loop
+            except json.JSONDecodeError:
+              if _json_attempt < _MAX_JSON_ATTEMPTS:
+                print(f"Tom JSON parse failed (attempt {_json_attempt}/{_MAX_JSON_ATTEMPTS}) — re-requesting model", file=sys.stderr)
+              else:
+                print(f"Tom ERROR: JSON parse failed after {_MAX_JSON_ATTEMPTS} attempts. Raw output (first 2000 chars):", file=sys.stderr)
+                print(_last_raw[:2000], file=sys.stderr)
+                sys.exit(1)
 
           # Validate shape
           for key in ("spec_conformance", "defects", "architecture_notes"):
