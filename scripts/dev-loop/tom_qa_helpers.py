@@ -17,6 +17,17 @@ def count_changed_lines(diff: str) -> int:
     return count
 
 
+def parse_min_diff_lines(raw: str, default: int = 20) -> int:
+    """Parse QA_MIN_DIFF_LINES env var safely, falling back to default on empty or non-integer."""
+    stripped = (raw or "").strip()
+    if not stripped:
+        return default
+    try:
+        return int(stripped)
+    except ValueError:
+        return default
+
+
 def make_skip_findings(changed_lines: int, threshold: int) -> dict:
     """Return a findings dict for a trivial-diff QA skip (no model call made)."""
     return {

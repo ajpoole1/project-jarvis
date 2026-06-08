@@ -12,6 +12,7 @@ _spec.loader.exec_module(_mod)
 
 count_changed_lines = _mod.count_changed_lines
 make_skip_findings = _mod.make_skip_findings
+parse_min_diff_lines = _mod.parse_min_diff_lines
 
 _SAMPLE_DIFF = """\
 diff --git a/skills/foo/skill.py b/skills/foo/skill.py
@@ -97,3 +98,32 @@ def test_make_skip_findings_note_mentions_no_model_call():
     findings = make_skip_findings(7, 20)
     note = findings["architecture_notes"][0]
     assert "No model call" in note or "no model call" in note.lower()
+
+
+def test_parse_min_diff_lines_normal():
+    assert parse_min_diff_lines("30") == 30
+
+
+def test_parse_min_diff_lines_empty_string_returns_default():
+    # GHA passes "" when a workflow input is not provided — must not crash
+    assert parse_min_diff_lines("") == 20
+
+
+def test_parse_min_diff_lines_none_like_returns_default():
+    assert parse_min_diff_lines(None) == 20
+
+
+def test_parse_min_diff_lines_whitespace_returns_default():
+    assert parse_min_diff_lines("   ") == 20
+
+
+def test_parse_min_diff_lines_non_integer_returns_default():
+    assert parse_min_diff_lines("abc") == 20
+
+
+def test_parse_min_diff_lines_custom_default():
+    assert parse_min_diff_lines("", default=15) == 15
+
+
+def test_parse_min_diff_lines_zero():
+    assert parse_min_diff_lines("0") == 0

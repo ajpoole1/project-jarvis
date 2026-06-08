@@ -115,7 +115,7 @@ jobs:
           python3 - <<'PYEOF'
           import json, os, re, sys, time, requests
           sys.path.insert(0, "scripts/dev-loop")
-          from tom_qa_helpers import count_changed_lines, make_skip_findings
+          from tom_qa_helpers import count_changed_lines, make_skip_findings, parse_min_diff_lines
 
           # Read untrusted inputs from the environment, never by templating GitHub
           # Actions expressions into the script source. The diff can contain triple-quotes,
@@ -148,7 +148,7 @@ jobs:
 
           # Cost-gate: skip the model call when the diff is too small to justify it.
           # QA_MIN_DIFF_LINES is a workflow input (default 20); set it lower to review smaller PRs.
-          min_diff_lines = int(os.environ.get("QA_MIN_DIFF_LINES", "20"))
+          min_diff_lines = parse_min_diff_lines(os.environ.get("QA_MIN_DIFF_LINES", ""))
           changed_lines = count_changed_lines(diff)
           if changed_lines < min_diff_lines:
               findings = make_skip_findings(changed_lines, min_diff_lines)
