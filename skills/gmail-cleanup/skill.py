@@ -1505,7 +1505,7 @@ def cmd_digest() -> str:
     queue = json.loads(queue_json)
 
     if not queue:
-        return ""
+        return "📭 Gmail: inbox clean — nothing to action."
 
     grouped: dict[str, list] = {a: [] for a in ACTIONS}
     for item in queue:
