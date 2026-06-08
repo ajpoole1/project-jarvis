@@ -226,8 +226,19 @@ jobs:
           # Merge main into dev-queue so it stays current.
           # dev-queue holds devnotes only on top of main, so this is always fast-forwardable
           # after a merge to main (main is an ancestor of dev-queue).
+          ITEM_ID="${{ steps.item.outputs.item_id }}"
+          QUEUE_PATH="knowledge/dev-notes/queue/$ITEM_ID.md"
+
           git fetch origin main
           git merge origin/main --no-edit -m "reconcile: merge main into dev-queue after merge" || true
+
+          # Re-assert queue file removal: start-build.sh copies the spec onto the feature
+          # branch, which lands on main via the PR merge. git merge sees it as "they added a
+          # file" (no conflict) and silently restores queue/ — undo that here.
+          if [ -f "$QUEUE_PATH" ]; then
+            git rm -f "$QUEUE_PATH"
+            git commit -m "cleanup: re-remove $ITEM_ID from queue/ after reconcile"
+          fi
 
       - name: Push dev-queue
         if: steps.item.outputs.found == 'true'

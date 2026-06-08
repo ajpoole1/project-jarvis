@@ -163,6 +163,8 @@ jobs:
           - If spec is 'none' or empty, review against repo conventions (CLAUDE.md) only
           - If there are no issues in a category, return an empty array for that key
           - Never return null — return [] for empty arrays
+          - Keep descriptions concise: each string value must be 120 characters or shorter
+          - Cap findings: return at most 8 items per array; if more exist, include the most important and add a single architecture_note summarising what was omitted
           """
 
           user_content = f"""## Spec (item: {item_id})
@@ -182,7 +184,7 @@ jobs:
               {"role": "user", "content": user_content}
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": 4096,
+            "max_tokens": 8192,
           }
 
           # Outer loop: retry the full model call if JSON parse fails (up to _MAX_JSON_ATTEMPTS).
