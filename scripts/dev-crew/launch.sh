@@ -90,12 +90,22 @@ KEY_SOURCE="${KEY_SOURCE/#\~/$HOME}"
 
 # Always start from a CLEAN base: inherit only PATH, HOME, TERM, LANG, USER.
 # This guarantees no ambient ANTHROPIC_API_KEY leaks in.
+#
+# ANTHROPIC_MODEL pins the model for every launched `claude` session. This is the
+# authoritative pin for RC-spawned builder sessions, which otherwise inherit the
+# account default (Opus): the env var outranks both project .claude/settings.json
+# and the account default, so it holds regardless of whether settings.json
+# propagates into an RC --spawn worktree session. The settings.json "model" key is
+# kept as belt-and-suspenders. Note: this default also applies to the `claude` CLI
+# for the api/classifier profile — skill classifiers that hit the API SDK with an
+# explicit model= argument are unaffected (the env var only sets the CLI default).
 CLEAN_ENV=(
     "PATH=$PATH"
     "HOME=$HOME"
     "TERM=${TERM:-xterm}"
     "LANG=${LANG:-en_US.UTF-8}"
     "USER=${USER:-$(whoami)}"
+    "ANTHROPIC_MODEL=claude-sonnet-4-6"
 )
 
 case "$AUTH_TYPE" in
