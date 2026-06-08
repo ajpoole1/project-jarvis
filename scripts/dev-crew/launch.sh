@@ -121,21 +121,21 @@ esac
 
 # ── pre-launch /status assertion ───────────────────────────────────────────────
 
-log "Running pre-launch /status assertion for profile='$PROFILE'"
+log "Running pre-launch auth assertion for profile='$PROFILE'"
 
-STATUS_OUT=$(env -i "${LAUNCH_ENV[@]}" claude /status 2>&1) || true
+STATUS_OUT=$(env -i "${LAUNCH_ENV[@]}" claude auth status 2>&1) || true
 
 if [[ -z "$STATUS_OUT" ]]; then
-    abort "/status returned empty output — cannot verify auth. Confirm 'claude /status' is machine-parseable on this machine before using launch.sh."
+    abort "auth status returned empty output — cannot verify auth. Confirm 'claude auth status' works for this profile before using launch.sh."
 fi
 
 case "$AUTH_TYPE" in
     subscription)
-        # Expect Max plan tokens — grep for "Max" (case-insensitive)
-        if ! echo "$STATUS_OUT" | grep -qi "max"; then
-            abort "/status does not show Max auth for subscription profile '$PROFILE'. Output: $STATUS_OUT"
+        # Expect first-party OAuth (Pro/Max subscription), not an API key
+        if ! echo "$STATUS_OUT" | grep -q '"apiProvider": *"firstParty"'; then
+            abort "auth status does not show first-party OAuth for '$PROFILE'. Output: $STATUS_OUT"
         fi
-        log "Auth assertion passed: Max OAuth confirmed"
+        log "Auth assertion passed: first-party OAuth confirmed"
         ;;
     api)
         # For API profile we just need claude to be reachable; key presence is the signal

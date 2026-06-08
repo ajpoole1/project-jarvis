@@ -214,7 +214,7 @@ def cmd_summon(args: list[str]) -> int:
         return 1
 
     repo_dir = persona["repo_dir"]
-    auth_profile = persona["auth"]
+    auth_profile = persona["role"]
     permission_mode = persona.get("permission_mode", "auto")
     rc_spawn = persona.get("rc_spawn", "worktree")
     display_name = f"{persona['name']} — {Path(repo_dir).name}"

@@ -16,9 +16,10 @@ import re
 import sqlite3
 import subprocess
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import anthropic
 import feedparser
@@ -41,6 +42,7 @@ CITY = os.environ.get("JARVIS_CITY", "Montreal")
 FETCH_TIMEOUT = 10
 
 _BRIEFING_DEDUP_SECONDS = 3600
+_TORONTO_TZ = ZoneInfo("America/Toronto")
 
 # Configurable via env as JSON, e.g. '[["CBC","https://..."],...]'
 _NEWS_SOURCES: list[tuple[str, str]] = json.loads(
@@ -113,6 +115,42 @@ def _strip_json_fences(raw: str) -> str:
         if raw.startswith("json"):
             raw = raw[4:]
     return raw.strip()
+
+
+def _toronto_today() -> date:
+    return datetime.now(_TORONTO_TZ).date()
+
+
+def _render_calendar_lines(events: list[dict], today: date) -> list[str]:
+    """Render event list as dated lines with Today/Tomorrow labels. No event is dateless."""
+    tomorrow = today + timedelta(days=1)
+    lines = []
+    for e in events:
+        start = e.get("start", "")
+        summary = e.get("summary", "")
+        try:
+            if "T" in start:
+                dt = datetime.fromisoformat(start)
+                dt_toronto = (
+                    dt.astimezone(_TORONTO_TZ) if dt.tzinfo else dt.replace(tzinfo=_TORONTO_TZ)
+                )
+                event_date = dt_toronto.date()
+                time_str = dt_toronto.strftime("%H:%M")
+            else:
+                event_date = date.fromisoformat(start)
+                time_str = "All day"
+        except (ValueError, KeyError):
+            lines.append(f"• {summary}")
+            continue
+        weekday = event_date.strftime("%a")
+        date_str = event_date.isoformat()
+        if event_date == today:
+            lines.append(f"• Today ({weekday} {date_str}) · {time_str} — {summary}")
+        elif event_date == tomorrow:
+            lines.append(f"• Tomorrow ({weekday} {date_str}) · {time_str} — {summary}")
+        else:
+            lines.append(f"• {weekday} {date_str} · {time_str} — {summary}")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -295,14 +333,7 @@ def _get_calendar() -> BriefBlock | None:
                 take="Nothing scheduled.",
                 detail="Nothing scheduled today.",
             )
-        lines = []
-        for e in events:
-            start = e.get("start", "")
-            summary = e.get("summary", "")
-            if "T" in start:
-                lines.append(f"• {start.split('T')[1][:5]} — {summary}")
-            else:
-                lines.append(f"• All day — {summary}")
+        lines = _render_calendar_lines(events, _toronto_today())
         detail = "\n".join(lines)
         return BriefBlock(
             type="calendar",
@@ -580,7 +611,7 @@ AJ's interest profile:
 Rules:
 - Genuine semantic match to AJ's interests AND both cross-cutting filters (grounded, applied)
 - Convergence pieces (hitting 2+ interests) are high-value
-- Write one direct "why you'd care" line per pick — Jarvis's voice: short, confident, no openers
+- Write one direct "why this matters to you" line per pick — addressed to AJ in second person ("you"/"your"). Never write in third person; never use "AJ is…" framing. Jarvis's voice: short, confident, no openers.
 - Prefer where "interesting" and "useful" merge
 
 Output JSON only:
@@ -642,15 +673,12 @@ Candidates:
 # ---------------------------------------------------------------------------
 
 
-def _compose_brief(client: anthropic.Anthropic, blocks: list[BriefBlock]) -> str:
-    """Sonnet composes the salience-ranked morning brief from the block data."""
+def _build_brief_prompt(blocks: list[BriefBlock], today: date, voice_text: str) -> str:
+    anchor = f"Today is {today.strftime('%A')}, {today.isoformat()} (America/Toronto)."
     ranked = sorted(blocks, key=lambda b: b.salience, reverse=True)
-
     context_parts = [f"[{b.type.upper()} | salience={b.salience}]\n{b.detail}" for b in ranked]
-
-    voice_text = _VOICE_PATH.read_text() if _VOICE_PATH.exists() else ""
-
-    prompt = (
+    return (
+        f"{anchor}\n\n"
         "You are Jarvis, AJ's personal assistant. Write AJ's morning briefing.\n\n"
         "Rules:\n"
         "- Open with ONE lead sentence naming the single most important thing today."
@@ -667,6 +695,15 @@ def _compose_brief(client: anthropic.Anthropic, blocks: list[BriefBlock]) -> str
         "Data blocks (salience-ranked):\n\n" + "\n\n".join(context_parts)
     )
 
+
+def _compose_brief(
+    client: anthropic.Anthropic, blocks: list[BriefBlock], today: date | None = None
+) -> str:
+    """Sonnet composes the salience-ranked morning brief from the block data."""
+    if today is None:
+        today = _toronto_today()
+    voice_text = _VOICE_PATH.read_text() if _VOICE_PATH.exists() else ""
+    prompt = _build_brief_prompt(blocks, today, voice_text)
     resp = client.messages.create(
         model=SONNET_MODEL,
         max_tokens=800,

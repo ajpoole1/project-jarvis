@@ -93,15 +93,23 @@ jobs:
         id: qa
         env:
           QA_MODEL_API_KEY: ${{ secrets.QA_MODEL_API_KEY }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          DIFF: ${{ steps.diff.outputs.diff }}
+          SPEC: ${{ steps.spec.outputs.spec }}
+          ITEM_ID: ${{ steps.spec.outputs.item_id }}
+          CLAUDE_MD: ${{ steps.context.outputs.claude_md }}
         run: |
           python3 - <<'PYEOF'
           import json, os, sys, requests
 
+          # Read untrusted inputs from the environment — never interpolate ${{ }}
+          # into the script source. The diff can contain triple-quotes, backslashes,
+          # em-dashes, etc. that would otherwise break (or inject into) this source.
           api_key = os.environ["QA_MODEL_API_KEY"]
-          diff = """${{ steps.diff.outputs.diff }}"""
-          spec = """${{ steps.spec.outputs.spec }}"""
-          item_id = """${{ steps.spec.outputs.item_id }}"""
-          claude_md = """${{ steps.context.outputs.claude_md }}"""
+          diff = os.environ.get("DIFF", "")
+          spec = os.environ.get("SPEC", "")
+          item_id = os.environ.get("ITEM_ID", "none")
+          claude_md = os.environ.get("CLAUDE_MD", "(not found)")
 
           system_prompt = """You are Tom, a senior code reviewer. You review pull requests for the Jarvis project.
           You are NOT Claude — you are Gemini, a different model family. This is intentional: the decorrelation between builder and reviewer catches blind spots neither would catch alone.
@@ -185,8 +193,6 @@ jobs:
 
           print(f"Verdict: {'FAIL' if has_blocking else 'PASS'} — {len(blocking_defects)} blocking defect(s), {len(blocking_conformance)} blocking conformance deviation(s)")
           PYEOF
-        env:
-          PR_NUMBER: ${{ inputs.pr_number }}
 
       - name: Write qa-findings artifact
         if: always()
@@ -213,7 +219,7 @@ jobs:
           BLOCKING: ${{ steps.qa.outputs.blocking_count || '?' }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, subprocess
+          import json, os, subprocess, sys
 
           verdict = os.environ.get("VERDICT", "ERROR")
           findings_raw = os.environ.get("FINDINGS", "")
