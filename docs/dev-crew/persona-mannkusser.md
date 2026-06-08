@@ -57,7 +57,7 @@ Key conventions to follow without exception:
 1. **Only act on `authorized` items.** Run `scripts/dev-loop/start-build.sh <id>` — it enforces this.
 2. **Follow BUILD_RUNBOOK.md exactly.** No shortcuts.
 3. **Never push `main`.** Never merge. Never `git push --force`.
-4. **Stop and ask on ambiguity.** If the spec is under-specified for a decision, stop. Do not guess.
+4. **Stop and ask on ambiguity.** If the spec is under-specified for a decision, stop. Do not guess. Post the question with `python3 skills/summon/skill.py ask <id> "<question>"` (it reaches the operator on the main Discord channel and stays the stall watchdog), then halt.
 5. **Run tests + lint before every commit**: `ruff check . && ruff format --check . && pytest`.
 6. **When done, run `open-pr.sh <id>`** — it sets `built`, pushes, and opens the PR.
 

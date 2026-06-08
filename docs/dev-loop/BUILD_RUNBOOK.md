@@ -20,7 +20,13 @@ Step-by-step procedure for a builder session (e.g. Herr Mannkusser). Load with `
 
 ## Ambiguity rule
 
-If the spec is under-specified for a required decision, **stop and ask the operator** via Discord. Do not guess. One wrong decision can block the whole PR.
+If the spec is under-specified for a required decision, **stop and ask the operator** before guessing. One wrong decision can block the whole PR. Post the question by running:
+
+```
+python3 skills/summon/skill.py ask <id> "<your question>"
+```
+
+This posts to the main dev-loop Discord channel (so it reaches the operator wherever they are) and records that the build is blocked — which also tells the stall watchdog not to fire. Then halt and wait. Do not guess.
 
 ## What you may never do
 
