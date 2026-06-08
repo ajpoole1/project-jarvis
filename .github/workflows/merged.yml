@@ -37,18 +37,33 @@ jobs:
         id: item
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          PR_BODY=$(gh pr view ${{ github.event.pull_request.number }} --json body -q '.body')
-          ITEM_ID=$(echo "$PR_BODY" | grep -oP '(?<=item-id: `)[\w-]+(?=`)' | head -1 || true)
+          # Not every PR is a dev-loop item: a genuinely-absent id means "skip" (exit 0).
+          # errexit is disabled here and every external call is guarded so that a no-match
+          # grep, a head -1 SIGPIPE under pipefail, or a gh hiccup can never turn a valid
+          # merge into a red workflow. PR_NUMBER comes via env, not templated into the body.
+          set +e
+          PR_BODY="$(gh pr view "$PR_NUMBER" --json body -q '.body')"
+          rc=$?
+          if [ "$rc" -ne 0 ] || [ -z "$PR_BODY" ]; then
+            echo "Could not read PR body (gh exit $rc or empty) — skipping cleanup."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
+          ITEM_ID="$(printf '%s\n' "$PR_BODY" | grep -oP '(?<=item-id: `)[\w-]+(?=`)' | head -n1)"
           if [ -z "$ITEM_ID" ]; then
             echo "No dev-loop item-id found in PR body — skipping."
             echo "found=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Item id: $ITEM_ID"
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "item_id=$ITEM_ID" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          echo "Item id: $ITEM_ID"
+          {
+            echo "found=true"
+            echo "item_id=$ITEM_ID"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Fetch dev-queue
         if: steps.item.outputs.found == 'true'

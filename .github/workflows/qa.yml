@@ -102,9 +102,9 @@ jobs:
           python3 - <<'PYEOF'
           import json, os, sys, requests
 
-          # Read untrusted inputs from the environment — never interpolate ${{ }}
-          # into the script source. The diff can contain triple-quotes, backslashes,
-          # em-dashes, etc. that would otherwise break (or inject into) this source.
+          # Read untrusted inputs from the environment, never by templating GitHub
+          # Actions expressions into the script source. The diff can contain triple-quotes,
+          # backslashes, em-dashes, etc. that would otherwise break (or inject into) it.
           api_key = os.environ["QA_MODEL_API_KEY"]
           diff = os.environ.get("DIFF", "")
           spec = os.environ.get("SPEC", "")
