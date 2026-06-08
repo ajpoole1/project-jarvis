@@ -45,6 +45,15 @@ _SKILL_ROOT = Path(__file__).parents[2] / "skills"
 _DISCORD_SCRIPT = Path(__file__).parents[2] / "scripts" / "discord_post.py"
 _HEARTBEAT_GAP_MIN = 30  # alert if gap between ticks exceeds this many minutes
 
+# Quiet-hours gate — shared single source of truth with the followups skill.
+# During this window outbound Discord posts are queued and flushed at quiet-end.
+_QUIET_START = int(os.environ.get("FOLLOW_UP_QUIET_START", "23"))  # local hour
+_QUIET_END = int(os.environ.get("FOLLOW_UP_QUIET_END", "9"))  # local hour
+
+# Discord user ID to @mention on high-signal posts (outages, errors, stall alerts).
+# Lives in ~/.jarvis.env as DISCORD_NOTIFY_USER_ID. Empty = no mention.
+_NOTIFY_USER_ID = os.environ.get("DISCORD_NOTIFY_USER_ID", "")
+
 # Shell metacharacter pattern — any arg matching this is rejected at propose time
 _SHELL_META = re.compile(r"[;&|><`\\]|\$\(|\$\{")
 
@@ -88,22 +97,67 @@ def _init_db() -> sqlite3.Connection:
             last_tick TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS outbound_queue (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            queued_at TEXT NOT NULL,
+            message   TEXT NOT NULL,
+            signal    TEXT NOT NULL DEFAULT 'ambient'
+        )
+    """)
     conn.commit()
     return conn
 
 
 # ---------------------------------------------------------------------------
-# Health-signal helpers
+# Quiet-hours helpers
 # ---------------------------------------------------------------------------
 
 
-def _post_discord(message: str) -> None:
-    """Fire-and-forget Discord post via discord_post.py. Never crashes the caller."""
+def _is_quiet_now() -> bool:
+    """True if the current local time is inside the quiet window."""
+    h = _now_local().hour
+    if _QUIET_START > _QUIET_END:  # wraps midnight, e.g. 23→9
+        return h >= _QUIET_START or h < _QUIET_END
+    return _QUIET_START <= h < _QUIET_END
+
+
+def _gap_is_expected_overnight(prev: datetime, now: datetime, gap_min: float) -> bool:
+    """True when the gap is explained by an expected overnight machine-off.
+
+    Fires when the last tick was at or within 2 hours of quiet-start (or already
+    inside the quiet window) and the gap is at least as long as the quiet window
+    minus a 2-hour restart buffer.  This avoids alerting when the PC is simply
+    shut down overnight.
+    """
+    quiet_duration_min = ((_QUIET_END - _QUIET_START + 24) % 24) * 60
+    if gap_min < quiet_duration_min - 120:
+        return False  # too short to be an overnight pause
+    prev_h = prev.astimezone(_LOCAL_TZ).hour
+    # Was the last tick inside quiet hours or within 2 hours before quiet-start?
+    if _QUIET_START > _QUIET_END:
+        in_quiet = prev_h >= _QUIET_START or prev_h < _QUIET_END
+    else:
+        in_quiet = _QUIET_START <= prev_h < _QUIET_END
+    hours_before_quiet = (_QUIET_START - prev_h) % 24
+    return in_quiet or hours_before_quiet <= 2
+
+
+# ---------------------------------------------------------------------------
+# Outbound delivery helpers
+# ---------------------------------------------------------------------------
+
+
+def _post_discord_direct(message: str, signal: str = "ambient") -> None:
+    """Post immediately to Discord (no quiet-hours check). Never crashes the caller."""
     if not _DISCORD_SCRIPT.exists():
         return
     try:
+        cmd = ["python3", str(_DISCORD_SCRIPT)]
+        if signal == "high" and _NOTIFY_USER_ID:
+            cmd.append("--mention")
         subprocess.run(
-            ["python3", str(_DISCORD_SCRIPT)],
+            cmd,
             input=message,
             text=True,
             capture_output=True,
@@ -113,18 +167,58 @@ def _post_discord(message: str) -> None:
         pass
 
 
+def _post_discord(conn: sqlite3.Connection, message: str, signal: str = "ambient") -> None:
+    """Route a Discord post through the quiet-hours gate.
+
+    During quiet hours: enqueue in outbound_queue (flushed at quiet-end).
+    Outside quiet hours: post immediately via _post_discord_direct.
+    signal='high' prepends an @mention to alert AJ when flushed/posted.
+    """
+    if _is_quiet_now():
+        conn.execute(
+            "INSERT INTO outbound_queue (queued_at, message, signal) VALUES (?, ?, ?)",
+            (_now_utc().isoformat(), message, signal),
+        )
+        conn.commit()
+    else:
+        _post_discord_direct(message, signal)
+
+
+def _flush_outbound_queue(conn: sqlite3.Connection) -> None:
+    """Post all queued messages in insertion order and clear the queue.
+
+    Only called when not in quiet hours. Messages preserve their original signal
+    level so high-signal posts still get the @mention when flushed.
+    """
+    if _is_quiet_now():
+        return
+    rows = conn.execute("SELECT id, message, signal FROM outbound_queue ORDER BY id").fetchall()
+    if not rows:
+        return
+    ids = [row[0] for row in rows]
+    for _, message, signal in rows:
+        _post_discord_direct(message, signal)
+    conn.execute(
+        f"DELETE FROM outbound_queue WHERE id IN ({','.join('?' * len(ids))})",
+        ids,
+    )
+    conn.commit()
+
+
 def _tick_heartbeat(conn: sqlite3.Connection, now: datetime) -> None:
-    """Record this tick; alert if the gap since the last tick exceeded the threshold."""
+    """Record this tick; alert on a real gap (not an expected overnight pause)."""
     row = conn.execute("SELECT last_tick FROM heartbeat WHERE id = 1").fetchone()
     if row:
         prev = datetime.fromisoformat(row[0])
         if prev.tzinfo is None:
             prev = prev.replace(tzinfo=UTC)
         gap_min = (now - prev).total_seconds() / 60
-        if gap_min > _HEARTBEAT_GAP_MIN:
+        if gap_min > _HEARTBEAT_GAP_MIN and not _gap_is_expected_overnight(prev, now, gap_min):
             _post_discord(
-                f"⚠️ Jarvis heartbeat gap: last tick was {gap_min:.0f} min ago"
-                f" (threshold {_HEARTBEAT_GAP_MIN} min). System may have been offline."
+                conn,
+                f"⚠️ Jarvis heartbeat: {gap_min:.0f}-min gap detected"
+                f" (threshold {_HEARTBEAT_GAP_MIN} min). Dispatcher was offline.",
+                signal="high",
             )
     conn.execute(
         "INSERT OR REPLACE INTO heartbeat (id, last_tick) VALUES (1, ?)",
@@ -530,6 +624,8 @@ def cmd_dispatch(argv: list[str]) -> None:
     conn = _init_db()
     try:
         _tick_heartbeat(conn, now)
+        # Flush any messages deferred during quiet hours (no-op if still quiet or queue is empty).
+        _flush_outbound_queue(conn)
 
         rows = conn.execute(
             """SELECT id, skill, args, schedule, description
@@ -550,7 +646,9 @@ def cmd_dispatch(argv: list[str]) -> None:
                     file=sys.stderr,
                 )
                 _post_discord(
-                    f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) — skill file not found"
+                    conn,
+                    f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) — skill file not found",
+                    signal="high",
                 )
                 continue
 
@@ -578,25 +676,37 @@ def cmd_dispatch(argv: list[str]) -> None:
             except subprocess.TimeoutExpired:
                 status = "error:timeout"
                 _post_discord(
-                    f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) timed out after 120s"
+                    conn,
+                    f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) timed out after 120s",
+                    signal="high",
                 )
             except Exception as exc:  # noqa: BLE001
                 status = "error:exception"
                 print(f"[schedules] job={job_id} exception={exc}", file=sys.stderr)
                 _post_discord(
-                    f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) raised exception: {exc}"
+                    conn,
+                    f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) raised exception: {exc}",
+                    signal="high",
                 )
 
             if result is not None:
-                # Forward any skill output to Discord
+                # Forward any skill output to Discord.
+                # Skills may prefix SIGNAL:high\n to their stdout to request an @mention.
                 if result.stdout.strip():
-                    _post_discord(result.stdout.strip())
+                    raw = result.stdout.strip()
+                    _HIGH_PREFIX = "SIGNAL:high\n"
+                    if raw.startswith(_HIGH_PREFIX):
+                        _post_discord(conn, raw[len(_HIGH_PREFIX) :], signal="high")
+                    else:
+                        _post_discord(conn, raw, signal="ambient")
                 # Alert on failure
                 if result.returncode != 0:
                     err_tail = (result.stderr or "").strip()[-400:]
                     _post_discord(
+                        conn,
                         f"⚠️ Jarvis scheduler: job {job_id} ({skill_name}) failed"
-                        f" ({status})\n```\n{err_tail}\n```"
+                        f" ({status})\n```\n{err_tail}\n```",
+                        signal="high",
                     )
 
             _record_run(conn, job_id, schedule, now, status)

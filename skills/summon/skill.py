@@ -390,18 +390,23 @@ def _set_pr_pinged(item_id: str, now: datetime) -> None:
 # ── Discord ───────────────────────────────────────────────────────────────────
 
 
-def _post_discord(message: str) -> bool:
+def _post_discord(message: str, mention: bool = False) -> bool:
     """Post to the MAIN Discord channel via scripts/discord_post.py (stdin). Best-effort.
 
     discord_post.py routes to DISCORD_WEBHOOK_URL — the main channel — deliberately, so a
     blocked build reaches AJ wherever he is. DISCORD_DEVLOOP_WEBHOOK stays for QA verdicts.
+    Pass mention=True for high-signal posts (blocked questions, critical alerts) so Discord
+    push-notifies AJ via the @mention.
     """
     if not DISCORD_SCRIPT.exists():
         print(f"discord_post.py not found at {DISCORD_SCRIPT}", file=sys.stderr)
         return False
     try:
+        cmd = ["python3", str(DISCORD_SCRIPT)]
+        if mention:
+            cmd.append("--mention")
         result = subprocess.run(
-            ["python3", str(DISCORD_SCRIPT)],
+            cmd,
             input=message,
             text=True,
             capture_output=True,
@@ -698,7 +703,7 @@ def cmd_ask(args: list[str]) -> int:
     persona = row[0] if row else "builder"
 
     message = f"🟡 **{persona}** is blocked on `{item_id}` and needs a decision:\n> {question}"
-    posted = _post_discord(message)
+    posted = _post_discord(message, mention=True)
     _set_question(item_id, datetime.now(UTC))
 
     if not posted:
@@ -748,20 +753,24 @@ def cmd_watchdog_check(args: list[str]) -> int:
         return 0
 
     # ── escalating stall alert ────────────────────────────────────────────────
+    # SIGNAL:high prefix tells the dispatcher to @mention AJ on these posts.
     if is_stalled({"question_at": question_at}, progressed):
         name = persona.get("name", persona_id)
         if check_minutes <= 5:
             print(
+                f"SIGNAL:high\n"
                 f"⏱️ Builder {name} on `{item_id}` — {check_minutes} min, no PR yet "
                 f"(may still be setting up or working fast)."
             )
         elif check_minutes <= 15:
             print(
+                f"SIGNAL:high\n"
                 f"⚠️ Builder {name} quiet for {check_minutes} min on `{item_id}` — "
                 f"no PR and no question yet. May need attention."
             )
         else:
             print(
+                f"SIGNAL:high\n"
                 f"🚨 Builder {name} appears stalled on `{item_id}` — no PR and no posted "
                 f"question after {check_minutes} min. Intervene: reconnect via claude.ai/code, "
                 f"or `summon dismiss {persona_id}` and re-summon."

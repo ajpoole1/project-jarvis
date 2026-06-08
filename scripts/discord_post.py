@@ -17,6 +17,7 @@ if _env_path.exists():
             os.environ.setdefault(_key.strip(), _val.strip())
 
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+NOTIFY_USER_ID = os.environ.get("DISCORD_NOTIFY_USER_ID", "")
 MAX_CHARS = 1900  # Discord limit is 2000; leave buffer for safety
 
 
@@ -62,6 +63,9 @@ def post(message: str) -> None:
 
 
 if __name__ == "__main__":
+    mention = "--mention" in sys.argv
     message = sys.stdin.read().strip()
     if message:
+        if mention and NOTIFY_USER_ID:
+            message = f"<@{NOTIFY_USER_ID}> {message}"
         post(message)
