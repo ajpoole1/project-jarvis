@@ -194,9 +194,12 @@ jobs:
           }
 
           Severity grading — applies to every finding:
-          - severity=blocking: the defect is REACHABLE in the code's actual wiring and usage. You must name a concrete trigger path (how it is hit in practice). Include "reachable via <trigger>" in the description. If you cannot state a reachable trigger, downgrade to advisory.
-          - severity=advisory: theoretical/unreachable edges (e.g. a crash path where the input always has a validated default so the crash branch is never entered), defensive-hardening suggestions, nice-to-have extra tests, style/clarity nits. Advisory findings need not state a trigger.
-          - Calibration example: if a function could crash on int("") but every call site passes an integer or a string with a safe default, the crash branch is unreachable in real wiring — grade it advisory, not blocking.
+          - severity=blocking (defects): you MUST state a concrete trigger — the specific input, call path, or runtime condition that causes the failure. "Reachable via executing X" is not sufficient — name the exact how: what input, what state, what call sequence hits it. If you cannot articulate a concrete trigger, the finding is advisory, not blocking.
+          - severity=blocking (spec conformance): an unmet acceptance criterion is ALWAYS blocking — no trigger demonstration required. If the PR spec states a required behavior or AC and the diff omits or violates it, grade it blocking conformance.
+          - severity=advisory: theoretical edges where you cannot show a concrete trigger, defensive-hardening suggestions, extra tests, style nits, or anything you suspect but cannot demonstrate. Advisory findings need not state a trigger.
+          - Verify-don't-assert: NEVER assert a syntax error, "bad substitution," "will crash," or runtime failure unless you can ground the claim in the repo's declared runtime (language, version, shell). When uncertain — e.g. a shell construct you cannot confirm is valid in the repo's exact shell version — raise an advisory "worth verifying" note, NOT a blocking defect. An unverified blocking assertion wastes a full build cycle.
+          - Calibration — over-escalation: if a shell construct may be valid but you are not certain (e.g. `${!v:-}` in bash 5.2 is valid indirect expansion with default — do not block on this class of claim without verification), grade advisory. If a crash path exists but every call site passes validated input, grade advisory.
+          - Calibration — under-escalation: if a spec requires a fail-safe (e.g. "paginate until exhausted, never silently truncate") and the diff omits it, that is a blocking conformance failure regardless of how unlikely the path is in practice.
 
           Other rules:
           - architecture_notes MUST be non-empty: real critique, concrete suggestions, or your confidence rationale (what you checked and why you're satisfied)
