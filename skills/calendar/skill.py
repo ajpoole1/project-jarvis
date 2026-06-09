@@ -134,7 +134,10 @@ def _paginate_events(
         req = {**list_kwargs, "calendarId": calendar_id, "maxResults": 250}
         if page_token:
             req["pageToken"] = page_token
-        result = service.events().list(**req).execute()
+        try:
+            result = service.events().list(**req).execute()
+        except Exception:
+            return events, True
         events.extend(result.get("items", []))
         page_token = result.get("nextPageToken")
         if not page_token:

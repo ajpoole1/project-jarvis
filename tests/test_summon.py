@@ -165,3 +165,106 @@ def test_watchdog_check_silent_when_no_record(tmp_db, capsys):
     rc = _mod.cmd_watchdog_check(["2026-0009-unknown"])
     assert rc == 0
     assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# _classify_verdict — ERROR branch
+# ---------------------------------------------------------------------------
+
+
+def test_classify_verdict_error():
+    """Tom posts '## Tom QA — ERROR' when it cannot run; sweep must surface it."""
+    body = (
+        "## Tom QA — ERROR\n\n"
+        "Tom could not produce findings. This check is **red** by design (fail-closed)."
+    )
+    assert _mod._classify_verdict(body) == "ERROR"
+
+
+def test_classify_verdict_non_tom_comment_returns_empty():
+    assert _mod._classify_verdict("some unrelated PR comment") == ""
+
+
+def test_classify_verdict_unknown_format_returns_empty():
+    """A Tom comment with no recognized verdict keyword returns ''; the sweep converts it
+    to ERROR via belt-and-suspenders so it is never silently dropped."""
+    body = "## Tom QA\n\nFuture format with no recognized verdict token."
+    assert _mod._classify_verdict(body) == ""
+
+
+# ---------------------------------------------------------------------------
+# _build_verdict_message — ERROR branch
+# ---------------------------------------------------------------------------
+
+
+def test_build_verdict_message_error_contains_url_and_item():
+    msg = _mod._build_verdict_message(
+        "ERROR",
+        "2026-0013-foo",
+        "Herr Mannkusser",
+        "https://github.com/x/y/pull/43",
+        "## Tom QA — ERROR\n\nTom could not produce findings.",
+    )
+    assert "ERROR" in msg
+    assert "2026-0013-foo" in msg
+    assert "https://github.com/x/y/pull/43" in msg
+
+
+# ---------------------------------------------------------------------------
+# cmd_verdict_sweep — ERROR verdict and belt-and-suspenders
+# ---------------------------------------------------------------------------
+
+
+def test_verdict_sweep_surfaces_error_verdict(tmp_db, monkeypatch, capsys):
+    """A Tom comment with ERROR verdict is emitted to stdout (SIGNAL:high path)."""
+    from datetime import UTC, datetime
+
+    item = "2026-0013-err"
+    _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
+
+    monkeypatch.setattr(
+        _mod,
+        "_fetch_active_verdict",
+        lambda *a: (
+            "OPEN",
+            "https://github.com/x/y/pull/43",
+            "ERROR",
+            "comment-node-001",
+            "## Tom QA — ERROR\n\nTom could not produce findings.",
+            False,
+        ),
+    )
+
+    rc = _mod.cmd_verdict_sweep([])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ERROR" in out
+    assert item in out
+
+
+def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch, capsys):
+    """Belt-and-suspenders: a Tom comment that classifies to '' is never silently dropped;
+    it surfaces as ERROR so AJ always sees unexpected Tom output."""
+    from datetime import UTC, datetime
+
+    item = "2026-0013-unk"
+    _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
+
+    monkeypatch.setattr(
+        _mod,
+        "_fetch_active_verdict",
+        lambda *a: (
+            "OPEN",
+            "https://github.com/x/y/pull/99",
+            "",  # unrecognized verdict — sweep must not drop this
+            "comment-node-002",
+            "## Tom QA\n\nFuture format with no recognized verdict token.",
+            False,
+        ),
+    )
+
+    rc = _mod.cmd_verdict_sweep([])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert item in out
+    assert out.strip() != ""  # something was emitted — never silent

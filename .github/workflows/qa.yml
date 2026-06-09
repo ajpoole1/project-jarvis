@@ -228,10 +228,11 @@ jobs:
           }
 
           # Outer loop: retry the full model call if JSON parse fails (up to _MAX_JSON_ATTEMPTS).
-          # Inner loop: retry on transient HTTP 503/429 with exponential backoff (2s → 4s → 8s).
-          # Persistent HTTP errors or all JSON retries exhausted → fail closed (sys.exit(1)).
+          # Inner loop: retry on transient HTTP 503/429 or network errors with exponential backoff.
+          # PR #43 post-mortem: 3 consecutive 503s exhausted the budget; increased to 5.
+          # Persistent HTTP errors or all retries exhausted → fail closed (sys.exit(1)).
           _RETRY_STATUSES = {429, 503}
-          _MAX_ATTEMPTS = 3
+          _MAX_ATTEMPTS = 5
           _MAX_JSON_ATTEMPTS = 3
           findings = None
           _last_raw = ""
@@ -239,15 +240,24 @@ jobs:
           for _json_attempt in range(1, _MAX_JSON_ATTEMPTS + 1):
             resp = None
             for _attempt in range(1, _MAX_ATTEMPTS + 1):
-              resp = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-                headers={
-                  "Authorization": f"Bearer {api_key}",
-                  "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=120,
-              )
+              try:
+                resp = requests.post(
+                  "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                  headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                  },
+                  json=payload,
+                  timeout=120,
+                )
+              except requests.exceptions.RequestException as _net_err:
+                _delay = 2 * (2 ** (_attempt - 1))
+                if _attempt < _MAX_ATTEMPTS:
+                  print(f"Tom network error (attempt {_attempt}/{_MAX_ATTEMPTS}): {_net_err} — retrying in {_delay}s", file=sys.stderr)
+                  time.sleep(_delay)
+                  continue
+                print(f"Tom network error persisted after {_MAX_ATTEMPTS} attempts: {_net_err} — failing closed", file=sys.stderr)
+                sys.exit(1)
               if resp.status_code not in _RETRY_STATUSES:
                 break
               _delay = 2 * (2 ** (_attempt - 1))
@@ -257,8 +267,8 @@ jobs:
               else:
                 print(f"Tom transient {resp.status_code} persisted after {_MAX_ATTEMPTS} attempts — failing closed", file=sys.stderr)
 
-            if resp.status_code != 200:
-              print(f"Tom API error {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
+            if resp is None or resp.status_code != 200:
+              print(f"Tom API error {resp.status_code if resp else 'no response'}: {resp.text[:500] if resp else ''}", file=sys.stderr)
               sys.exit(1)
 
             _last_raw = resp.json()["choices"][0]["message"]["content"]

@@ -64,8 +64,8 @@ _PUNCT = re.compile(r"[^\w\s]")
 
 def _normalize(title: str) -> str:
     t = title.lower().strip()
-    t = _LEADING_ARTICLE.sub("", t)
     t = _PUNCT.sub("", t)
+    t = _LEADING_ARTICLE.sub("", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -213,12 +213,17 @@ def cmd_filter(args: list[str]) -> str:
     conn = _init_db()
     norm_to_original: dict[str, str] = {_normalize(t): t for t in titles}
 
-    placeholders = ",".join("?" * len(norm_to_original))
-    rows = conn.execute(
-        f"SELECT DISTINCT title_norm FROM media_log WHERE title_norm IN ({placeholders})",
-        list(norm_to_original.keys()),
-    ).fetchall()
-    seen_norms = {r[0] for r in rows}
+    _SQLITE_VAR_LIMIT = 999
+    norms = list(norm_to_original.keys())
+    seen_norms: set[str] = set()
+    for i in range(0, len(norms), _SQLITE_VAR_LIMIT):
+        batch = norms[i : i + _SQLITE_VAR_LIMIT]
+        placeholders = ",".join("?" * len(batch))
+        rows = conn.execute(
+            f"SELECT DISTINCT title_norm FROM media_log WHERE title_norm IN ({placeholders})",
+            batch,
+        ).fetchall()
+        seen_norms.update(r[0] for r in rows)
 
     fresh = []
     seen = []
