@@ -173,6 +173,21 @@ class TestPaginateEvents:
         all_args.update(calls[1].kwargs or {})
         assert "pageToken" in all_args
 
+    def test_api_error_mid_pagination_returns_partial(self):
+        """API error on 2nd page: returns 1st-page events, truncated=True, no exception raised."""
+        page1 = [_make_event(f"ev{i}", f"2026-06-01T0{i}:00:00") for i in range(3)]
+        resp1 = {"items": page1, "nextPageToken": "tok1"}
+        execute_mock = MagicMock(side_effect=[resp1, Exception("simulated API error")])
+        list_mock = MagicMock(return_value=MagicMock(execute=execute_mock))
+        events_mock = MagicMock(return_value=MagicMock(list=list_mock))
+        svc = MagicMock()
+        svc.events = events_mock
+
+        events, truncated = _paginate_events(svc, "primary")  # must not raise
+
+        assert len(events) == 3
+        assert truncated is True
+
 
 # ===========================================================================
 # Part 2 — Watched-media store
@@ -211,6 +226,10 @@ class TestNormalize:
     def test_case_variants_match(self):
         assert _normalize("the summer i turned pretty") == _normalize("The Summer I Turned Pretty")
         assert _normalize("SUMMER I TURNED PRETTY") == _normalize("summer i turned pretty")
+
+    def test_leading_punctuation_stripped_before_article(self):
+        """Leading quote must not block article strip — punctuation goes first."""
+        assert _normalize('"The Summer I Turned Pretty"') == "summer i turned pretty"
 
 
 class TestSeed:
@@ -326,3 +345,10 @@ class TestCmdFilter:
         data = json.loads(raw)
         assert len(data["fresh"]) == 2
         assert data["seen"] == []
+
+    def test_filter_over_999_titles(self, media_db):
+        """1500 candidate titles must not raise OperationalError from SQLite variable limit."""
+        titles = [f"Show Title {i}" for i in range(1500)]
+        raw = _media.cmd_filter(["--titles", ",".join(titles)])
+        data = json.loads(raw)
+        assert len(data["fresh"]) + len(data["seen"]) == 1500
