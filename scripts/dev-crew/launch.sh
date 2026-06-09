@@ -108,6 +108,13 @@ CLEAN_ENV=(
     "ANTHROPIC_MODEL=claude-sonnet-4-6"
 )
 
+# Pass through gateway/RC vars so claude --remote-control registers with the
+# OpenClaw gateway (→ visible in claude.ai/code + app). NEVER pass ANTHROPIC_API_KEY
+# (the leak this scrub prevents) or CLAUDE_CODE_SESSION_ID (child needs its own).
+for v in OPENCLAW_GATEWAY_PORT XDG_RUNTIME_DIR CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH; do
+    if [ -n "${!v:-}" ]; then CLEAN_ENV+=("$v=${!v}"); fi
+done
+
 case "$AUTH_TYPE" in
     subscription)
         log "Profile='$PROFILE' auth=subscription — Max OAuth; API key absent by construction"
