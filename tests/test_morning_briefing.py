@@ -131,3 +131,298 @@ def test_reads_coda_pick_prompt_second_person():
     pick_prompt = captured[skill.SONNET_MODEL]
     assert "second person" in pick_prompt.lower(), "pick prompt must instruct second-person voice"
     assert "AJ is" in pick_prompt, "pick prompt must explicitly forbid 'AJ is…' framing"
+
+
+# ---------------------------------------------------------------------------
+# Ellie dress — helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_wttr_data(
+    drop_feels: float,
+    drop_rain: int = 0,
+    drop_wind: int = 0,
+    pick_feels: float | None = None,
+    pick_rain: int = 0,
+    pick_wind: int = 0,
+) -> dict:
+    """Minimal mock wttr.in j1 payload for two daycare windows."""
+    if pick_feels is None:
+        pick_feels = drop_feels
+
+    def slot(time_str: str, feels: float, rain: int, wind: int) -> dict:
+        return {
+            "time": time_str,
+            "FeelsLikeC": str(int(feels)),
+            "tempC": str(int(feels)),
+            "chanceofrain": str(rain),
+            "windspeedKmph": str(wind),
+            "weatherDesc": [{"value": "Partly cloudy"}],
+        }
+
+    return {
+        "weather": [
+            {
+                "maxtempC": str(int(max(drop_feels, pick_feels))),
+                "mintempC": str(int(min(drop_feels, pick_feels))),
+                "hourly": [
+                    slot("0", drop_feels, 0, 0),
+                    slot("300", drop_feels, 0, 0),
+                    slot("600", drop_feels, 0, 0),
+                    slot("900", drop_feels, drop_rain, drop_wind),
+                    slot("1200", pick_feels, 0, 0),
+                    slot("1500", pick_feels, pick_rain, pick_wind),
+                    slot("1800", pick_feels, 0, 0),
+                    slot("2100", pick_feels, 0, 0),
+                ],
+            }
+        ],
+        "current_condition": [
+            {"weatherDesc": [{"value": "Partly cloudy"}], "temp_C": str(int(drop_feels))}
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ellie dress — _layer_for_temp boundaries
+# ---------------------------------------------------------------------------
+
+
+def test_layer_for_temp_hot():
+    assert skill._layer_for_temp(skill._TEMP_HOT) == "hat + sunscreen, light clothes"
+    assert skill._layer_for_temp(30.0) == "hat + sunscreen, light clothes"
+
+
+def test_layer_for_temp_warm():
+    assert skill._layer_for_temp(skill._TEMP_WARM) == "light clothes"
+    assert skill._layer_for_temp(21.0) == "light clothes"
+
+
+def test_layer_for_temp_mild():
+    assert skill._layer_for_temp(skill._TEMP_MILD) == "light jacket + long sleeves"
+    assert skill._layer_for_temp(14.0) == "light jacket + long sleeves"
+
+
+def test_layer_for_temp_cool():
+    assert skill._layer_for_temp(skill._TEMP_COOL) == "jacket + warm layers"
+    assert skill._layer_for_temp(8.0) == "jacket + warm layers"
+
+
+def test_layer_for_temp_cold():
+    assert skill._layer_for_temp(skill._TEMP_COLD) == "heavy jacket + hat + mittens"
+    assert skill._layer_for_temp(3.0) == "heavy jacket + hat + mittens"
+
+
+def test_layer_for_temp_below_zero():
+    assert skill._layer_for_temp(-5.0) == "snowsuit"
+
+
+def test_layer_for_temp_boundary_below_mild():
+    # 11.9 is below TEMP_MILD (12), so falls to cool
+    assert skill._layer_for_temp(11.9) == "jacket + warm layers"
+
+
+# ---------------------------------------------------------------------------
+# Ellie dress — weekday / weekend gate
+# ---------------------------------------------------------------------------
+
+
+def test_ellie_dress_weekday_returns_block():
+    data = _make_wttr_data(drop_feels=14, pick_feels=20)
+    monday = date(2026, 6, 8)  # Monday
+    block = skill._get_ellie_dress(data, monday)
+    assert block is not None
+    assert block.type == "ellie"
+    assert "10:00" in block.detail
+    assert "15:00" in block.detail
+
+
+def test_ellie_dress_saturday_omitted():
+    data = _make_wttr_data(drop_feels=14, pick_feels=20)
+    saturday = date(2026, 6, 7)  # Saturday
+    block = skill._get_ellie_dress(data, saturday)
+    assert block is None
+
+
+def test_ellie_dress_sunday_omitted():
+    data = _make_wttr_data(drop_feels=14, pick_feels=20)
+    sunday = date(2026, 6, 14)  # Sunday
+    block = skill._get_ellie_dress(data, sunday)
+    assert block is None
+
+
+def test_ellie_dress_all_weekdays_produce_block():
+    data = _make_wttr_data(drop_feels=14, pick_feels=20)
+    # Mon 2026-06-08 … Fri 2026-06-12
+    for day_offset in range(5):
+        d = date(2026, 6, 8 + day_offset)
+        assert d.weekday() < 5, f"{d} is not a weekday"
+        block = skill._get_ellie_dress(data, d)
+        assert block is not None, f"Expected block for {d}"
+
+
+# ---------------------------------------------------------------------------
+# Ellie dress — dressing logic (rules-based)
+# ---------------------------------------------------------------------------
+
+
+def test_ellie_dress_cool_morning_warm_rainy_afternoon():
+    """Classic spec scenario: cool drop-off, warm rainy pick-up."""
+    data = _make_wttr_data(drop_feels=12, pick_feels=21, pick_rain=40)
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is not None
+    detail = block.detail
+    # Drop-off: mild → light jacket
+    assert "light jacket" in detail
+    # Pick-up: warm + rain → pack rain coat note
+    assert "rain coat" in detail
+    assert "40%" in detail
+
+
+def test_ellie_dress_rain_likely_both_windows():
+    """≥60% rain → rain coat (not just pack)."""
+    data = _make_wttr_data(drop_feels=14, drop_rain=70, pick_feels=16, pick_rain=80)
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is not None
+    # "rain coat" should appear without the "(pack" qualifier for 70%
+    assert "rain coat" in block.detail
+
+
+def test_ellie_dress_rain_possible_shows_pack():
+    """30–59% rain → pack rain coat."""
+    data = _make_wttr_data(drop_feels=15, drop_rain=35)
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is not None
+    assert "pack rain coat" in block.detail
+
+
+def test_ellie_dress_no_rain_note_below_threshold():
+    """<30% rain → no rain mention."""
+    data = _make_wttr_data(drop_feels=20, drop_rain=20, pick_feels=22, pick_rain=20)
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is not None
+    assert "rain" not in block.detail.lower()
+
+
+def test_ellie_dress_hot_day():
+    data = _make_wttr_data(drop_feels=26, pick_feels=28)
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is not None
+    assert "hat" in block.detail
+    assert "sunscreen" in block.detail
+
+
+def test_ellie_dress_cold_day():
+    data = _make_wttr_data(drop_feels=3, pick_feels=4)
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is not None
+    assert "heavy jacket" in block.detail
+    assert "mittens" in block.detail
+
+
+def test_ellie_dress_breezy_note():
+    """Wind ≥ 30 kmph → 'breezy' appears in conditions."""
+    data = _make_wttr_data(drop_feels=14, drop_wind=35)
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is not None
+    assert "breezy" in block.detail
+
+
+def test_ellie_dress_calm_no_breezy():
+    """Wind < 30 kmph → no breezy note."""
+    data = _make_wttr_data(drop_feels=14, drop_wind=20)
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is not None
+    assert "breezy" not in block.detail
+
+
+# ---------------------------------------------------------------------------
+# Ellie dress — graceful degradation
+# ---------------------------------------------------------------------------
+
+
+def test_ellie_dress_none_data_graceful():
+    block = skill._get_ellie_dress(None, date(2026, 6, 9))
+    assert block is None
+
+
+def test_ellie_dress_empty_hourly_graceful():
+    data = {
+        "weather": [{"maxtempC": "20", "mintempC": "10", "hourly": []}],
+        "current_condition": [{"weatherDesc": [{"value": "Clear"}], "temp_C": "15"}],
+    }
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is None
+
+
+def test_ellie_dress_missing_target_slots_graceful():
+    """Hourly data present but neither 900 nor 1500 slot exists → None."""
+    data = {
+        "weather": [
+            {
+                "maxtempC": "20",
+                "mintempC": "10",
+                "hourly": [
+                    {
+                        "time": "600",
+                        "FeelsLikeC": "15",
+                        "tempC": "15",
+                        "chanceofrain": "0",
+                        "windspeedKmph": "10",
+                        "weatherDesc": [{"value": "Clear"}],
+                    },
+                ],
+            }
+        ],
+        "current_condition": [{"weatherDesc": [{"value": "Clear"}], "temp_C": "15"}],
+    }
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is None
+
+
+def test_ellie_dress_partial_slot_only_morning():
+    """Only 900 slot present (1500 missing) → still returns a block."""
+    data = {
+        "weather": [
+            {
+                "maxtempC": "15",
+                "mintempC": "10",
+                "hourly": [
+                    {
+                        "time": "900",
+                        "FeelsLikeC": "12",
+                        "tempC": "12",
+                        "chanceofrain": "0",
+                        "windspeedKmph": "5",
+                        "weatherDesc": [{"value": "Sunny"}],
+                    },
+                ],
+            }
+        ],
+        "current_condition": [{"weatherDesc": [{"value": "Sunny"}], "temp_C": "12"}],
+    }
+    block = skill._get_ellie_dress(data, date(2026, 6, 9))
+    assert block is not None
+    assert "10:00" in block.detail
+    assert "15:00" not in block.detail
+
+
+# ---------------------------------------------------------------------------
+# Single-fetch conformance (AC 3)
+# ---------------------------------------------------------------------------
+
+
+def test_get_weather_does_not_fetch_when_data_is_none():
+    """_get_weather(None) must not trigger a second fetch — None means fetch failed."""
+    with patch.object(skill, "_fetch_wttr_data") as mock_fetch:
+        result = skill._get_weather(None)
+    mock_fetch.assert_not_called()
+    assert result is None
+
+
+def test_get_weather_fetches_when_called_with_no_args():
+    """_get_weather() with no args should call _fetch_wttr_data exactly once."""
+    with patch.object(skill, "_fetch_wttr_data", return_value=None) as mock_fetch:
+        result = skill._get_weather()
+    mock_fetch.assert_called_once()
+    assert result is None

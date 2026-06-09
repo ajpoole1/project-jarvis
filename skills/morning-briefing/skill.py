@@ -44,6 +44,28 @@ FETCH_TIMEOUT = 10
 _BRIEFING_DEDUP_SECONDS = 3600
 _TORONTO_TZ = ZoneInfo("America/Toronto")
 
+# Daycare outdoor windows — see people/ellie.md for rationale
+# wttr.in j1 hourly `time` values: "0"=midnight, "300"=03:00, ..., "900"=09:00, "1500"=15:00
+_ELLIE_DROP_SLOT = "900"  # nearest 3-hour slot to 10:00 drop-off
+_ELLIE_PICK_SLOT = "1500"  # exact 15:00 pick-up window
+
+# Dressing thresholds — feels-like °C (toddler, Quebec outdoor exposure)
+_TEMP_HOT = 24  # ≥24 → hat + sunscreen, light clothes
+_TEMP_WARM = 18  # ≥18 → light clothes
+_TEMP_MILD = 12  # ≥12 → light jacket + long sleeves
+_TEMP_COOL = 6  # ≥6  → jacket + warm layers
+_TEMP_COLD = 0  # ≥0  → heavy jacket + hat + mittens  /  <0 → snowsuit
+
+# Rain probability thresholds (percent)
+_RAIN_LIKELY = 60  # ≥60 → rain coat (take it and use it)
+_RAIN_POSSIBLE = 30  # ≥30 → pack rain coat (just in case)
+
+# Sentinel: distinguishes "caller passed no data" from "caller passed None (fetch failed)"
+_UNSPECIFIED: object = object()
+
+# Wind speed (kmph) above which "breezy" appears in the conditions note
+_WIND_STRONG = 30
+
 # Configurable via env as JSON, e.g. '[["CBC","https://..."],...]'
 _NEWS_SOURCES: list[tuple[str, str]] = json.loads(
     os.environ.get("BRIEFING_NEWS_SOURCES", "null") or "null"
@@ -290,7 +312,8 @@ def _check_and_stamp_run() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _get_weather() -> BriefBlock | None:
+def _fetch_wttr_data() -> dict | None:
+    """Fetch wttr.in j1 payload once; callers share this response."""
     try:
         resp = requests.get(
             f"https://wttr.in/{quote_plus(CITY)}?format=j1",
@@ -298,7 +321,17 @@ def _get_weather() -> BriefBlock | None:
             headers={"User-Agent": "jarvis-briefing/1.0"},
         )
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _get_weather(data: object = _UNSPECIFIED) -> BriefBlock | None:
+    try:
+        if data is _UNSPECIFIED:
+            data = _fetch_wttr_data()
+        if data is None:
+            return None
         today = data["weather"][0]
         current = data["current_condition"][0]
         high = today["maxtempC"]
@@ -306,6 +339,78 @@ def _get_weather() -> BriefBlock | None:
         desc = current["weatherDesc"][0]["value"]
         raw = f"{CITY}: high {high}°C / low {low}°C, {desc.lower()}"
         return BriefBlock(type="weather", salience=35, take=raw, detail=raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _layer_for_temp(feels_c: float) -> str:
+    """Map feels-like °C to a layer recommendation for a toddler."""
+    if feels_c >= _TEMP_HOT:
+        return "hat + sunscreen, light clothes"
+    if feels_c >= _TEMP_WARM:
+        return "light clothes"
+    if feels_c >= _TEMP_MILD:
+        return "light jacket + long sleeves"
+    if feels_c >= _TEMP_COOL:
+        return "jacket + warm layers"
+    if feels_c >= _TEMP_COLD:
+        return "heavy jacket + hat + mittens"
+    return "snowsuit"
+
+
+def _render_ellie_window(slot: dict, label: str) -> str:
+    """Render one daycare outdoor window as a compact dressing note."""
+    try:
+        feels_c = float(slot.get("FeelsLikeC") or slot.get("tempC", 15))
+    except (TypeError, ValueError):
+        feels_c = 15.0
+    try:
+        rain_pct = int(slot.get("chanceofrain", 0))
+    except (TypeError, ValueError):
+        rain_pct = 0
+    try:
+        wind_kmph = int(slot.get("windspeedKmph", 0))
+    except (TypeError, ValueError):
+        wind_kmph = 0
+
+    conditions: list[str] = []
+    if rain_pct >= _RAIN_POSSIBLE:
+        conditions.append(f"{rain_pct}% rain")
+    if wind_kmph >= _WIND_STRONG:
+        conditions.append("breezy")
+
+    layer = _layer_for_temp(feels_c)
+    if rain_pct >= _RAIN_LIKELY:
+        layer += " + rain coat"
+    elif rain_pct >= _RAIN_POSSIBLE:
+        layer += " (pack rain coat)"
+
+    cond_str = ", " + ", ".join(conditions) if conditions else ""
+    return f"{label} feels {feels_c:.0f}°C{cond_str} → {layer}"
+
+
+def _get_ellie_dress(data: dict | None, today: date | None = None) -> BriefBlock | None:
+    """Toddler dressing line for Ellie's daycare outdoor windows. Weekdays only."""
+    try:
+        if today is None:
+            today = _toronto_today()
+        if today.weekday() > 4:  # Saturday=5, Sunday=6
+            return None
+        if data is None:
+            return None
+        hourly = data["weather"][0]["hourly"]
+        slots = {h["time"]: h for h in hourly}
+        drop_slot = slots.get(_ELLIE_DROP_SLOT)
+        pick_slot = slots.get(_ELLIE_PICK_SLOT)
+        if not drop_slot and not pick_slot:
+            return None
+        parts: list[str] = []
+        if drop_slot:
+            parts.append(_render_ellie_window(drop_slot, "10:00"))
+        if pick_slot:
+            parts.append(_render_ellie_window(pick_slot, "15:00"))
+        detail = "👶 **Ellie:** " + "; ".join(parts) + "."
+        return BriefBlock(type="ellie", salience=34, take="Ellie dressing check", detail=detail)
     except Exception:  # noqa: BLE001
         return None
 
@@ -747,17 +852,24 @@ def run() -> list[str]:
 
     client = anthropic.Anthropic()
     profile = _load_interests_profile()
+    today = _toronto_today()
+
+    # Single weather fetch — shared with the Ellie dress block (no duplicate HTTP call)
+    weather_data = _fetch_wttr_data()
 
     # Gather body blocks
     blocks: list[BriefBlock] = []
     for fn in (
-        _get_weather,
         _get_calendar,
         _get_deadlines,
         _get_gmail_priority,
         _get_dev_crew_standup,
     ):
         block = fn()
+        if block:
+            blocks.append(block)
+
+    for block in (_get_weather(weather_data), _get_ellie_dress(weather_data, today)):
         if block:
             blocks.append(block)
 
