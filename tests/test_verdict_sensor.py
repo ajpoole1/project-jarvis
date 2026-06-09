@@ -11,6 +11,7 @@ Acceptance criteria covered:
 from __future__ import annotations
 
 import importlib.util
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -175,7 +176,7 @@ def test_verdict_sweep_deduplication(tmp_db, monkeypatch, capsys):
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
 
     def mock_fetch(repo_dir, item_id, summoned_at):
-        return "OPEN", _PR_URL, "PASS", "IC_unique42", "## Tom QA — ✅ PASS\n..."
+        return "OPEN", _PR_URL, "PASS", "IC_unique42", "## Tom QA — ✅ PASS\n...", False
 
     monkeypatch.setattr(_mod, "_fetch_active_verdict", mock_fetch)
 
@@ -207,7 +208,7 @@ def test_verdict_sweep_refix_cycle(tmp_db, monkeypatch, capsys):
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
-        lambda *a: ("OPEN", _PR_URL, "FAIL", "IC_fail_001", "## Tom QA — 🚫 FAIL\n"),
+        lambda *a: ("OPEN", _PR_URL, "FAIL", "IC_fail_001", "## Tom QA — 🚫 FAIL\n", False),
     )
     _mod.cmd_verdict_sweep([])
     fail_out = capsys.readouterr().out
@@ -224,7 +225,7 @@ def test_verdict_sweep_refix_cycle(tmp_db, monkeypatch, capsys):
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
-        lambda *a: ("OPEN", _PR_URL, "PASS", "IC_pass_002", "## Tom QA — ✅ PASS\n"),
+        lambda *a: ("OPEN", _PR_URL, "PASS", "IC_pass_002", "## Tom QA — ✅ PASS\n", False),
     )
     _mod.cmd_verdict_sweep([])
     pass_out = capsys.readouterr().out
@@ -246,7 +247,7 @@ def test_verdict_sweep_signal_high_for_pass(tmp_db, monkeypatch, capsys):
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
-        lambda *a: ("OPEN", _PR_URL, "PASS", "IC_sp1", "## Tom QA — ✅ PASS"),
+        lambda *a: ("OPEN", _PR_URL, "PASS", "IC_sp1", "## Tom QA — ✅ PASS", False),
     )
     _mod.cmd_verdict_sweep([])
     out = capsys.readouterr().out
@@ -259,7 +260,7 @@ def test_verdict_sweep_signal_high_for_fail(tmp_db, monkeypatch, capsys):
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
-        lambda *a: ("OPEN", _PR_URL, "FAIL", "IC_sf1", "## Tom QA — 🚫 FAIL\n"),
+        lambda *a: ("OPEN", _PR_URL, "FAIL", "IC_sf1", "## Tom QA — 🚫 FAIL\n", False),
     )
     _mod.cmd_verdict_sweep([])
     out = capsys.readouterr().out
@@ -272,7 +273,7 @@ def test_verdict_sweep_signal_high_for_skip(tmp_db, monkeypatch, capsys):
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
-        lambda *a: ("OPEN", _PR_URL, "SKIP", "IC_sk1", "## Tom QA — ⏭️ SKIP"),
+        lambda *a: ("OPEN", _PR_URL, "SKIP", "IC_sk1", "## Tom QA — ⏭️ SKIP", False),
     )
     _mod.cmd_verdict_sweep([])
     out = capsys.readouterr().out
@@ -292,7 +293,7 @@ def test_verdict_sweep_retires_on_merged_pr(tmp_db, monkeypatch, capsys):
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
-        lambda *a: ("MERGED", _PR_URL, "PASS", "IC_m1", "## Tom QA — ✅ PASS"),
+        lambda *a: ("MERGED", _PR_URL, "PASS", "IC_m1", "## Tom QA — ✅ PASS", False),
     )
     _mod.cmd_verdict_sweep([])
 
@@ -312,7 +313,7 @@ def test_verdict_sweep_retires_on_closed_pr(tmp_db, monkeypatch, capsys):
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
-        lambda *a: ("CLOSED", _PR_URL, "", "", ""),
+        lambda *a: ("CLOSED", _PR_URL, "", "", "", False),
     )
     _mod.cmd_verdict_sweep([])
 
@@ -338,7 +339,7 @@ def test_verdict_sweep_silent_when_no_pr_yet(tmp_db, monkeypatch, capsys):
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
-        lambda *a: ("", "", "", "", ""),
+        lambda *a: ("", "", "", "", "", False),
     )
     _mod.cmd_verdict_sweep([])
     assert capsys.readouterr().out.strip() == ""
@@ -352,7 +353,119 @@ def test_verdict_sweep_silent_when_no_verdict_yet(tmp_db, monkeypatch, capsys):
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
-        lambda *a: ("OPEN", _PR_URL, "", "", ""),
+        lambda *a: ("OPEN", _PR_URL, "", "", "", False),
     )
     _mod.cmd_verdict_sweep([])
     assert capsys.readouterr().out.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# cmd_verdict_sweep — gh failure surfacing (AC2: #34 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def test_verdict_sweep_gh_fail_surfaces_signal(tmp_db, monkeypatch, tmp_path, capsys):
+    """A gh failure surfaces a SIGNAL:high notice, not a silent skip."""
+    item = "2026-0010-gh-fail"
+    _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
+
+    monkeypatch.setattr(
+        _mod,
+        "_fetch_active_verdict",
+        lambda *a: ("", "", "", "", "", True),
+    )
+    sentinel = tmp_path / "gh-fail-sentinel"
+    monkeypatch.setattr(_mod, "_GH_FAIL_SENTINEL", sentinel)
+
+    _mod.cmd_verdict_sweep([])
+    out = capsys.readouterr().out
+    assert "SIGNAL:high" in out
+    assert "gh" in out.lower()
+
+
+def test_verdict_sweep_gh_fail_throttled(tmp_db, monkeypatch, tmp_path, capsys):
+    """A gh failure within the cooldown window produces no stdout (throttled)."""
+    item = "2026-0010-gh-throttle"
+    _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
+
+    monkeypatch.setattr(
+        _mod,
+        "_fetch_active_verdict",
+        lambda *a: ("", "", "", "", "", True),
+    )
+    sentinel = tmp_path / "gh-fail-sentinel"
+    sentinel.write_text(str(time.time()))  # written just now — within cooldown
+    monkeypatch.setattr(_mod, "_GH_FAIL_SENTINEL", sentinel)
+
+    _mod.cmd_verdict_sweep([])
+    assert capsys.readouterr().out.strip() == ""
+
+
+def test_verdict_sweep_gh_fail_multiple_items_one_alert(tmp_db, monkeypatch, tmp_path, capsys):
+    """Multiple items with gh failures emit a single alert, not one per item."""
+    for i in range(3):
+        _mod._record_summon(f"2026-0010-multi-{i}", "mannkusser", "/tmp/wt", datetime.now(UTC))
+
+    monkeypatch.setattr(
+        _mod,
+        "_fetch_active_verdict",
+        lambda *a: ("", "", "", "", "", True),
+    )
+    sentinel = tmp_path / "gh-fail-sentinel"
+    monkeypatch.setattr(_mod, "_GH_FAIL_SENTINEL", sentinel)
+
+    _mod.cmd_verdict_sweep([])
+    out = capsys.readouterr().out
+    assert out.startswith("SIGNAL:high\n")
+    # The alert message should appear exactly once
+    assert out.count("verdict sensor") == 1
+
+
+def test_verdict_sweep_no_pr_yet_silent_on_gh_ok(tmp_db, monkeypatch, capsys):
+    """'No PR yet' (pr_state='', gh_failed=False) stays silent — distinct from gh failure."""
+    item = "2026-0010-no-pr-ok"
+    _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
+
+    monkeypatch.setattr(
+        _mod,
+        "_fetch_active_verdict",
+        lambda *a: ("", "", "", "", "", False),
+    )
+    _mod.cmd_verdict_sweep([])
+    assert capsys.readouterr().out.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# _should_emit_gh_fail_alert / _record_gh_fail_alert — throttle helpers
+# ---------------------------------------------------------------------------
+
+
+def test_should_emit_gh_fail_alert_true_when_no_sentinel(tmp_path):
+    """Returns True when no sentinel file exists (first failure ever)."""
+    sentinel = tmp_path / "nonexistent"
+    assert _mod._should_emit_gh_fail_alert(sentinel) is True
+
+
+def test_should_emit_gh_fail_alert_false_within_cooldown(tmp_path):
+    """Returns False when sentinel was written recently (within cooldown)."""
+    sentinel = tmp_path / "recent"
+    sentinel.write_text(str(time.time()))
+    assert _mod._should_emit_gh_fail_alert(sentinel) is False
+
+
+def test_should_emit_gh_fail_alert_true_after_cooldown(tmp_path):
+    """Returns True when sentinel is older than the cooldown window."""
+    sentinel = tmp_path / "old"
+    old_ts = time.time() - _mod.GH_FAIL_ALERT_COOLDOWN_SECONDS - 1
+    sentinel.write_text(str(old_ts))
+    assert _mod._should_emit_gh_fail_alert(sentinel) is True
+
+
+def test_record_gh_fail_alert_writes_sentinel(tmp_path):
+    """Stamps the sentinel file so subsequent checks see a recent timestamp."""
+    sentinel = tmp_path / "stamp"
+    before = time.time()
+    _mod._record_gh_fail_alert(sentinel)
+    assert sentinel.exists()
+    recorded = float(sentinel.read_text().strip())
+    assert recorded >= before
