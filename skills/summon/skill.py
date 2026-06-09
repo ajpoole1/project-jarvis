@@ -8,6 +8,7 @@ Commands:
                                     seeding Tom's QA findings + PR link into the kickoff
   ask <id> <question...>    (builder) post a blocking question to the dev-loop Discord
   watchdog-check <id> [min] (scheduler) stall check + milestone ping; prints if action needed
+  verdict-sweep             (scheduler) check all active builds for new Tom QA verdicts
   dismiss <persona>         Kill the tmux session + worktree for a persona
   reaper                    Kill all crew tmux sessions idle past IDLE_MINUTES
   status                    List live crew sessions with idle times
@@ -44,6 +45,7 @@ Security:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -341,6 +343,11 @@ def _db() -> sqlite3.Connection:
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        conn.execute("ALTER TABLE dev_crew_runs ADD COLUMN last_verdict_reported TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     return conn
 
 
@@ -355,7 +362,8 @@ def _record_summon(item_id: str, persona_id: str, worktree: str, now: datetime) 
                    persona=excluded.persona,
                    worktree=excluded.worktree,
                    summoned_at=excluded.summoned_at,
-                   question_at=NULL""",
+                   question_at=NULL,
+                   last_verdict_reported=NULL""",
             (item_id, persona_id, worktree, now.isoformat()),
         )
         conn.commit()
@@ -385,6 +393,157 @@ def _set_pr_pinged(item_id: str, now: datetime) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# ── verdict sensor helpers ────────────────────────────────────────────────────
+
+
+def _parse_iso(s: str) -> datetime | None:
+    """Parse an ISO datetime string (Z or +00:00 suffix) to a UTC-aware datetime."""
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except ValueError:
+        return None
+
+
+def _comment_identity(comment: dict) -> str:
+    """Stable dedupe key for a PR comment: node ID if present, else body hash."""
+    node_id = comment.get("id", "").strip()
+    if node_id:
+        return node_id
+    body = comment.get("body", "")
+    return "hash:" + hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+def _classify_verdict(body: str) -> str:
+    """Extract PASS, FAIL, or SKIP from a Tom QA PR comment body."""
+    if "## Tom QA" not in body:
+        return ""
+    if "✅ PASS" in body or "— PASS" in body:
+        return "PASS"
+    if "🚫 FAIL" in body or "— FAIL" in body:
+        return "FAIL"
+    if "⏭️ SKIP" in body or "— SKIP" in body:
+        return "SKIP"
+    return ""
+
+
+def _extract_blocking_summary(body: str) -> str:
+    """Extract bullet lines from the blocking section of a Tom QA FAIL comment."""
+    m = re.search(r"### 🚫 Blocking.*?\n(.*?)(?=###|---)", body, re.DOTALL)
+    if not m:
+        return ""
+    lines = [ln.strip() for ln in m.group(1).strip().splitlines() if ln.strip()]
+    if len(lines) > 5:
+        lines = lines[:5] + [f"… (+{len(lines) - 5} more)"]
+    return "\n".join(lines)
+
+
+def _build_verdict_message(
+    verdict: str, item_id: str, persona_name: str, pr_url: str, comment_body: str
+) -> str:
+    """Build the Discord verdict notification message for a Tom QA outcome."""
+    if verdict == "PASS":
+        return (
+            f"✅ Tom QA **PASS** on `{item_id}` — ready for your merge.\n"
+            f"PR: {pr_url} | Builder: {persona_name}"
+        )
+    if verdict == "SKIP":
+        return (
+            f"⏭️ Tom QA **SKIP** on `{item_id}` — trivial diff, ready for your merge.\n"
+            f"PR: {pr_url} | Builder: {persona_name}"
+        )
+    if verdict == "FAIL":
+        summary = _extract_blocking_summary(comment_body)
+        base = (
+            f"🚫 Tom QA **FAIL** on `{item_id}` — needs a fix. Authorize a refix?\n"
+            f"PR: {pr_url} | Builder: {persona_name}"
+        )
+        return base + (f"\nBlocking:\n{summary}" if summary else "")
+    return f"⚠️ Tom QA unknown verdict on `{item_id}` — check PR: {pr_url}"
+
+
+def _fetch_active_verdict(
+    repo_dir: str, item_id: str, summoned_at: str
+) -> tuple[str, str, str, str, str]:
+    """Return (pr_state, pr_url, verdict, comment_id, comment_body).
+
+    pr_state: 'OPEN', 'MERGED', 'CLOSED', or '' (no PR found)
+    verdict:  'PASS', 'FAIL', 'SKIP', or '' (no verdict after summoned_at)
+    Only considers Tom QA comments posted *after* summoned_at so that a re-summon
+    for a refix cycle does not re-report the FAIL that triggered the refix.
+    """
+    branch = f"feature/{item_id}"
+    try:
+        pr_result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--json",
+                "number,url,state",
+                "--limit",
+                "1",
+            ],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if pr_result.returncode != 0 or not pr_result.stdout.strip():
+            return "", "", "", "", ""
+        prs = json.loads(pr_result.stdout or "[]")
+        if not prs:
+            return "", "", "", "", ""
+        pr = prs[0]
+        pr_state = str(pr.get("state", "")).upper()
+        pr_url = pr.get("url", "")
+        pr_number = str(pr.get("number", ""))
+        if not pr_number:
+            return "", "", "", "", ""
+
+        comments_result = subprocess.run(
+            ["gh", "pr", "view", pr_number, "--json", "comments"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if comments_result.returncode != 0:
+            return pr_state, pr_url, "", "", ""
+        cdata = json.loads(comments_result.stdout or "{}")
+
+        summoned_dt = _parse_iso(summoned_at)
+        tom_after_summon = []
+        for c in cdata.get("comments", []):
+            if "## Tom QA" not in c.get("body", ""):
+                continue
+            created_dt = _parse_iso(c.get("createdAt", ""))
+            if summoned_dt and created_dt and created_dt <= summoned_dt:
+                continue  # predates or coincides with this summon — skip
+            tom_after_summon.append(c)
+
+        if not tom_after_summon:
+            return pr_state, pr_url, "", "", ""
+
+        latest = tom_after_summon[-1]  # gh returns in chronological order
+        comment_id = _comment_identity(latest)
+        comment_body = latest.get("body", "")
+        verdict = _classify_verdict(comment_body)
+        return pr_state, pr_url, verdict, comment_id, comment_body
+    except Exception:  # noqa: BLE001
+        return "", "", "", "", ""
 
 
 # ── Discord ───────────────────────────────────────────────────────────────────
@@ -520,6 +679,70 @@ def _arm_watchdog(item_id: str) -> None:
     """Arm escalating stall/milestone checks at each interval in WATCHDOG_CHECKS."""
     for minutes in WATCHDOG_CHECKS:
         _arm_single_watchdog(item_id, minutes)
+
+
+def _arm_verdict_sweep_if_needed() -> None:
+    """Arm a recurring 10m verdict-sweep schedule if one isn't already active.
+
+    Best-effort: a scheduling failure never blocks the (already-launched) build.
+    Idempotent: if a verdict-sweep schedule already exists and is enabled, no new
+    schedule is created so multiple summons don't accumulate duplicate sweeps.
+    """
+    if not SCHEDULES_SKILL.exists():
+        print("schedules skill not found — verdict-sweep not armed", file=sys.stderr)
+        return
+    try:
+        db_path = _db_path()
+        if db_path.exists():
+            conn = sqlite3.connect(str(db_path))
+            try:
+                rows = conn.execute(
+                    "SELECT id FROM schedules "
+                    "WHERE skill='summon' AND enabled=1 AND args LIKE '%verdict-sweep%'"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            finally:
+                conn.close()
+            if rows:
+                return  # already armed
+
+        proposed = subprocess.run(
+            [
+                "python3",
+                str(SCHEDULES_SKILL),
+                "propose",
+                "--skill",
+                "summon",
+                "--schedule",
+                "10m",
+                "--description",
+                "dev-crew verdict sweep — watch for Tom QA verdicts on active builds",
+                "--args",
+                json.dumps(["verdict-sweep"]),
+                "--created-by",
+                "summon",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if proposed.returncode != 0:
+            print(f"verdict-sweep arming failed: {proposed.stderr.strip()}", file=sys.stderr)
+            return
+        job_id = json.loads(proposed.stdout)["id"]
+        approved = subprocess.run(
+            ["python3", str(SCHEDULES_SKILL), "approve", str(job_id)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if approved.returncode != 0:
+            print(f"verdict-sweep approve failed: {approved.stderr.strip()}", file=sys.stderr)
+            return
+        print("Verdict-sweep schedule armed (10m recurring).")
+    except Exception as exc:  # noqa: BLE001
+        print(f"verdict-sweep arming error: {exc}", file=sys.stderr)
 
 
 # ── commands ──────────────────────────────────────────────────────────────────
@@ -659,6 +882,7 @@ def cmd_summon(args: list[str]) -> int:
 
     _record_summon(item_id, persona_id, str(wt), datetime.now(UTC))
     _arm_watchdog(item_id)
+    _arm_verdict_sweep_if_needed()
 
     url = capture_rc_url(url_file, timeout=15)
     if url:
@@ -778,6 +1002,70 @@ def cmd_watchdog_check(args: list[str]) -> int:
     return 0
 
 
+def cmd_verdict_sweep(_args: list[str]) -> int:
+    """verdict-sweep  — check all active builds for new Tom QA verdicts and report them.
+
+    Called by the heartbeat dispatcher on a 10m recurring schedule (armed at summon time).
+    For each active dev_crew_runs row:
+      - Fetches the PR's Tom QA comments posted after summoned_at
+      - Reports new verdicts (PASS/FAIL/SKIP) to Discord via SIGNAL:high stdout prefix
+      - Dedupes by comment node ID so each verdict posts exactly once
+      - Self-retires (removes the row) when the PR is merged or closed
+    Produces no output when there are no active builds or no new verdicts — silent no-op.
+    """
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT item, persona, summoned_at, last_verdict_reported FROM dev_crew_runs"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return 0
+
+    messages: list[str] = []
+    for item_id, persona_id, summoned_at, last_reported in rows:
+        persona = load_roster().get(persona_id, {})
+        repo_dir = persona.get("repo_dir", str(PROJECT))
+        persona_name = persona.get("name", persona_id)
+
+        pr_state, pr_url, verdict, comment_id, comment_body = _fetch_active_verdict(
+            repo_dir, item_id, summoned_at or ""
+        )
+
+        if not pr_state:
+            continue  # no PR yet — nothing to watch
+
+        # Report new verdict (deduped by comment identity)
+        if verdict and comment_id and comment_id != last_reported:
+            msg = _build_verdict_message(verdict, item_id, persona_name, pr_url, comment_body)
+            messages.append(msg)
+            upd = _db()
+            try:
+                upd.execute(
+                    "UPDATE dev_crew_runs SET last_verdict_reported = ? WHERE item = ?",
+                    (comment_id, item_id),
+                )
+                upd.commit()
+            finally:
+                upd.close()
+
+        # Self-retire when PR is in a terminal state
+        if pr_state in ("MERGED", "CLOSED"):
+            del_conn = _db()
+            try:
+                del_conn.execute("DELETE FROM dev_crew_runs WHERE item = ?", (item_id,))
+                del_conn.commit()
+            finally:
+                del_conn.close()
+
+    if messages:
+        print("SIGNAL:high\n" + "\n\n".join(messages))
+
+    return 0
+
+
 def cmd_dismiss(args: list[str]) -> int:
     """dismiss <persona>  — kill the tmux session and remove any build worktree(s)."""
     if not args:
@@ -862,6 +1150,7 @@ def main() -> int:
         "summon": cmd_summon,
         "ask": cmd_ask,
         "watchdog-check": cmd_watchdog_check,
+        "verdict-sweep": cmd_verdict_sweep,
         "dismiss": cmd_dismiss,
         "reaper": cmd_reaper,
         "status": cmd_status,
@@ -869,7 +1158,7 @@ def main() -> int:
     fn = dispatch.get(cmd)
     if fn is None:
         print(
-            f"Unknown command '{cmd}'; use summon|ask|watchdog-check|dismiss|reaper|status",
+            f"Unknown command '{cmd}'; use summon|ask|watchdog-check|verdict-sweep|dismiss|reaper|status",
             file=sys.stderr,
         )
         return 1
