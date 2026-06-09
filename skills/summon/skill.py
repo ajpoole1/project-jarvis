@@ -452,7 +452,7 @@ def _comment_identity(comment: dict) -> str:
 
 
 def _classify_verdict(body: str) -> str:
-    """Extract PASS, FAIL, or SKIP from a Tom QA PR comment body."""
+    """Extract PASS, FAIL, SKIP, or ERROR from a Tom QA PR comment body."""
     if "## Tom QA" not in body:
         return ""
     if "✅ PASS" in body or "— PASS" in body:
@@ -461,6 +461,8 @@ def _classify_verdict(body: str) -> str:
         return "FAIL"
     if "⏭️ SKIP" in body or "— SKIP" in body:
         return "SKIP"
+    if "— ERROR" in body:
+        return "ERROR"
     return ""
 
 
@@ -496,6 +498,11 @@ def _build_verdict_message(
             f"PR: {pr_url} | Builder: {persona_name}"
         )
         return base + (f"\nBlocking:\n{summary}" if summary else "")
+    if verdict == "ERROR":
+        return (
+            f"⚠️ Tom QA **ERROR** on `{item_id}` — Tom could not run, merge is blocked.\n"
+            f"Check the QA workflow logs.\nPR: {pr_url} | Builder: {persona_name}"
+        )
     return f"⚠️ Tom QA unknown verdict on `{item_id}` — check PR: {pr_url}"
 
 
@@ -1104,9 +1111,14 @@ def cmd_verdict_sweep(_args: list[str]) -> int:
         if not pr_state:
             continue  # no PR yet — nothing to watch
 
-        # Report new verdict (deduped by comment identity)
-        if verdict and comment_id and comment_id != last_reported:
-            msg = _build_verdict_message(verdict, item_id, persona_name, pr_url, comment_body)
+        # Report new verdict (deduped by comment identity).
+        # Belt-and-suspenders: any new Tom comment with an unrecognized verdict is
+        # surfaced as ERROR rather than silently dropped (e.g. future new verdict tokens).
+        if comment_id and comment_id != last_reported:
+            effective_verdict = verdict or "ERROR"
+            msg = _build_verdict_message(
+                effective_verdict, item_id, persona_name, pr_url, comment_body
+            )
             messages.append(msg)
             upd = _db()
             try:

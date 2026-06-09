@@ -60,9 +60,8 @@ def test_classify_verdict_not_tom_comment():
 
 
 def test_classify_verdict_error_comment():
-    # ERROR verdict is not PASS/FAIL/SKIP — returns empty string (treated as unknown)
     body = "## Tom QA — ERROR\n\nCould not run."
-    assert _mod._classify_verdict(body) == ""
+    assert _mod._classify_verdict(body) == "ERROR"
 
 
 # ---------------------------------------------------------------------------
