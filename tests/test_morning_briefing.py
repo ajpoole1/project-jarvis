@@ -405,3 +405,24 @@ def test_ellie_dress_partial_slot_only_morning():
     assert block is not None
     assert "10:00" in block.detail
     assert "15:00" not in block.detail
+
+
+# ---------------------------------------------------------------------------
+# Single-fetch conformance (AC 3)
+# ---------------------------------------------------------------------------
+
+
+def test_get_weather_does_not_fetch_when_data_is_none():
+    """_get_weather(None) must not trigger a second fetch — None means fetch failed."""
+    with patch.object(skill, "_fetch_wttr_data") as mock_fetch:
+        result = skill._get_weather(None)
+    mock_fetch.assert_not_called()
+    assert result is None
+
+
+def test_get_weather_fetches_when_called_with_no_args():
+    """_get_weather() with no args should call _fetch_wttr_data exactly once."""
+    with patch.object(skill, "_fetch_wttr_data", return_value=None) as mock_fetch:
+        result = skill._get_weather()
+    mock_fetch.assert_called_once()
+    assert result is None

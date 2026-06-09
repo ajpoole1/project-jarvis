@@ -60,6 +60,9 @@ _TEMP_COLD = 0  # ≥0  → heavy jacket + hat + mittens  /  <0 → snowsuit
 _RAIN_LIKELY = 60  # ≥60 → rain coat (take it and use it)
 _RAIN_POSSIBLE = 30  # ≥30 → pack rain coat (just in case)
 
+# Sentinel: distinguishes "caller passed no data" from "caller passed None (fetch failed)"
+_UNSPECIFIED: object = object()
+
 # Wind speed (kmph) above which "breezy" appears in the conditions note
 _WIND_STRONG = 30
 
@@ -323,9 +326,9 @@ def _fetch_wttr_data() -> dict | None:
         return None
 
 
-def _get_weather(data: dict | None = None) -> BriefBlock | None:
+def _get_weather(data: object = _UNSPECIFIED) -> BriefBlock | None:
     try:
-        if data is None:
+        if data is _UNSPECIFIED:
             data = _fetch_wttr_data()
         if data is None:
             return None
