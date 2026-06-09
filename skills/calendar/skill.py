@@ -28,6 +28,8 @@ TIMEZONE = os.environ.get("JARVIS_TIMEZONE", "America/Toronto")
 _raw_ids = os.environ.get("GOOGLE_CALENDAR_IDS", "primary")
 CALENDAR_IDS = [c.strip() for c in _raw_ids.split(",") if c.strip()]
 
+_PAGINATION_SAFETY_CAP = int(os.environ.get("JARVIS_CALENDAR_EVENT_CAP", "2500"))
+
 # Shared Home calendar — stubs are written here
 HOME_CALENDAR_ID = os.environ.get("GOOGLE_HOME_CALENDAR_ID", "")
 
@@ -114,6 +116,33 @@ def _load_providers(conn: sqlite3.Connection) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _paginate_events(
+    service,
+    calendar_id: str,
+    *,
+    safety_cap: int = _PAGINATION_SAFETY_CAP,
+    **list_kwargs,
+) -> tuple[list[dict], bool]:
+    """Paginate through all pages of a Calendar events.list call.
+
+    Returns (events, truncated). truncated=True only when the safety cap was hit
+    with more pages remaining — never on a natural end of results.
+    """
+    events: list[dict] = []
+    page_token: str | None = None
+    while True:
+        req = {**list_kwargs, "calendarId": calendar_id, "maxResults": 250}
+        if page_token:
+            req["pageToken"] = page_token
+        result = service.events().list(**req).execute()
+        events.extend(result.get("items", []))
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            return events, False
+        if len(events) >= safety_cap:
+            return events, True
+
+
 def get_service():
     creds = None
     if TOKEN_PATH.exists():
@@ -151,19 +180,21 @@ def fetch_events(service, time_min: str, time_max: str) -> list[dict]:
     """Fetch events across all configured calendars in a time range."""
     events = []
     for cal_id in CALENDAR_IDS:
-        result = (
-            service.events()
-            .list(
-                calendarId=cal_id,
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                orderBy="startTime",
-                maxResults=50,
-            )
-            .execute()
+        page_events, truncated = _paginate_events(
+            service,
+            cal_id,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
         )
-        for e in result.get("items", []):
+        if truncated:
+            print(
+                f"[calendar] ⚠️ safety cap ({_PAGINATION_SAFETY_CAP}) hit for calendar"
+                f" '{cal_id}': results are incomplete",
+                file=sys.stderr,
+            )
+        for e in page_events:
             e["_calendarId"] = cal_id
             events.append(e)
     events.sort(key=lambda e: e["start"].get("dateTime", e["start"].get("date", "")))
@@ -291,20 +322,21 @@ def _find_existing_home_stub(service, home_cal_id: str, source_event: dict) -> d
         return None
 
     t_min, t_max = _day_bounds(d)
-    result = (
-        service.events()
-        .list(
-            calendarId=home_cal_id,
-            timeMin=t_min,
-            timeMax=t_max,
-            singleEvents=True,
-            maxResults=50,
-        )
-        .execute()
+    items, truncated = _paginate_events(
+        service,
+        home_cal_id,
+        timeMin=t_min,
+        timeMax=t_max,
+        singleEvents=True,
     )
+    if truncated:
+        print(
+            f"[calendar] ⚠️ safety cap hit scanning home calendar for stub {source_id}",
+            file=sys.stderr,
+        )
 
     marker = _stub_marker(source_id)
-    for event in result.get("items", []):
+    for event in items:
         description = event.get("description") or ""
         # Exact marker match
         if marker in description:
@@ -337,19 +369,19 @@ def cmd_sync_stubs(args: list[str]) -> str:
     _, t_max = _day_bounds(end_date)
 
     # Fetch personal calendar events in the 14-day window
-    result = (
-        service.events()
-        .list(
-            calendarId="primary",
-            timeMin=t_min,
-            timeMax=t_max,
-            singleEvents=True,
-            orderBy="startTime",
-            maxResults=100,
-        )
-        .execute()
+    personal_events, _truncated = _paginate_events(
+        service,
+        "primary",
+        timeMin=t_min,
+        timeMax=t_max,
+        singleEvents=True,
+        orderBy="startTime",
     )
-    personal_events = result.get("items", [])
+    if _truncated:
+        print(
+            "[calendar] ⚠️ safety cap hit on personal calendar: sync-stubs results are incomplete",
+            file=sys.stderr,
+        )
 
     # Load existing stubs mapping (source_event_id → {stub_id, category, source_start})
     stub_rows = conn.execute(
