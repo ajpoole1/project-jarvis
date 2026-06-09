@@ -397,6 +397,35 @@ def _set_pr_pinged(item_id: str, now: datetime) -> None:
 
 # ── verdict sensor helpers ────────────────────────────────────────────────────
 
+# Throttle: emit at most one gh-fail alert per this window (across all verdict-sweep ticks).
+GH_FAIL_ALERT_COOLDOWN_SECONDS = 3600
+
+_GH_FAIL_SENTINEL = Path("/tmp/jarvis-verdict-gh-fail-last")
+
+
+def _should_emit_gh_fail_alert(sentinel: Path | None = None) -> bool:
+    """True if enough time has passed since the last gh-fail alert was emitted."""
+    if sentinel is None:
+        sentinel = _GH_FAIL_SENTINEL
+    try:
+        if sentinel.exists():
+            last = float(sentinel.read_text().strip())
+            if time.time() - last < GH_FAIL_ALERT_COOLDOWN_SECONDS:
+                return False
+    except (ValueError, OSError):
+        pass
+    return True
+
+
+def _record_gh_fail_alert(sentinel: Path | None = None) -> None:
+    """Stamp the sentinel file so the next alert is throttled."""
+    if sentinel is None:
+        sentinel = _GH_FAIL_SENTINEL
+    try:
+        sentinel.write_text(str(time.time()))
+    except OSError:
+        pass
+
 
 def _parse_iso(s: str) -> datetime | None:
     """Parse an ISO datetime string (Z or +00:00 suffix) to a UTC-aware datetime."""
@@ -472,11 +501,13 @@ def _build_verdict_message(
 
 def _fetch_active_verdict(
     repo_dir: str, item_id: str, summoned_at: str
-) -> tuple[str, str, str, str, str]:
-    """Return (pr_state, pr_url, verdict, comment_id, comment_body).
+) -> tuple[str, str, str, str, str, bool]:
+    """Return (pr_state, pr_url, verdict, comment_id, comment_body, gh_failed).
 
     pr_state: 'OPEN', 'MERGED', 'CLOSED', or '' (no PR found)
     verdict:  'PASS', 'FAIL', 'SKIP', or '' (no verdict after summoned_at)
+    gh_failed: True when a gh subprocess call failed — distinct from the normal
+               empty state when no PR exists yet (which returns gh_failed=False).
     Only considers Tom QA comments posted *after* summoned_at so that a re-summon
     for a refix cycle does not re-report the FAIL that triggered the refix.
     """
@@ -501,17 +532,29 @@ def _fetch_active_verdict(
             text=True,
             timeout=20,
         )
-        if pr_result.returncode != 0 or not pr_result.stdout.strip():
-            return "", "", "", "", ""
-        prs = json.loads(pr_result.stdout or "[]")
-        if not prs:
-            return "", "", "", "", ""
+        if pr_result.returncode != 0:
+            print(
+                f"verdict sensor: gh pr list failed for {item_id} "
+                f"(rc={pr_result.returncode}): {pr_result.stderr.strip()[:200]}",
+                file=sys.stderr,
+            )
+            return "", "", "", "", "", True
+        try:
+            prs = json.loads(pr_result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            print(
+                f"verdict sensor: gh pr list JSON parse failed for {item_id}: {exc}",
+                file=sys.stderr,
+            )
+            return "", "", "", "", "", True
+        if not isinstance(prs, list) or not prs:
+            return "", "", "", "", "", False  # normal: no PR yet
         pr = prs[0]
         pr_state = str(pr.get("state", "")).upper()
         pr_url = pr.get("url", "")
         pr_number = str(pr.get("number", ""))
         if not pr_number:
-            return "", "", "", "", ""
+            return "", "", "", "", "", False
 
         comments_result = subprocess.run(
             ["gh", "pr", "view", pr_number, "--json", "comments"],
@@ -521,8 +564,20 @@ def _fetch_active_verdict(
             timeout=20,
         )
         if comments_result.returncode != 0:
-            return pr_state, pr_url, "", "", ""
-        cdata = json.loads(comments_result.stdout or "{}")
+            print(
+                f"verdict sensor: gh pr view failed for {item_id} PR#{pr_number} "
+                f"(rc={comments_result.returncode}): {comments_result.stderr.strip()[:200]}",
+                file=sys.stderr,
+            )
+            return pr_state, pr_url, "", "", "", True
+        try:
+            cdata = json.loads(comments_result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            print(
+                f"verdict sensor: gh pr view JSON parse failed for {item_id}: {exc}",
+                file=sys.stderr,
+            )
+            return pr_state, pr_url, "", "", "", True
 
         summoned_dt = _parse_iso(summoned_at)
         tom_after_summon = []
@@ -535,15 +590,22 @@ def _fetch_active_verdict(
             tom_after_summon.append(c)
 
         if not tom_after_summon:
-            return pr_state, pr_url, "", "", ""
+            return pr_state, pr_url, "", "", "", False
 
         latest = tom_after_summon[-1]  # gh returns in chronological order
         comment_id = _comment_identity(latest)
         comment_body = latest.get("body", "")
         verdict = _classify_verdict(comment_body)
-        return pr_state, pr_url, verdict, comment_id, comment_body
-    except Exception:  # noqa: BLE001
-        return "", "", "", "", ""
+        return pr_state, pr_url, verdict, comment_id, comment_body, False
+    except FileNotFoundError:
+        print(
+            "verdict sensor: gh not found on PATH — install gh CLI for verdict tracking",
+            file=sys.stderr,
+        )
+        return "", "", "", "", "", True
+    except Exception as exc:  # noqa: BLE001
+        print(f"verdict sensor: unexpected error for {item_id}: {exc}", file=sys.stderr)
+        return "", "", "", "", "", True
 
 
 # ── Discord ───────────────────────────────────────────────────────────────────
@@ -1024,15 +1086,20 @@ def cmd_verdict_sweep(_args: list[str]) -> int:
     if not rows:
         return 0
 
+    gh_failed_any = False
     messages: list[str] = []
     for item_id, persona_id, summoned_at, last_reported in rows:
         persona = load_roster().get(persona_id, {})
         repo_dir = persona.get("repo_dir", str(PROJECT))
         persona_name = persona.get("name", persona_id)
 
-        pr_state, pr_url, verdict, comment_id, comment_body = _fetch_active_verdict(
+        pr_state, pr_url, verdict, comment_id, comment_body, gh_failed = _fetch_active_verdict(
             repo_dir, item_id, summoned_at or ""
         )
+
+        if gh_failed:
+            gh_failed_any = True
+            continue  # already logged to stderr in _fetch_active_verdict
 
         if not pr_state:
             continue  # no PR yet — nothing to watch
@@ -1059,6 +1126,13 @@ def cmd_verdict_sweep(_args: list[str]) -> int:
                 del_conn.commit()
             finally:
                 del_conn.close()
+
+    if gh_failed_any and _should_emit_gh_fail_alert():
+        _record_gh_fail_alert()
+        messages.insert(
+            0,
+            "⚠️ verdict sensor can't reach GitHub (`gh` failing) — verdicts may be missed",
+        )
 
     if messages:
         print("SIGNAL:high\n" + "\n\n".join(messages))

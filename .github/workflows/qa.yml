@@ -193,9 +193,12 @@ jobs:
             "architecture_notes": ["string"]
           }
 
-          Rules:
-          - severity=blocking: real defect or spec-break that must be fixed before merge
-          - severity=advisory: worth filing to backlog but does not block
+          Severity grading — applies to every finding:
+          - severity=blocking: the defect is REACHABLE in the code's actual wiring and usage. You must name a concrete trigger path (how it is hit in practice). Include "reachable via <trigger>" in the description. If you cannot state a reachable trigger, downgrade to advisory.
+          - severity=advisory: theoretical/unreachable edges (e.g. a crash path where the input always has a validated default so the crash branch is never entered), defensive-hardening suggestions, nice-to-have extra tests, style/clarity nits. Advisory findings need not state a trigger.
+          - Calibration example: if a function could crash on int("") but every call site passes an integer or a string with a safe default, the crash branch is unreachable in real wiring — grade it advisory, not blocking.
+
+          Other rules:
           - architecture_notes MUST be non-empty: real critique, concrete suggestions, or your confidence rationale (what you checked and why you're satisfied)
           - If spec is 'none' or empty, review against repo conventions (CLAUDE.md) only
           - If there are no issues in a category, return an empty array for that key
