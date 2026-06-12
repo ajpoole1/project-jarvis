@@ -426,3 +426,208 @@ def test_get_weather_fetches_when_called_with_no_args():
         result = skill._get_weather()
     mock_fetch.assert_called_once()
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Reads sources config (AC 1)
+# ---------------------------------------------------------------------------
+
+
+def test_reads_sources_exists():
+    assert hasattr(skill, "_READS_SOURCES"), "_READS_SOURCES config must be defined"
+
+
+def test_reads_sources_is_list_of_tuples():
+    assert isinstance(skill._READS_SOURCES, list)
+    for entry in skill._READS_SOURCES:
+        assert len(entry) == 2, f"Expected (name, url) pair, got: {entry!r}"
+
+
+def test_reads_sources_has_hobby_feeds():
+    """AC 1: ≥1 feed for MTG, D&D, and Star Wars."""
+    urls = [url for _, url in skill._READS_SOURCES]
+    assert any("hipstersofthecoast" in u for u in urls), "MTG feed missing"
+    assert any("thealexandrian" in u for u in urls), "D&D/TTRPG feed missing"
+    assert any("eleven-thirtyeight" in u for u in urls), "Star Wars feed missing"
+
+
+def test_reads_sources_min_count():
+    """Curated default should have at least 15 entries."""
+    assert len(skill._READS_SOURCES) >= 15
+
+
+# ---------------------------------------------------------------------------
+# Reads coda — combined pool (AC 2) and longform bias (AC 3)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_create(haiku_scores: list[dict], sonnet_picks: list[dict]):
+    """Return a side_effect callable that mocks Haiku scoring and Sonnet picks."""
+    import json as _json
+
+    def fake_create(**kwargs):
+        model = kwargs["model"]
+        mock_resp = MagicMock()
+        if model == skill.HAIKU_MODEL:
+            mock_resp.content = [MagicMock(text=_json.dumps(haiku_scores))]
+        else:
+            mock_resp.content = [MagicMock(text=_json.dumps(sonnet_picks))]
+        return mock_resp
+
+    return fake_create
+
+
+def test_reads_coda_pool_includes_longform_and_news(monkeypatch):
+    """AC 2: candidate pool is drawn from both longform feeds and Google News."""
+
+    def fake_score_create(**kwargs):
+        # Capture the candidates from the prompt to verify both kinds were gathered.
+        # Intercept at scoring stage — by this point candidates have been assembled.
+        mock_resp = MagicMock()
+        mock_resp.content = [MagicMock(text="[]")]
+        return mock_resp
+
+    news_item = {
+        "title": "News headline",
+        "link": "https://news.example.com/1",
+        "source": "Google News",
+        "summary": "",
+    }
+    essay_item = {
+        "title": "Longform essay",
+        "link": "https://essay.example.com/1",
+        "source": "Aeon",
+        "summary": "",
+    }
+
+    parse_calls: list[str] = []
+
+    def fake_parse_rss(url, source_name, max_items=8):
+        parse_calls.append(source_name)
+        if source_name == "Google News":
+            return [news_item]
+        return [essay_item]
+
+    client_mock = MagicMock()
+    client_mock.messages.create.side_effect = fake_score_create
+
+    profile = "### 1. Technology — AI and software"
+
+    with (
+        patch.object(skill, "_parse_rss", side_effect=fake_parse_rss),
+        patch.object(skill, "_is_reads_dedup", return_value=False),
+        patch.object(skill, "_init_reads_dedup"),
+        patch.object(skill, "_mark_reads_surfaced"),
+    ):
+        skill._get_reads_coda(client_mock, profile)
+
+    assert "Google News" in parse_calls, "Google News candidates not fetched"
+    longform_sources = [s for s in parse_calls if s != "Google News"]
+    assert len(longform_sources) > 0, "No longform feed sources fetched"
+
+
+def test_reads_coda_longform_beats_news_at_equal_score(monkeypatch):
+    """AC 3: when a longform and a news item score equally, longform fills the slot first."""
+    sonnet_was_called_with: list[str] = []
+
+    def fake_create(**kwargs):
+        model = kwargs["model"]
+        content = kwargs["messages"][0]["content"]
+        mock_resp = MagicMock()
+        if model == skill.HAIKU_MODEL:
+            # Both candidates score 7
+            mock_resp.content = [
+                MagicMock(text='[{"index": 0, "score": 7}, {"index": 1, "score": 7}]')
+            ]
+        else:
+            sonnet_was_called_with.append(content)
+            mock_resp.content = [MagicMock(text='[{"index": 0, "why": "You should read this."}]')]
+        return mock_resp
+
+    news_item = {
+        "title": "Breaking news story",
+        "link": "https://news.example.com/1",
+        "source": "Google News",
+        "summary": "news",
+    }
+    essay_item = {
+        "title": "Longform essay piece",
+        "link": "https://essay.example.com/2",
+        "source": "Aeon",
+        "summary": "essay",
+    }
+
+    def fake_parse_rss(url, source_name, max_items=8):
+        if source_name == "Google News":
+            return [news_item]
+        if source_name == "Aeon":
+            return [essay_item]
+        return []
+
+    client_mock = MagicMock()
+    client_mock.messages.create.side_effect = fake_create
+
+    profile = "### 1. Technology — AI and software"
+
+    with (
+        patch.object(skill, "_parse_rss", side_effect=fake_parse_rss),
+        patch.object(skill, "_is_reads_dedup", return_value=False),
+        patch.object(skill, "_init_reads_dedup"),
+        patch.object(skill, "_mark_reads_surfaced"),
+    ):
+        skill._get_reads_coda(client_mock, profile)
+
+    # Sonnet must have been called (at least one candidate cleared the bar)
+    assert sonnet_was_called_with, "Sonnet pick prompt was never called"
+    pick_prompt = sonnet_was_called_with[0]
+    # The longform candidate should appear before the news candidate in the pick prompt
+    longform_pos = pick_prompt.find("Longform essay piece")
+    news_pos = pick_prompt.find("Breaking news story")
+    assert longform_pos != -1, "Longform candidate not in pick prompt"
+    assert news_pos != -1, "News candidate not in pick prompt"
+    assert (
+        longform_pos < news_pos
+    ), "Longform candidate must appear before news in pick prompt (bias)"
+
+
+def test_reads_coda_unreachable_feeds_skipped(monkeypatch):
+    """AC 4: unreachable feeds return [] from _parse_rss; briefing still completes."""
+
+    def fake_parse_rss(url, source_name, max_items=8):
+        # Only Google News returns items; all longform feeds are 'unreachable'
+        if source_name == "Google News":
+            return [
+                {
+                    "title": "Some news",
+                    "link": "https://news.example.com/1",
+                    "source": "Google News",
+                    "summary": "",
+                }
+            ]
+        return []
+
+    def fake_create(**kwargs):
+        model = kwargs["model"]
+        mock_resp = MagicMock()
+        if model == skill.HAIKU_MODEL:
+            mock_resp.content = [MagicMock(text='[{"index": 0, "score": 7}]')]
+        else:
+            mock_resp.content = [MagicMock(text='[{"index": 0, "why": "Interesting read."}]')]
+        return mock_resp
+
+    client_mock = MagicMock()
+    client_mock.messages.create.side_effect = fake_create
+
+    profile = "### 1. Technology — AI and software"
+
+    with (
+        patch.object(skill, "_parse_rss", side_effect=fake_parse_rss),
+        patch.object(skill, "_is_reads_dedup", return_value=False),
+        patch.object(skill, "_init_reads_dedup"),
+        patch.object(skill, "_mark_reads_surfaced"),
+    ):
+        result = skill._get_reads_coda(client_mock, profile)
+
+    # Briefing still produces a result from the news fallback
+    assert result is not None, "Briefing failed when all longform feeds unreachable"
+    assert result.type == "reads-coda"

@@ -77,6 +77,31 @@ _NEWS_SOURCES: list[tuple[str, str]] = json.loads(
     ("Reuters", "https://feeds.reuters.com/reuters/worldNews"),
 ]
 
+# Curated longform/essay feeds for the reads coda — env-overridable like BRIEFING_NEWS_SOURCES.
+_READS_SOURCES: list[tuple[str, str]] = json.loads(
+    os.environ.get("BRIEFING_READS_SOURCES", "null") or "null"
+) or [
+    # Ideas / history / general longform
+    ("Aeon", "https://aeon.co/feed.rss"),
+    ("Longreads", "https://longreads.com/feed/"),
+    ("Works in Progress", "https://worksinprogress.co/feed"),
+    ("The Marginalian", "https://www.themarginalian.org/feed/"),
+    ("Lapham's Quarterly", "https://www.laphamsquarterly.org/feed"),
+    # AI (practitioner)
+    ("Simon Willison", "https://simonwillison.net/atom/everything/"),
+    ("Latent Space", "https://www.latent.space/feed"),
+    ("Import AI", "https://jack-clark.net/feed/"),
+    # Trade / markets / geopolitics (systemic)
+    ("Noahpinion", "https://www.noahpinion.blog/feed"),
+    ("Marginal Revolution", "https://marginalrevolution.com/feed/"),
+    ("Phenomenal World", "https://www.phenomenalworld.org/feed"),
+    ("Bank Underground", "https://bankunderground.co.uk/feed/"),
+    # Hobbies — one each
+    ("Hipsters of the Coast", "https://hipstersofthecoast.com/feed/"),  # MTG
+    ("The Alexandrian", "https://thealexandrian.net/feed/"),  # D&D / TTRPG
+    ("Eleven-ThirtyEight", "https://eleven-thirtyeight.com/feed/"),  # Star Wars
+]
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -638,7 +663,13 @@ def _get_reads_coda(client: anthropic.Anthropic, profile: str) -> BriefBlock | N
         )
         for item in _parse_rss(url, "Google News", max_items=3):
             if not _is_reads_dedup(item.get("link", "")):
-                candidates.append(item)
+                candidates.append({**item, "kind": "news"})
+
+    # Augment: curated longform/essay feeds (unreachable feeds skipped by _parse_rss)
+    for source_name, url in _READS_SOURCES:
+        for item in _parse_rss(url, source_name, max_items=5):
+            if not _is_reads_dedup(item.get("link", "")):
+                candidates.append({**item, "kind": "longform"})
 
     if not candidates:
         return None
@@ -652,7 +683,7 @@ def _get_reads_coda(client: anthropic.Anthropic, profile: str) -> BriefBlock | N
             seen.add(key)
             unique.append(c)
 
-    candidates = unique[:20]
+    candidates = unique[:30]
 
     profile_ctx = _profile_for_prompt(profile)
 
@@ -690,7 +721,19 @@ Articles:
         )
         scored = json.loads(_strip_json_fences(score_resp.content[0].text))
         scored.sort(key=lambda x: x.get("score", 0), reverse=True)
-        top_indices = [s["index"] for s in scored if s.get("score", 0) >= 6][:4]
+        # Bias to longform: qualifying longform candidates fill slots first; news fills remainder.
+        qualifying = [s for s in scored if s.get("score", 0) >= 6]
+        longform_top = [
+            s["index"]
+            for s in qualifying
+            if s["index"] < len(candidates) and candidates[s["index"]].get("kind") == "longform"
+        ][:4]
+        news_top = [
+            s["index"]
+            for s in qualifying
+            if s["index"] < len(candidates) and candidates[s["index"]].get("kind") == "news"
+        ][:2]
+        top_indices = (longform_top + news_top)[:4]
     except Exception:  # noqa: BLE001
         return None
 
@@ -703,7 +746,7 @@ Articles:
 
     # Sonnet picks final 1–2 and writes why-lines
     top_text = "\n".join(
-        f"{i}. {c['title']} ({c['source']})"
+        f"{i}. [{c.get('kind', 'news')}] {c['title']} ({c['source']})"
         + (f" — {c['summary'][:200]}" if c.get("summary") else "")
         for i, c in enumerate(top_candidates)
     )
@@ -716,6 +759,7 @@ AJ's interest profile:
 Rules:
 - Genuine semantic match to AJ's interests AND both cross-cutting filters (grounded, applied)
 - Convergence pieces (hitting 2+ interests) are high-value
+- Prefer longform/evergreen articles over news items — the news radar already covers breaking news; the coda is for interesting reads
 - Write one direct "why this matters to you" line per pick — addressed to AJ in second person ("you"/"your"). Never write in third person; never use "AJ is…" framing. Jarvis's voice: short, confident, no openers.
 - Prefer where "interesting" and "useful" merge
 
