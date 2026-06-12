@@ -903,6 +903,68 @@ def cmd_calendars(service) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Grocery note commands (Part A — 2026-0017)
+# ---------------------------------------------------------------------------
+
+
+def cmd_grocery_event(service) -> str:
+    """Return JSON {found, event_id, description} for the current month's Grocery list event."""
+    if not HOME_CALENDAR_ID:
+        return json.dumps({"found": False, "error": "GOOGLE_HOME_CALENDAR_ID not set"})
+
+    today = date.today()
+    first = date(today.year, today.month, 1)
+    t_min, t_max = _day_bounds(first)
+
+    events, _ = _paginate_events(
+        service,
+        HOME_CALENDAR_ID,
+        timeMin=t_min,
+        timeMax=t_max,
+        singleEvents=True,
+        orderBy="startTime",
+    )
+
+    for event in events:
+        if event.get("summary", "").strip().lower() == "grocery list":
+            return json.dumps(
+                {
+                    "found": True,
+                    "event_id": event["id"],
+                    "description": event.get("description") or "",
+                }
+            )
+
+    return json.dumps({"found": False, "error": "Grocery list event not found for this month"})
+
+
+def cmd_get_notes(service, event_id: str) -> str:
+    """Return the description of an event on HOME_CALENDAR_ID."""
+    if not HOME_CALENDAR_ID:
+        return ""
+    try:
+        event = service.events().get(calendarId=HOME_CALENDAR_ID, eventId=event_id).execute()
+        return event.get("description") or ""
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def cmd_set_notes(service, event_id: str, text: str) -> str:
+    """Patch the description of an event on HOME_CALENDAR_ID, leaving all other fields intact."""
+    if not HOME_CALENDAR_ID:
+        return "Error: GOOGLE_HOME_CALENDAR_ID not set"
+    try:
+        service.events().patch(
+            calendarId=HOME_CALENDAR_ID,
+            eventId=event_id,
+            body={"description": text},
+        ).execute()
+        return "✓ Note updated."
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -916,6 +978,21 @@ if __name__ == "__main__":
         print(cmd_stubs(sys.argv[2:]))
     elif cmd == "providers":
         print(cmd_providers(sys.argv[2:]))
+    elif cmd == "grocery-event":
+        service = get_service()
+        print(cmd_grocery_event(service))
+    elif cmd == "get-notes":
+        if len(sys.argv) < 3:
+            print("Usage: skill.py get-notes <event_id>")
+            sys.exit(1)
+        service = get_service()
+        print(cmd_get_notes(service, sys.argv[2]))
+    elif cmd == "set-notes":
+        if len(sys.argv) < 4:
+            print("Usage: skill.py set-notes <event_id> <text>")
+            sys.exit(1)
+        service = get_service()
+        print(cmd_set_notes(service, sys.argv[2], sys.argv[3]))
     else:
         service = get_service()
         if cmd == "today":
@@ -948,6 +1025,7 @@ if __name__ == "__main__":
             print(
                 "Commands: today, week, check <date>, upcoming [days], "
                 "add <title> <date> [time] [duration] [cal_id] [RRULE], calendars, "
-                "sync-stubs, stubs [list|stub|unstub], providers [list|add|remove]"
+                "sync-stubs, stubs [list|stub|unstub], providers [list|add|remove], "
+                "grocery-event, get-notes <event_id>, set-notes <event_id> <text>"
             )
             sys.exit(1)
