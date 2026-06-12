@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,6 +38,9 @@ _load_env(Path.home() / ".jarvis.env")
 DATA_DIR = Path(os.environ.get("JARVIS_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "jarvis.db"
 _KNOWLEDGE_ROOT = Path(__file__).parents[2] / "knowledge"
+_SKILLS_DIR = Path(__file__).parents[2] / "skills"
+_CAL_PYTHON = str(_SKILLS_DIR / "calendar" / ".venv" / "bin" / "python")
+_CAL_SKILL = str(_SKILLS_DIR / "calendar" / "skill.py")
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +59,16 @@ def _init_db() -> sqlite3.Connection:
             qty        TEXT,
             store      TEXT,
             note       TEXT,
+            status     TEXT NOT NULL DEFAULT 'active',
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
+    # Idempotent migration: add status column to pre-existing tables
+    try:
+        conn.execute("ALTER TABLE grocery_items ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS grocery_archive (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,22 +254,46 @@ def cmd_review(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
-def cmd_shopped(conn: sqlite3.Connection) -> str:
+def cmd_shopped(conn: sqlite3.Connection, store: str | None = None) -> str:
+    if store:
+        rows = conn.execute(
+            "SELECT name, qty, store FROM grocery_items WHERE lower(store) = lower(?)",
+            (store,),
+        ).fetchall()
+        if not rows:
+            return f"No items assigned to '{store}'."
+
+        trip_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        now_str = datetime.now(UTC).isoformat()
+        for name, qty, item_store in rows:
+            conn.execute(
+                "INSERT INTO grocery_archive (trip_id, name, qty, store, shopped_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (trip_id, name, qty, item_store, now_str),
+            )
+        conn.execute("DELETE FROM grocery_items WHERE lower(store) = lower(?)", (store,))
+        conn.commit()
+
+        note_result = _remove_note_section(store)
+        return f"Archived {len(rows)} {store} items, list updated.{note_result}"
+
     rows = conn.execute("SELECT name, qty, store FROM grocery_items").fetchall()
     if not rows:
         return "List is already empty — nothing to archive."
 
     trip_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     now_str = datetime.now(UTC).isoformat()
-    for name, qty, store in rows:
+    for name, qty, item_store in rows:
         conn.execute(
             "INSERT INTO grocery_archive (trip_id, name, qty, store, shopped_at)"
             " VALUES (?, ?, ?, ?, ?)",
-            (trip_id, name, qty, store, now_str),
+            (trip_id, name, qty, item_store, now_str),
         )
     conn.execute("DELETE FROM grocery_items")
     conn.commit()
-    return f"Archived {len(rows)} items, list cleared — fresh list ready."
+
+    note_result = _clear_note()
+    return f"Archived {len(rows)} items, list cleared — fresh list ready.{note_result}"
 
 
 def cmd_history(conn: sqlite3.Connection, limit: int = 5) -> str:
@@ -360,6 +396,349 @@ def cmd_seed(conn: sqlite3.Connection) -> str:
     if skipped:
         parts.append(f"Already on list: {', '.join(skipped)}")
     return (". ".join(parts) + ".") if parts else "Nothing to seed."
+
+
+# ---------------------------------------------------------------------------
+# Calendar bridge — subprocess helpers
+# ---------------------------------------------------------------------------
+
+
+def _cal_run(*args: str) -> str:
+    try:
+        result = subprocess.run(
+            [_CAL_PYTHON, _CAL_SKILL, *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.stdout.strip()
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def _get_grocery_event() -> tuple[str | None, str]:
+    """Return (event_id, description) or (None, error_message)."""
+    out = _cal_run("grocery-event")
+    try:
+        data = json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return None, f"calendar skill returned non-JSON: {out!r}"
+    if not data.get("found"):
+        return None, data.get("error", "Grocery event not found")
+    return data["event_id"], data.get("description", "")
+
+
+def _cal_set_notes(event_id: str, text: str) -> str | None:
+    """Patch the grocery calendar note. Returns error string or None."""
+    out = _cal_run("set-notes", event_id, text)
+    if out.startswith("Error") or out.startswith("✗"):
+        return out
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Grocery note format — render and parse
+# ---------------------------------------------------------------------------
+
+# Section header prefix in the canonical Jarvis-written note format
+_SECTION_PREFIX = "🛒"
+
+# Trailing qty: "item ×2" or "item x2" (case-insensitive)
+_TRAILING_QTY_RE = re.compile(r"^(.+?)\s*[×xX](\S+)\s*$")
+
+# Leading qty: "2 item" or "500g item" — leading token is digit(s) with optional unit
+_LEADING_QTY_RE = re.compile(
+    r"^(\d+(?:\.\d+)?(?:kg|g|L|ml|lb|oz|pack|packs)?)\s+(.+)$",
+    re.IGNORECASE,
+)
+
+# Store hint in trailing parens: "chicken (Costco)" — only accepts alpha + spaces
+_STORE_PAREN_RE = re.compile(r"\(([A-Za-z][A-Za-z ]*)\)\s*$")
+
+
+def _parse_note_items(text: str) -> list[tuple[str, str | None, str | None, bool]]:
+    """
+    Parse a grocery note (freeform or Jarvis-formatted) into (name, qty, store, store_explicit).
+
+    store_explicit=True: store came from an inline (Store) hint on the line.
+    store_explicit=False: store inherited from the nearest preceding 🛒 section header.
+
+    Handles:
+      "peaches"              → ("peaches", None, None, False)
+      "2 milk"               → ("milk", "2", None, False)
+      "milk x2" / "milk ×2" → ("milk", "2", None, False)
+      "- chicken (Costco)"   → ("chicken", None, "Costco", True)
+      "🛒 IGA"               → section header, sets store context to "IGA"
+      "- milk ×2"  (in IGA section) → ("milk", "2", "IGA", False)
+    """
+    items: list[tuple[str, str | None, str | None, bool]] = []
+    current_store: str | None = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        # Section header
+        if line.startswith(_SECTION_PREFIX):
+            section = line.lstrip(_SECTION_PREFIX).strip()
+            current_store = None if section.lower() == "unassigned" else section
+            continue
+
+        # Strip leading bullet/dash/asterisk
+        line = re.sub(r"^[-*•]\s*", "", line).strip()
+        if not line:
+            continue
+
+        # Inline store hint: "chicken (Costco)"
+        store: str | None = current_store
+        store_explicit = False
+        paren_m = _STORE_PAREN_RE.search(line)
+        if paren_m:
+            hint = paren_m.group(1).strip().title()
+            # Accept single-word or known short names; exclude food qualifiers with commas
+            if "," not in paren_m.group(1):
+                store = hint
+                store_explicit = True
+                line = line[: paren_m.start()].strip()
+
+        # Trailing qty: "milk ×2" or "milk x2"
+        qty: str | None = None
+        name = line
+        trailing_m = _TRAILING_QTY_RE.match(line)
+        if trailing_m:
+            name = trailing_m.group(1).strip()
+            qty = trailing_m.group(2).strip()
+        else:
+            leading_m = _LEADING_QTY_RE.match(line)
+            if leading_m:
+                qty = leading_m.group(1)
+                name = leading_m.group(2).strip()
+
+        if not name:
+            continue
+
+        items.append((name, qty, store, store_explicit))
+
+    return items
+
+
+def _render_note(conn: sqlite3.Connection) -> str:
+    """Render the current active grocery list as a store-grouped formatted note."""
+    rows = conn.execute("SELECT name, qty, store FROM grocery_items ORDER BY name").fetchall()
+    if not rows:
+        return ""
+
+    groups: dict[str, list[tuple[str, str | None]]] = {}
+    for name, qty, store in rows:
+        key = store or "Unassigned"
+        groups.setdefault(key, []).append((name, qty))
+
+    lines: list[str] = []
+    assigned = sorted(k for k in groups if k != "Unassigned")
+    order = assigned + (["Unassigned"] if "Unassigned" in groups else [])
+
+    for store_key in order:
+        lines.append(f"{_SECTION_PREFIX} {store_key}")
+        for name, qty in groups[store_key]:
+            lines.append(f"- {name} ×{qty}" if qty else f"- {name}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _remove_store_section(text: str, store: str) -> str:
+    """Remove the named store's section from a formatted note, leaving all others intact."""
+    result: list[str] = []
+    in_target = False
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_SECTION_PREFIX):
+            section = stripped.lstrip(_SECTION_PREFIX).strip()
+            in_target = section.lower() == store.lower()
+        if not in_target:
+            result.append(line)
+
+    while result and not result[-1].strip():
+        result.pop()
+
+    return "\n".join(result)
+
+
+# ---------------------------------------------------------------------------
+# Calendar note side-effect helpers (called from shopped / plan / add dispatch)
+# ---------------------------------------------------------------------------
+
+
+def _remove_note_section(store: str) -> str:
+    """Remove store's section from the calendar note. Returns status suffix for caller."""
+    event_id, description = _get_grocery_event()
+    if event_id is None:
+        return f"\n⚠️ Calendar note not updated: {description}"
+    if not description:
+        return ""
+    new_desc = _remove_store_section(description, store)
+    err = _cal_set_notes(event_id, new_desc)
+    return f"\n⚠️ Note update failed: {err}" if err else "\n✓ Note updated."
+
+
+def _clear_note() -> str:
+    """Clear the grocery calendar note. Returns status suffix for caller."""
+    event_id, description = _get_grocery_event()
+    if event_id is None:
+        return f"\n⚠️ Calendar note not cleared: {description}"
+    err = _cal_set_notes(event_id, "")
+    return f"\n⚠️ Note clear failed: {err}" if err else "\n✓ Calendar note cleared."
+
+
+def _append_item_to_note(name: str, qty: str | None, store: str | None) -> str | None:
+    """Prepend item to grocery note (before any section headers). Returns error or None."""
+    event_id, description = _get_grocery_event()
+    if event_id is None:
+        return description
+
+    item_text = name.strip()
+    if qty:
+        item_text += f" ×{qty}"
+    if store:
+        item_text += f" ({store})"
+
+    # Prepend: freeform items appear before section headers, keeping store context = None on parse
+    new_desc = (item_text + "\n" + description).strip() if description else item_text
+    return _cal_set_notes(event_id, new_desc)
+
+
+# ---------------------------------------------------------------------------
+# Sync-note — note → DB capture (heartbeat target)
+# ---------------------------------------------------------------------------
+
+
+def cmd_sync_note(conn: sqlite3.Connection) -> str:
+    """Read the current month's grocery note and upsert items into the active list (idempotent)."""
+    event_id, description = _get_grocery_event()
+    if event_id is None:
+        return f"⚠️ {description}"
+
+    if not description.strip():
+        return "Grocery note is empty — nothing to sync."
+
+    items = _parse_note_items(description)
+    if not items:
+        return "No parseable items in grocery note."
+
+    added: list[str] = []
+    updated: list[str] = []
+    skipped: list[str] = []
+
+    for name, qty, store, store_explicit in items:
+        nn = _norm(name)
+        row = conn.execute(
+            "SELECT name, qty, store FROM grocery_items WHERE name_norm = ?", (nn,)
+        ).fetchone()
+
+        if row:
+            updates, params = [], []
+            if qty is not None and row[1] is None:
+                updates.append("qty = ?")
+                params.append(qty)
+            # Only write store from section context if item has no store; explicit hints always win
+            if store is not None and (store_explicit or row[2] is None):
+                updates.append("store = ?")
+                params.append(store)
+            if updates:
+                params.append(nn)
+                conn.execute(
+                    f"UPDATE grocery_items SET {', '.join(updates)} WHERE name_norm = ?",
+                    params,
+                )
+                updated.append(name)
+            else:
+                skipped.append(name)
+        else:
+            conn.execute(
+                "INSERT INTO grocery_items (name, name_norm, qty, store) VALUES (?, ?, ?, ?)",
+                (name.strip(), nn, qty, store),
+            )
+            added.append(name)
+
+    conn.commit()
+
+    parts: list[str] = []
+    if added:
+        parts.append(f"Added {len(added)}: {', '.join(added)}")
+    if updated:
+        parts.append(f"Updated {len(updated)}: {', '.join(updated)}")
+    if skipped:
+        parts.append(f"Skipped {len(skipped)} (unchanged)")
+    return "; ".join(parts) if parts else "No changes."
+
+
+# ---------------------------------------------------------------------------
+# Plan — sync + auto-suggest stores + write formatted note back
+# ---------------------------------------------------------------------------
+
+
+def cmd_plan(conn: sqlite3.Connection) -> str:
+    """Sync note → DB, auto-assign stores from history, render formatted note, write it back."""
+    sync_result = cmd_sync_note(conn)
+
+    # Auto-suggest stores for unassigned items using archive history
+    unassigned = conn.execute(
+        "SELECT name, name_norm FROM grocery_items WHERE store IS NULL ORDER BY name"
+    ).fetchall()
+
+    suggested: list[str] = []
+    for name, nn in unassigned:
+        hist = conn.execute(
+            """SELECT store, COUNT(*) AS c FROM grocery_archive
+               WHERE lower(name) = ? AND store IS NOT NULL
+               GROUP BY store ORDER BY c DESC LIMIT 1""",
+            (nn,),
+        ).fetchone()
+        if hist:
+            conn.execute("UPDATE grocery_items SET store = ? WHERE name_norm = ?", (hist[0], nn))
+            suggested.append(f"{name} → {hist[0]}")
+
+    if suggested:
+        conn.commit()
+
+    # Mark all items planned
+    conn.execute("UPDATE grocery_items SET status = 'planned'")
+    conn.commit()
+
+    # Render and write back
+    note_text = _render_note(conn)
+    event_id, _ = _get_grocery_event()
+    note_err: str | None = None
+    if event_id:
+        note_err = _cal_set_notes(event_id, note_text)
+    else:
+        note_err = "Grocery calendar event not found"
+
+    lines = [f"Sync: {sync_result}"]
+    if suggested:
+        lines.append(f"Store auto-assigned: {', '.join(suggested)}")
+
+    still_unresolved = conn.execute(
+        "SELECT name, qty, store FROM grocery_items WHERE qty IS NULL OR store IS NULL ORDER BY name"
+    ).fetchall()
+    if still_unresolved:
+        lines.append(f"\n⚠️ {len(still_unresolved)} item(s) need attention:")
+        for name, qty, store in still_unresolved:
+            flags = []
+            if not qty:
+                flags.append("no qty")
+            if not store:
+                flags.append("no store")
+            lines.append(f"  • {name}  [{', '.join(flags)}]")
+
+    if note_err:
+        lines.append(f"\n⚠️ Note write failed: {note_err}")
+    else:
+        lines.append("\n✓ Formatted list written to calendar note.")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +861,14 @@ def main() -> None:
     p_list.add_argument("--by-store", action="store_true")
 
     sub.add_parser("review", help="Full list with missing-field flags")
-    sub.add_parser("shopped", help="Archive active list and clear it")
+
+    p_shopped = sub.add_parser("shopped", help="Archive active list and clear it")
+    p_shopped.add_argument(
+        "--store",
+        default=None,
+        metavar="STORE",
+        help="Partial clear: archive only this store's items and remove its note section",
+    )
 
     p_hist = sub.add_parser("history", help="Show recent trips")
     p_hist.add_argument("limit", nargs="?", type=int, default=5, metavar="N")
@@ -499,11 +885,24 @@ def main() -> None:
     p_fr = sub.add_parser("from-recipe", help="Add ingredients from a recipe file")
     p_fr.add_argument("slug", help="Recipe slug (filename without .md)")
 
+    sub.add_parser("sync-note", help="Capture current grocery calendar note into DB (idempotent)")
+    sub.add_parser(
+        "plan", help="Sync note, assign stores, render formatted list, write to calendar"
+    )
+    sub.add_parser(
+        "propose-schedule",
+        help="Print the schedules propose command to register the daily sync-note job",
+    )
+
     args = parser.parse_args()
     conn = _init_db()
     try:
         if args.cmd == "add":
-            print(cmd_add(conn, args.item, args.qty, args.store, args.note))
+            result = cmd_add(conn, args.item, args.qty, args.store, args.note)
+            print(result)
+            note_err = _append_item_to_note(args.item, args.qty, args.store)
+            if note_err:
+                print(f"⚠️ Calendar note update failed: {note_err}")
         elif args.cmd == "rm":
             print(cmd_rm(conn, args.item))
         elif args.cmd == "set-qty":
@@ -515,7 +914,7 @@ def main() -> None:
         elif args.cmd == "review":
             print(cmd_review(conn))
         elif args.cmd == "shopped":
-            print(cmd_shopped(conn))
+            print(cmd_shopped(conn, args.store))
         elif args.cmd == "history":
             print(cmd_history(conn, args.limit))
         elif args.cmd == "usuals":
@@ -526,6 +925,19 @@ def main() -> None:
             print(cmd_seed(conn))
         elif args.cmd == "from-recipe":
             print(cmd_from_recipe(conn, args.slug))
+        elif args.cmd == "sync-note":
+            print(cmd_sync_note(conn))
+        elif args.cmd == "plan":
+            print(cmd_plan(conn))
+        elif args.cmd == "propose-schedule":
+            print(
+                "Run this to register the daily sync-note job (staged, AJ must approve):\n"
+                "  python3 skills/schedules/skill.py propose"
+                " --skill grocery"
+                " --args '[\"sync-note\"]'"
+                " --schedule daily@09:00"
+                " --description 'Daily grocery note capture from shared calendar'"
+            )
     finally:
         conn.close()
 
