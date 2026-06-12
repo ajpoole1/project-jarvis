@@ -9,9 +9,29 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-from dotenv import load_dotenv
 
-load_dotenv(Path.home() / ".jarvis.env")
+def _load_env(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.removeprefix("export ").strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        for q in ('"', "'"):
+            if value.startswith(q) and value.endswith(q) and len(value) >= 2:
+                value = value[1:-1]
+                break
+        if key:
+            os.environ.setdefault(key, value)
+
+
+_load_env(Path.home() / ".jarvis.env")
 
 DATA_DIR = Path(os.environ.get("JARVIS_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "jarvis.db"
