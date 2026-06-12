@@ -74,9 +74,17 @@ def _make_conn() -> sqlite3.Connection:
 
 
 def _quiet_at(hour: int) -> bool:
-    """Helper: call _is_quiet_now with the clock frozen at the given local hour."""
+    """Helper: call _is_quiet_now with the clock frozen at the given local hour.
+
+    Pins QUIET_START/END to 23/9 so the test is deterministic regardless of
+    FOLLOW_UP_QUIET_START/FOLLOW_UP_QUIET_END env-var overrides.
+    """
     fake_local = datetime(2026, 6, 8, hour, 5, tzinfo=_LOCAL_TZ)
-    with patch.object(_sched, "_now_local", return_value=fake_local):
+    with (
+        patch.object(_sched, "_now_local", return_value=fake_local),
+        patch.object(_sched, "_QUIET_START", 23),
+        patch.object(_sched, "_QUIET_END", 9),
+    ):
         return _sched._is_quiet_now()
 
 

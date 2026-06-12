@@ -852,12 +852,33 @@ def cmd_summon(args: list[str]) -> int:
     permission_mode = persona.get("permission_mode", "auto")
     display_name = f"{persona['name']} — {item_id}"
 
+    # ── preflight: spec must be on origin/dev-queue before spawning anything ──
+    # Fetch first so we have the latest remote state.
+    subprocess.run(
+        ["git", "-C", repo_dir, "fetch", "origin", "--quiet"],
+        capture_output=True,
+        text=True,
+    )
+    spec_ref = f"knowledge/dev-notes/queue/{item_id}.md"
+    spec_check = subprocess.run(
+        ["git", "-C", repo_dir, "cat-file", "-e", f"origin/dev-queue:{spec_ref}"],
+        capture_output=True,
+        text=True,
+    )
+    if spec_check.returncode != 0:
+        print(
+            f"Error: spec not found on origin/dev-queue ({spec_ref}).\n"
+            f"Run `devqueue push {item_id}` to publish the spec before summoning.\n"
+            f"No session, worktree, or watchdog has been created.",
+            file=sys.stderr,
+        )
+        return 1
+
     # ── isolated build worktree ────────────────────────────────────────────────
     # The builder must not disturb the operator's checkout, so it works in a dedicated
     # worktree. A worktree of the (trusted) repo inherits its trust, so the unattended
     # session is not blocked by the workspace-trust dialog.
     wt = worktree_path(repo_dir, item_id)
-    subprocess.run(["git", "-C", repo_dir, "fetch", "origin"], capture_output=True, text=True)
     if wt.exists():
         # Remove a stale worktree from a previous summon of the same item.
         subprocess.run(
@@ -1077,10 +1098,11 @@ def cmd_verdict_sweep(_args: list[str]) -> int:
     Called by the heartbeat dispatcher on a 10m recurring schedule (armed at summon time).
     For each active dev_crew_runs row:
       - Fetches the PR's Tom QA comments posted after summoned_at
-      - Reports new verdicts (PASS/FAIL/SKIP) to Discord via SIGNAL:high stdout prefix
-      - Dedupes by comment node ID so each verdict posts exactly once
+      - Posts new verdicts (PASS/FAIL/SKIP) directly to Discord — bypasses quiet-hours gate
+      - Dedupes by comment node ID: the dedup marker is set only after confirmed delivery,
+        so a dropped post is retried on the next sweep rather than silently lost
       - Self-retires (removes the row) when the PR is merged or closed
-    Produces no output when there are no active builds or no new verdicts — silent no-op.
+    Produces no stdout; errors go to stderr.
     """
     conn = _db()
     try:
@@ -1094,7 +1116,6 @@ def cmd_verdict_sweep(_args: list[str]) -> int:
         return 0
 
     gh_failed_any = False
-    messages: list[str] = []
     for item_id, persona_id, summoned_at, last_reported in rows:
         persona = load_roster().get(persona_id, {})
         repo_dir = persona.get("repo_dir", str(PROJECT))
@@ -1114,21 +1135,23 @@ def cmd_verdict_sweep(_args: list[str]) -> int:
         # Report new verdict (deduped by comment identity).
         # Belt-and-suspenders: any new Tom comment with an unrecognized verdict is
         # surfaced as ERROR rather than silently dropped (e.g. future new verdict tokens).
+        # Dedup marker is updated only after confirmed delivery to ensure retries on failure.
         if comment_id and comment_id != last_reported:
             effective_verdict = verdict or "ERROR"
             msg = _build_verdict_message(
                 effective_verdict, item_id, persona_name, pr_url, comment_body
             )
-            messages.append(msg)
-            upd = _db()
-            try:
-                upd.execute(
-                    "UPDATE dev_crew_runs SET last_verdict_reported = ? WHERE item = ?",
-                    (comment_id, item_id),
-                )
-                upd.commit()
-            finally:
-                upd.close()
+            delivered = _post_discord(msg, mention=True)
+            if delivered:
+                upd = _db()
+                try:
+                    upd.execute(
+                        "UPDATE dev_crew_runs SET last_verdict_reported = ? WHERE item = ?",
+                        (comment_id, item_id),
+                    )
+                    upd.commit()
+                finally:
+                    upd.close()
 
         # Self-retire when PR is in a terminal state
         if pr_state in ("MERGED", "CLOSED"):
@@ -1141,13 +1164,10 @@ def cmd_verdict_sweep(_args: list[str]) -> int:
 
     if gh_failed_any and _should_emit_gh_fail_alert():
         _record_gh_fail_alert()
-        messages.insert(
-            0,
+        _post_discord(
             "⚠️ verdict sensor can't reach GitHub (`gh` failing) — verdicts may be missed",
+            mention=True,
         )
-
-    if messages:
-        print("SIGNAL:high\n" + "\n\n".join(messages))
 
     return 0
 

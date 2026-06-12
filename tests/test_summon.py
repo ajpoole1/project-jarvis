@@ -215,13 +215,20 @@ def test_build_verdict_message_error_contains_url_and_item():
 # ---------------------------------------------------------------------------
 
 
-def test_verdict_sweep_surfaces_error_verdict(tmp_db, monkeypatch, capsys):
-    """A Tom comment with ERROR verdict is emitted to stdout (SIGNAL:high path)."""
+def test_verdict_sweep_surfaces_error_verdict(tmp_db, monkeypatch):
+    """A Tom ERROR verdict is posted via _post_discord (high-signal path), not stdout."""
     from datetime import UTC, datetime
 
     item = "2026-0013-err"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
 
+    posts: list[tuple[str, bool]] = []
+
+    def _fake_post(message: str, mention: bool = False) -> bool:
+        posts.append((message, mention))
+        return True
+
+    monkeypatch.setattr(_mod, "_post_discord", _fake_post)
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
@@ -236,13 +243,15 @@ def test_verdict_sweep_surfaces_error_verdict(tmp_db, monkeypatch, capsys):
     )
 
     rc = _mod.cmd_verdict_sweep([])
-    out = capsys.readouterr().out
     assert rc == 0
-    assert "ERROR" in out
-    assert item in out
+    assert len(posts) == 1
+    msg, mention = posts[0]
+    assert "ERROR" in msg
+    assert item in msg
+    assert mention is True
 
 
-def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch):
     """Belt-and-suspenders: a Tom comment that classifies to '' is never silently dropped;
     it surfaces as ERROR so AJ always sees unexpected Tom output."""
     from datetime import UTC, datetime
@@ -250,6 +259,13 @@ def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch, ca
     item = "2026-0013-unk"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
 
+    posts: list[tuple[str, bool]] = []
+
+    def _fake_post(message: str, mention: bool = False) -> bool:
+        posts.append((message, mention))
+        return True
+
+    monkeypatch.setattr(_mod, "_post_discord", _fake_post)
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
@@ -264,7 +280,8 @@ def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch, ca
     )
 
     rc = _mod.cmd_verdict_sweep([])
-    out = capsys.readouterr().out
     assert rc == 0
-    assert item in out
-    assert out.strip() != ""  # something was emitted — never silent
+    assert len(posts) == 1
+    msg, mention = posts[0]
+    assert item in msg
+    assert mention is True
