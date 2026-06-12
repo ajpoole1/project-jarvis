@@ -274,7 +274,15 @@ jobs:
               print(f"Tom API error {resp.status_code if resp else 'no response'}: {resp.text[:500] if resp else ''}", file=sys.stderr)
               sys.exit(1)
 
-            _last_raw = resp.json()["choices"][0]["message"]["content"]
+            try:
+              _last_raw = resp.json()["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, ValueError, Exception) as _shape_err:
+              if _json_attempt < _MAX_JSON_ATTEMPTS:
+                print(f"Tom unexpected response shape (attempt {_json_attempt}/{_MAX_JSON_ATTEMPTS}): {_shape_err} — retrying", file=sys.stderr)
+                continue  # retry the model call
+              print(f"Tom ERROR: unexpected response shape after {_MAX_JSON_ATTEMPTS} attempts: {_shape_err}", file=sys.stderr)
+              print(f"Response body (first 500 chars): {str(resp.json())[:500]}", file=sys.stderr)
+              sys.exit(1)
             try:
               _m = re.search(r'\{.*\}', _last_raw, re.DOTALL)
               findings = json.loads(_m.group(0) if _m else _last_raw)
