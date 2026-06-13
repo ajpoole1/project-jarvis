@@ -167,7 +167,7 @@ jobs:
             STUB_BASE="knowledge/dev-notes/backlog/${ITEM_ID}-advisory"
 
             python3 - "$ADVISORY_NOTES" "$STUB_BASE" "$ITEM_ID" "$TODAY" <<'PYEOF'
-          import json, sys, re
+          import json, sys, re, textwrap
           from pathlib import Path
 
           notes_raw, stub_base, item_id, today = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -196,7 +196,8 @@ jobs:
               path = Path(f"{stub_base}-{i:02d}-{slug}.md")
               path.parent.mkdir(parents=True, exist_ok=True)
 
-              content = f"""---
+              content = textwrap.dedent(f"""
+          ---
           id: {path.stem}
           title: "{title}"
           status: proposed
@@ -222,7 +223,7 @@ jobs:
 
           ## Notes
           Source: QA run on {item_id}.
-          """
+          """).lstrip("\n")
               path.write_text(content, encoding='utf-8')
               print(f"Seeded backlog stub: {path}")
           PYEOF

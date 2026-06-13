@@ -168,6 +168,47 @@ def test_watchdog_check_silent_when_no_record(tmp_db, capsys):
 
 
 # ---------------------------------------------------------------------------
+# cmd_summon — preflight (spec absent on origin/dev-queue)
+# ---------------------------------------------------------------------------
+
+
+def test_summon_preflight_fails_when_spec_not_on_dev_queue(tmp_db, monkeypatch, capsys):
+    """cmd_summon returns 1 and creates no worktree, spawns no session, arms no watchdog
+    when git cat-file -e origin/dev-queue:<spec> fails (spec not published)."""
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_mod, "check_claude_version", lambda: None)
+    monkeypatch.setattr(_mod, "concurrency_check", lambda: None)
+    monkeypatch.setattr(_mod, "list_crew_sessions", lambda: [])
+    monkeypatch.setattr(
+        _mod,
+        "get_persona",
+        lambda _: {
+            "name": "Herr Mannkusser",
+            "role": "builder",
+            "repo_dir": "/fake/repo",
+            "permission_mode": "auto",
+        },
+    )
+
+    spawned: list[list] = []
+
+    def _fake_run(cmd, **kwargs):
+        spawned.append(list(cmd))
+        rc = 1 if "cat-file" in cmd else 0
+        return _subprocess.CompletedProcess(cmd, rc)
+
+    monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
+
+    rc = _mod.cmd_summon(["mannkusser", "2026-0999-fake"])
+
+    assert rc == 1
+    # Only git fetch and git cat-file should have been called; nothing beyond the preflight.
+    substantive = [c for c in spawned if "cat-file" not in c and "fetch" not in c]
+    assert substantive == [], f"Unexpected subprocess calls after preflight failure: {substantive}"
+
+
+# ---------------------------------------------------------------------------
 # _classify_verdict — ERROR branch
 # ---------------------------------------------------------------------------
 
