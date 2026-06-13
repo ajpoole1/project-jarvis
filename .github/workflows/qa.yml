@@ -199,6 +199,7 @@ jobs:
           - severity=advisory: theoretical edges where you cannot show a concrete trigger, defensive-hardening suggestions, extra tests, style nits, or anything you suspect but cannot demonstrate. Advisory findings need not state a trigger.
           - Verify-don't-assert: NEVER assert a syntax error, "bad substitution," "will crash," or runtime failure unless you can ground the claim in the repo's declared runtime (language, version, shell). When uncertain — e.g. a shell construct you cannot confirm is valid in the repo's exact shell version — raise an advisory "worth verifying" note, NOT a blocking defect. An unverified blocking assertion wastes a full build cycle.
           - Calibration — over-escalation: if a shell construct may be valid but you are not certain (e.g. `${!v:-}` in bash 5.2 is valid indirect expansion with default — do not block on this class of claim without verification), grade advisory. If a crash path exists but every call site passes validated input, grade advisory.
+          - Calibration — over-escalation: if a function or symbol appears CALLED in the diff but its DEFINITION is not visible in the diff, do NOT block on "undefined" — the definition likely exists elsewhere in the file or module. Only block if the diff explicitly removes the definition while keeping calls.
           - Calibration — under-escalation: if a spec requires a fail-safe (e.g. "paginate until exhausted, never silently truncate") and the diff omits it, that is a blocking conformance failure regardless of how unlikely the path is in practice.
 
           Other rules:
@@ -291,9 +292,47 @@ jobs:
               if _json_attempt < _MAX_JSON_ATTEMPTS:
                 print(f"Tom JSON parse failed (attempt {_json_attempt}/{_MAX_JSON_ATTEMPTS}) — re-requesting model", file=sys.stderr)
               else:
-                print(f"Tom ERROR: JSON parse failed after {_MAX_JSON_ATTEMPTS} attempts. Raw output (first 2000 chars):", file=sys.stderr)
+                # All parse attempts failed — try partial recovery by extracting
+                # spec_conformance and defects individually from the truncated response.
+                # architecture_notes is commonly the last field and gets cut off when
+                # Gemini's response exceeds the output budget; the key findings are earlier.
+                print(f"Tom JSON parse failed after {_MAX_JSON_ATTEMPTS} attempts — attempting partial recovery.", file=sys.stderr)
+                print(f"Raw output (first 2000 chars):", file=sys.stderr)
                 print(_last_raw[:2000], file=sys.stderr)
-                sys.exit(1)
+
+                def _extract_array(raw, key):
+                  """Extract a JSON array for key from potentially-truncated JSON."""
+                  m = re.search(r'"' + re.escape(key) + r'"\s*:\s*(\[)', raw, re.DOTALL)
+                  if not m:
+                    return None
+                  start = m.start(1)
+                  depth = 0
+                  for i, ch in enumerate(raw[start:]):
+                    if ch == '[':
+                      depth += 1
+                    elif ch == ']':
+                      depth -= 1
+                      if depth == 0:
+                        try:
+                          return json.loads(raw[start:start + i + 1])
+                        except json.JSONDecodeError:
+                          return None
+                  return None
+
+                sc = _extract_array(_last_raw, "spec_conformance")
+                df = _extract_array(_last_raw, "defects")
+                if sc is not None and df is not None:
+                  findings = {
+                    "spec_conformance": sc,
+                    "defects": df,
+                    "architecture_notes": [
+                      "[Partial response — Gemini output truncated before architecture_notes; spec_conformance and defects recovered]"
+                    ],
+                  }
+                  print("Tom WARNING: JSON truncated but spec_conformance+defects recovered — proceeding with partial results.", file=sys.stderr)
+                else:
+                  print(f"Tom ERROR: JSON parse and partial recovery both failed after {_MAX_JSON_ATTEMPTS} attempts.", file=sys.stderr)
+                  sys.exit(1)
 
           # Validate shape
           for key in ("spec_conformance", "defects", "architecture_notes"):
