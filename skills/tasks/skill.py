@@ -13,7 +13,7 @@ from pathlib import Path
 def _load_env(path: Path) -> None:
     if not path.exists():
         return
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -23,10 +23,20 @@ def _load_env(path: Path) -> None:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip()
+        # Unquote and strip inline comments.  Quoted values keep the comment inside.
         for q in ('"', "'"):
-            if value.startswith(q) and value.endswith(q) and len(value) >= 2:
-                value = value[1:-1]
+            if value.startswith(q):
+                end = value.find(q, 1)
+                if end != -1:
+                    value = value[1:end]
                 break
+        else:
+            # Not quoted: strip trailing inline comment (KEY=VAL # comment)
+            for sep in (" #", "\t#"):
+                pos = value.find(sep)
+                if pos != -1:
+                    value = value[:pos].rstrip()
+                    break
         if key:
             os.environ.setdefault(key, value)
 

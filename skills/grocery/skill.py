@@ -15,7 +15,7 @@ from pathlib import Path
 def _load_env(path: Path) -> None:
     if not path.exists():
         return
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -25,10 +25,20 @@ def _load_env(path: Path) -> None:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip()
+        # Unquote and strip inline comments.  Quoted values keep the comment inside.
         for q in ('"', "'"):
-            if value.startswith(q) and value.endswith(q) and len(value) >= 2:
-                value = value[1:-1]
+            if value.startswith(q):
+                end = value.find(q, 1)
+                if end != -1:
+                    value = value[1:end]
                 break
+        else:
+            # Not quoted: strip trailing inline comment (KEY=VAL # comment)
+            for sep in (" #", "\t#"):
+                pos = value.find(sep)
+                if pos != -1:
+                    value = value[:pos].rstrip()
+                    break
         if key:
             os.environ.setdefault(key, value)
 
@@ -39,8 +49,13 @@ DATA_DIR = Path(os.environ.get("JARVIS_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "jarvis.db"
 _KNOWLEDGE_ROOT = Path(__file__).parents[2] / "knowledge"
 _SKILLS_DIR = Path(__file__).parents[2] / "skills"
-_CAL_PYTHON = str(_SKILLS_DIR / "calendar" / ".venv" / "bin" / "python")
 _CAL_SKILL = str(_SKILLS_DIR / "calendar" / "skill.py")
+
+
+def _cal_python() -> str:
+    """Resolve the calendar venv interpreter relative to the skills root; fall back to system python3."""
+    venv = _SKILLS_DIR / "calendar" / ".venv" / "bin" / "python"
+    return str(venv) if venv.exists() else "python3"
 
 
 # ---------------------------------------------------------------------------
@@ -63,12 +78,16 @@ def _init_db() -> sqlite3.Connection:
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
-    # Idempotent migration: add status column to pre-existing tables
-    try:
-        conn.execute("ALTER TABLE grocery_items ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    # Idempotent migrations
+    for _migration in [
+        "ALTER TABLE grocery_items ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+        "ALTER TABLE grocery_items ADD COLUMN from_note INTEGER NOT NULL DEFAULT 0",
+    ]:
+        try:
+            conn.execute(_migration)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS grocery_archive (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -406,7 +425,7 @@ def cmd_seed(conn: sqlite3.Connection) -> str:
 def _cal_run(*args: str) -> str:
     try:
         result = subprocess.run(
-            [_CAL_PYTHON, _CAL_SKILL, *args],
+            [_cal_python(), _CAL_SKILL, *args],
             capture_output=True,
             text=True,
             timeout=30,
@@ -598,6 +617,13 @@ def _append_item_to_note(name: str, qty: str | None, store: str | None) -> str |
     if event_id is None:
         return description
 
+    # Case-insensitive dedup: skip if name already present in note (any case)
+    name_lower = name.strip().lower()
+    if any(
+        pname.strip().lower() == name_lower for pname, _, _, _ in _parse_note_items(description)
+    ):
+        return None
+
     item_text = name.strip()
     if qty:
         item_text += f" ×{qty}"
@@ -615,24 +641,27 @@ def _append_item_to_note(name: str, qty: str | None, store: str | None) -> str |
 
 
 def cmd_sync_note(conn: sqlite3.Connection) -> str:
-    """Read the current month's grocery note and upsert items into the active list (idempotent)."""
+    """Read the current month's grocery note and upsert items into the active list (idempotent).
+
+    Items present in the note are upserted and marked from_note=1.
+    Active items previously synced from the note (from_note=1) that no longer appear in the
+    note are removed — the note is canonical for this set.  Items added by other routes
+    (from-recipe, seed; from_note=0) are never removed by this command.
+    """
     event_id, description = _get_grocery_event()
     if event_id is None:
         return f"⚠️ {description}"
 
-    if not description.strip():
-        return "Grocery note is empty — nothing to sync."
-
-    items = _parse_note_items(description)
-    if not items:
-        return "No parseable items in grocery note."
+    items = _parse_note_items(description) if description.strip() else []
 
     added: list[str] = []
     updated: list[str] = []
     skipped: list[str] = []
+    note_norms: set[str] = set()
 
     for name, qty, store, store_explicit in items:
         nn = _norm(name)
+        note_norms.add(nn)
         row = conn.execute(
             "SELECT name, qty, store FROM grocery_items WHERE name_norm = ?", (nn,)
         ).fetchone()
@@ -646,21 +675,33 @@ def cmd_sync_note(conn: sqlite3.Connection) -> str:
             if store is not None and (store_explicit or row[2] is None):
                 updates.append("store = ?")
                 params.append(store)
-            if updates:
-                params.append(nn)
-                conn.execute(
-                    f"UPDATE grocery_items SET {', '.join(updates)} WHERE name_norm = ?",
-                    params,
-                )
+            updates.append("from_note = 1")
+            params.append(nn)
+            conn.execute(
+                f"UPDATE grocery_items SET {', '.join(updates)} WHERE name_norm = ?",
+                params,
+            )
+            if len(updates) > 1:  # something besides from_note changed
                 updated.append(name)
             else:
                 skipped.append(name)
         else:
             conn.execute(
-                "INSERT INTO grocery_items (name, name_norm, qty, store) VALUES (?, ?, ?, ?)",
+                "INSERT INTO grocery_items (name, name_norm, qty, store, from_note)"
+                " VALUES (?, ?, ?, ?, 1)",
                 (name.strip(), nn, qty, store),
             )
             added.append(name)
+
+    # Remove active items that came from the note but are no longer in it
+    removed_rows = conn.execute(
+        "SELECT name_norm FROM grocery_items WHERE from_note = 1"
+    ).fetchall()
+    removed: list[str] = []
+    for (nn,) in removed_rows:
+        if nn not in note_norms:
+            conn.execute("DELETE FROM grocery_items WHERE name_norm = ?", (nn,))
+            removed.append(nn)
 
     conn.commit()
 
@@ -669,6 +710,8 @@ def cmd_sync_note(conn: sqlite3.Connection) -> str:
         parts.append(f"Added {len(added)}: {', '.join(added)}")
     if updated:
         parts.append(f"Updated {len(updated)}: {', '.join(updated)}")
+    if removed:
+        parts.append(f"Removed {len(removed)} (no longer in note): {', '.join(removed)}")
     if skipped:
         parts.append(f"Skipped {len(skipped)} (unchanged)")
     return "; ".join(parts) if parts else "No changes."

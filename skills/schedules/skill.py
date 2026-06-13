@@ -691,12 +691,13 @@ def cmd_dispatch(argv: list[str]) -> None:
 
             if result is not None:
                 # Forward any skill output to Discord.
-                # Skills may prefix SIGNAL:high\n to their stdout to request an @mention.
+                # SIGNAL:high prefix bypasses the quiet-hours gate — dev-loop verdicts,
+                # stall alerts, and errors must reach AJ immediately regardless of hour.
                 if result.stdout.strip():
                     raw = result.stdout.strip()
                     _HIGH_PREFIX = "SIGNAL:high\n"
                     if raw.startswith(_HIGH_PREFIX):
-                        _post_discord(conn, raw[len(_HIGH_PREFIX) :], signal="high")
+                        _post_discord_direct(raw[len(_HIGH_PREFIX) :], signal="high")
                     else:
                         _post_discord(conn, raw, signal="ambient")
                 # Alert on failure

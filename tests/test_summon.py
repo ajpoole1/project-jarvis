@@ -168,6 +168,47 @@ def test_watchdog_check_silent_when_no_record(tmp_db, capsys):
 
 
 # ---------------------------------------------------------------------------
+# cmd_summon — preflight (spec absent on origin/dev-queue)
+# ---------------------------------------------------------------------------
+
+
+def test_summon_preflight_fails_when_spec_not_on_dev_queue(tmp_db, monkeypatch, capsys):
+    """cmd_summon returns 1 and creates no worktree, spawns no session, arms no watchdog
+    when git cat-file -e origin/dev-queue:<spec> fails (spec not published)."""
+    import subprocess as _subprocess
+
+    monkeypatch.setattr(_mod, "check_claude_version", lambda: None)
+    monkeypatch.setattr(_mod, "concurrency_check", lambda: None)
+    monkeypatch.setattr(_mod, "list_crew_sessions", lambda: [])
+    monkeypatch.setattr(
+        _mod,
+        "get_persona",
+        lambda _: {
+            "name": "Herr Mannkusser",
+            "role": "builder",
+            "repo_dir": "/fake/repo",
+            "permission_mode": "auto",
+        },
+    )
+
+    spawned: list[list] = []
+
+    def _fake_run(cmd, **kwargs):
+        spawned.append(list(cmd))
+        rc = 1 if "cat-file" in cmd else 0
+        return _subprocess.CompletedProcess(cmd, rc)
+
+    monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
+
+    rc = _mod.cmd_summon(["mannkusser", "2026-0999-fake"])
+
+    assert rc == 1
+    # Only git fetch and git cat-file should have been called; nothing beyond the preflight.
+    substantive = [c for c in spawned if "cat-file" not in c and "fetch" not in c]
+    assert substantive == [], f"Unexpected subprocess calls after preflight failure: {substantive}"
+
+
+# ---------------------------------------------------------------------------
 # _classify_verdict — ERROR branch
 # ---------------------------------------------------------------------------
 
@@ -215,13 +256,20 @@ def test_build_verdict_message_error_contains_url_and_item():
 # ---------------------------------------------------------------------------
 
 
-def test_verdict_sweep_surfaces_error_verdict(tmp_db, monkeypatch, capsys):
-    """A Tom comment with ERROR verdict is emitted to stdout (SIGNAL:high path)."""
+def test_verdict_sweep_surfaces_error_verdict(tmp_db, monkeypatch):
+    """A Tom ERROR verdict is posted via _post_discord (high-signal path), not stdout."""
     from datetime import UTC, datetime
 
     item = "2026-0013-err"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
 
+    posts: list[tuple[str, bool]] = []
+
+    def _fake_post(message: str, mention: bool = False) -> bool:
+        posts.append((message, mention))
+        return True
+
+    monkeypatch.setattr(_mod, "_post_discord", _fake_post)
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
@@ -236,13 +284,15 @@ def test_verdict_sweep_surfaces_error_verdict(tmp_db, monkeypatch, capsys):
     )
 
     rc = _mod.cmd_verdict_sweep([])
-    out = capsys.readouterr().out
     assert rc == 0
-    assert "ERROR" in out
-    assert item in out
+    assert len(posts) == 1
+    msg, mention = posts[0]
+    assert "ERROR" in msg
+    assert item in msg
+    assert mention is True
 
 
-def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch):
     """Belt-and-suspenders: a Tom comment that classifies to '' is never silently dropped;
     it surfaces as ERROR so AJ always sees unexpected Tom output."""
     from datetime import UTC, datetime
@@ -250,6 +300,13 @@ def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch, ca
     item = "2026-0013-unk"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
 
+    posts: list[tuple[str, bool]] = []
+
+    def _fake_post(message: str, mention: bool = False) -> bool:
+        posts.append((message, mention))
+        return True
+
+    monkeypatch.setattr(_mod, "_post_discord", _fake_post)
     monkeypatch.setattr(
         _mod,
         "_fetch_active_verdict",
@@ -264,7 +321,8 @@ def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch, ca
     )
 
     rc = _mod.cmd_verdict_sweep([])
-    out = capsys.readouterr().out
     assert rc == 0
-    assert item in out
-    assert out.strip() != ""  # something was emitted — never silent
+    assert len(posts) == 1
+    msg, mention = posts[0]
+    assert item in msg
+    assert mention is True

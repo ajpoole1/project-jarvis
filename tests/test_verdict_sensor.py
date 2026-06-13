@@ -3,7 +3,8 @@
 Acceptance criteria covered:
   AC1/AC2 — dedupe: same verdict reported twice → one Discord post
   AC2     — refix cycle: FAIL→PASS each reported exactly once
-  AC3     — PASS/FAIL/SKIP all emit SIGNAL:high prefix (@mention AJ)
+  AC2b    — dedup marker set only after confirmed delivery; failed delivery → retry
+  AC3     — PASS/FAIL/SKIP all post to Discord with mention=True (high-signal)
   AC3     — PASS/SKIP message names merge gate; FAIL message names fix-authorize gate
   AC4     — self-retire: row removed when PR is merged or closed
 """
@@ -33,6 +34,32 @@ def tmp_db(monkeypatch, tmp_path):
     """Isolate each test to its own jarvis.db."""
     monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
     return tmp_path
+
+
+@pytest.fixture
+def capture_posts(monkeypatch):
+    """Monkeypatch _post_discord to capture calls and return True (delivery success)."""
+    posts: list[tuple[str, bool]] = []
+
+    def _fake_post(message: str, mention: bool = False) -> bool:
+        posts.append((message, mention))
+        return True
+
+    monkeypatch.setattr(_mod, "_post_discord", _fake_post)
+    return posts
+
+
+@pytest.fixture
+def failing_post(monkeypatch):
+    """Monkeypatch _post_discord to simulate delivery failure (returns False)."""
+    calls: list[tuple[str, bool]] = []
+
+    def _fake_post(message: str, mention: bool = False) -> bool:
+        calls.append((message, mention))
+        return False
+
+    monkeypatch.setattr(_mod, "_post_discord", _fake_post)
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +196,7 @@ def test_parse_iso_empty_returns_none():
 # ---------------------------------------------------------------------------
 
 
-def test_verdict_sweep_deduplication(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_deduplication(tmp_db, monkeypatch, capture_posts):
     """Same verdict received on two consecutive ticks → posted exactly once."""
     item = "2026-0009-dedup"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
@@ -181,14 +208,80 @@ def test_verdict_sweep_deduplication(tmp_db, monkeypatch, capsys):
 
     # First sweep: new verdict — should post
     _mod.cmd_verdict_sweep([])
-    first_out = capsys.readouterr().out
+    assert len(capture_posts) == 1
 
-    # Second sweep: same comment ID — should be silent
+    # Second sweep: same comment ID — should be silent (deduped)
     _mod.cmd_verdict_sweep([])
-    second_out = capsys.readouterr().out
+    assert len(capture_posts) == 1  # still 1 — no new post
 
-    assert first_out.strip() != ""
-    assert second_out.strip() == ""
+
+# ---------------------------------------------------------------------------
+# cmd_verdict_sweep — dedup marker only set on confirmed delivery (AC2b)
+# ---------------------------------------------------------------------------
+
+
+def test_verdict_sweep_dedup_not_set_on_delivery_failure(tmp_db, monkeypatch, failing_post):
+    """If Discord delivery fails, dedup marker is NOT set — next sweep retries."""
+    item = "2026-0009-dedup-fail"
+    _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
+
+    monkeypatch.setattr(
+        _mod,
+        "_fetch_active_verdict",
+        lambda *a: ("OPEN", _PR_URL, "PASS", "IC_fail42", "## Tom QA — ✅ PASS\n", False),
+    )
+
+    # First sweep: delivery fails → marker NOT updated
+    _mod.cmd_verdict_sweep([])
+    assert len(failing_post) == 1  # attempted delivery
+
+    conn = _mod._db()
+    try:
+        row = conn.execute(
+            "SELECT last_verdict_reported FROM dev_crew_runs WHERE item = ?", (item,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] is None  # marker not set because delivery failed
+
+
+def test_verdict_sweep_dedup_retried_after_failure(tmp_db, monkeypatch):
+    """After a delivery failure the next sweep re-attempts delivery."""
+    item = "2026-0009-retry"
+    _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
+
+    monkeypatch.setattr(
+        _mod,
+        "_fetch_active_verdict",
+        lambda *a: ("OPEN", _PR_URL, "PASS", "IC_retry1", "## Tom QA — ✅ PASS\n", False),
+    )
+
+    attempt_count = [0]
+
+    def counting_post(message: str, mention: bool = False) -> bool:
+        attempt_count[0] += 1
+        return attempt_count[0] >= 2  # fail first, succeed second
+
+    monkeypatch.setattr(_mod, "_post_discord", counting_post)
+
+    # First sweep: fails → marker not set
+    _mod.cmd_verdict_sweep([])
+    assert attempt_count[0] == 1
+
+    # Second sweep: succeeds → marker set
+    _mod.cmd_verdict_sweep([])
+    assert attempt_count[0] == 2
+
+    conn = _mod._db()
+    try:
+        row = conn.execute(
+            "SELECT last_verdict_reported FROM dev_crew_runs WHERE item = ?", (item,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == "IC_retry1"
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +289,7 @@ def test_verdict_sweep_deduplication(tmp_db, monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_verdict_sweep_refix_cycle(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_refix_cycle(tmp_db, monkeypatch, capture_posts):
     """FAIL verdict posted, then re-summon, then PASS verdict posted — both appear, no dupes."""
     item = "2026-0009-refix"
 
@@ -210,12 +303,12 @@ def test_verdict_sweep_refix_cycle(tmp_db, monkeypatch, capsys):
         lambda *a: ("OPEN", _PR_URL, "FAIL", "IC_fail_001", "## Tom QA — 🚫 FAIL\n", False),
     )
     _mod.cmd_verdict_sweep([])
-    fail_out = capsys.readouterr().out
-    assert "FAIL" in fail_out
+    assert len(capture_posts) == 1
+    assert "FAIL" in capture_posts[0][0]
 
-    # Second tick with same FAIL verdict → silent
+    # Second tick with same FAIL verdict → silent (deduped)
     _mod.cmd_verdict_sweep([])
-    assert capsys.readouterr().out.strip() == ""
+    assert len(capture_posts) == 1
 
     # AJ re-summons for refix (resets last_verdict_reported=NULL, advances summoned_at)
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
@@ -227,20 +320,20 @@ def test_verdict_sweep_refix_cycle(tmp_db, monkeypatch, capsys):
         lambda *a: ("OPEN", _PR_URL, "PASS", "IC_pass_002", "## Tom QA — ✅ PASS\n", False),
     )
     _mod.cmd_verdict_sweep([])
-    pass_out = capsys.readouterr().out
-    assert "PASS" in pass_out
+    assert len(capture_posts) == 2
+    assert "PASS" in capture_posts[1][0]
 
     # Third tick → silent again
     _mod.cmd_verdict_sweep([])
-    assert capsys.readouterr().out.strip() == ""
+    assert len(capture_posts) == 2
 
 
 # ---------------------------------------------------------------------------
-# cmd_verdict_sweep — SIGNAL:high for all verdict types (AC3)
+# cmd_verdict_sweep — all verdicts post with mention=True (AC3, bypasses quiet hours)
 # ---------------------------------------------------------------------------
 
 
-def test_verdict_sweep_signal_high_for_pass(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_mention_true_for_pass(tmp_db, monkeypatch, capture_posts):
     item = "2026-0009-sig-pass"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
     monkeypatch.setattr(
@@ -249,11 +342,12 @@ def test_verdict_sweep_signal_high_for_pass(tmp_db, monkeypatch, capsys):
         lambda *a: ("OPEN", _PR_URL, "PASS", "IC_sp1", "## Tom QA — ✅ PASS", False),
     )
     _mod.cmd_verdict_sweep([])
-    out = capsys.readouterr().out
-    assert out.startswith("SIGNAL:high\n")
+    assert len(capture_posts) == 1
+    _, mention = capture_posts[0]
+    assert mention is True
 
 
-def test_verdict_sweep_signal_high_for_fail(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_mention_true_for_fail(tmp_db, monkeypatch, capture_posts):
     item = "2026-0009-sig-fail"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
     monkeypatch.setattr(
@@ -262,11 +356,12 @@ def test_verdict_sweep_signal_high_for_fail(tmp_db, monkeypatch, capsys):
         lambda *a: ("OPEN", _PR_URL, "FAIL", "IC_sf1", "## Tom QA — 🚫 FAIL\n", False),
     )
     _mod.cmd_verdict_sweep([])
-    out = capsys.readouterr().out
-    assert out.startswith("SIGNAL:high\n")
+    assert len(capture_posts) == 1
+    _, mention = capture_posts[0]
+    assert mention is True
 
 
-def test_verdict_sweep_signal_high_for_skip(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_mention_true_for_skip(tmp_db, monkeypatch, capture_posts):
     item = "2026-0009-sig-skip"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
     monkeypatch.setattr(
@@ -275,8 +370,9 @@ def test_verdict_sweep_signal_high_for_skip(tmp_db, monkeypatch, capsys):
         lambda *a: ("OPEN", _PR_URL, "SKIP", "IC_sk1", "## Tom QA — ⏭️ SKIP", False),
     )
     _mod.cmd_verdict_sweep([])
-    out = capsys.readouterr().out
-    assert out.startswith("SIGNAL:high\n")
+    assert len(capture_posts) == 1
+    _, mention = capture_posts[0]
+    assert mention is True
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +380,7 @@ def test_verdict_sweep_signal_high_for_skip(tmp_db, monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_verdict_sweep_retires_on_merged_pr(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_retires_on_merged_pr(tmp_db, monkeypatch, capture_posts):
     """Row is removed from dev_crew_runs when the PR is merged."""
     item = "2026-0009-retire-merge"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
@@ -304,7 +400,7 @@ def test_verdict_sweep_retires_on_merged_pr(tmp_db, monkeypatch, capsys):
     assert row is None
 
 
-def test_verdict_sweep_retires_on_closed_pr(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_retires_on_closed_pr(tmp_db, monkeypatch, capture_posts):
     """Row is removed from dev_crew_runs when the PR is closed (without merge)."""
     item = "2026-0009-retire-close"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
@@ -324,14 +420,14 @@ def test_verdict_sweep_retires_on_closed_pr(tmp_db, monkeypatch, capsys):
     assert row is None
 
 
-def test_verdict_sweep_silent_with_no_active_builds(tmp_db, capsys):
-    """No rows in dev_crew_runs → no output."""
+def test_verdict_sweep_silent_with_no_active_builds(tmp_db, monkeypatch, capture_posts):
+    """No rows in dev_crew_runs → no Discord post."""
     _mod.cmd_verdict_sweep([])
-    assert capsys.readouterr().out.strip() == ""
+    assert len(capture_posts) == 0
 
 
-def test_verdict_sweep_silent_when_no_pr_yet(tmp_db, monkeypatch, capsys):
-    """No PR yet for the build → no output."""
+def test_verdict_sweep_silent_when_no_pr_yet(tmp_db, monkeypatch, capture_posts):
+    """No PR yet for the build → no Discord post."""
     item = "2026-0009-no-pr"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
 
@@ -341,11 +437,11 @@ def test_verdict_sweep_silent_when_no_pr_yet(tmp_db, monkeypatch, capsys):
         lambda *a: ("", "", "", "", "", False),
     )
     _mod.cmd_verdict_sweep([])
-    assert capsys.readouterr().out.strip() == ""
+    assert len(capture_posts) == 0
 
 
-def test_verdict_sweep_silent_when_no_verdict_yet(tmp_db, monkeypatch, capsys):
-    """PR exists but no Tom verdict yet → no output."""
+def test_verdict_sweep_silent_when_no_verdict_yet(tmp_db, monkeypatch, capture_posts):
+    """PR exists but no Tom verdict yet → no Discord post."""
     item = "2026-0009-no-verdict"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
 
@@ -355,7 +451,7 @@ def test_verdict_sweep_silent_when_no_verdict_yet(tmp_db, monkeypatch, capsys):
         lambda *a: ("OPEN", _PR_URL, "", "", "", False),
     )
     _mod.cmd_verdict_sweep([])
-    assert capsys.readouterr().out.strip() == ""
+    assert len(capture_posts) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +459,8 @@ def test_verdict_sweep_silent_when_no_verdict_yet(tmp_db, monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_verdict_sweep_gh_fail_surfaces_signal(tmp_db, monkeypatch, tmp_path, capsys):
-    """A gh failure surfaces a SIGNAL:high notice, not a silent skip."""
+def test_verdict_sweep_gh_fail_surfaces_post(tmp_db, monkeypatch, tmp_path, capture_posts):
+    """A gh failure posts a notice to Discord."""
     item = "2026-0010-gh-fail"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
 
@@ -377,13 +473,14 @@ def test_verdict_sweep_gh_fail_surfaces_signal(tmp_db, monkeypatch, tmp_path, ca
     monkeypatch.setattr(_mod, "_GH_FAIL_SENTINEL", sentinel)
 
     _mod.cmd_verdict_sweep([])
-    out = capsys.readouterr().out
-    assert "SIGNAL:high" in out
-    assert "gh" in out.lower()
+    assert len(capture_posts) == 1
+    msg, mention = capture_posts[0]
+    assert "gh" in msg.lower()
+    assert mention is True
 
 
-def test_verdict_sweep_gh_fail_throttled(tmp_db, monkeypatch, tmp_path, capsys):
-    """A gh failure within the cooldown window produces no stdout (throttled)."""
+def test_verdict_sweep_gh_fail_throttled(tmp_db, monkeypatch, tmp_path, capture_posts):
+    """A gh failure within the cooldown window produces no Discord post (throttled)."""
     item = "2026-0010-gh-throttle"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
 
@@ -397,10 +494,12 @@ def test_verdict_sweep_gh_fail_throttled(tmp_db, monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(_mod, "_GH_FAIL_SENTINEL", sentinel)
 
     _mod.cmd_verdict_sweep([])
-    assert capsys.readouterr().out.strip() == ""
+    assert len(capture_posts) == 0
 
 
-def test_verdict_sweep_gh_fail_multiple_items_one_alert(tmp_db, monkeypatch, tmp_path, capsys):
+def test_verdict_sweep_gh_fail_multiple_items_one_alert(
+    tmp_db, monkeypatch, tmp_path, capture_posts
+):
     """Multiple items with gh failures emit a single alert, not one per item."""
     for i in range(3):
         _mod._record_summon(f"2026-0010-multi-{i}", "mannkusser", "/tmp/wt", datetime.now(UTC))
@@ -414,13 +513,12 @@ def test_verdict_sweep_gh_fail_multiple_items_one_alert(tmp_db, monkeypatch, tmp
     monkeypatch.setattr(_mod, "_GH_FAIL_SENTINEL", sentinel)
 
     _mod.cmd_verdict_sweep([])
-    out = capsys.readouterr().out
-    assert out.startswith("SIGNAL:high\n")
-    # The alert message should appear exactly once
-    assert out.count("verdict sensor") == 1
+    assert len(capture_posts) == 1
+    msg, _ = capture_posts[0]
+    assert "verdict sensor" in msg
 
 
-def test_verdict_sweep_no_pr_yet_silent_on_gh_ok(tmp_db, monkeypatch, capsys):
+def test_verdict_sweep_no_pr_yet_silent_on_gh_ok(tmp_db, monkeypatch, capture_posts):
     """'No PR yet' (pr_state='', gh_failed=False) stays silent — distinct from gh failure."""
     item = "2026-0010-no-pr-ok"
     _mod._record_summon(item, "mannkusser", "/tmp/wt", datetime.now(UTC))
@@ -431,7 +529,7 @@ def test_verdict_sweep_no_pr_yet_silent_on_gh_ok(tmp_db, monkeypatch, capsys):
         lambda *a: ("", "", "", "", "", False),
     )
     _mod.cmd_verdict_sweep([])
-    assert capsys.readouterr().out.strip() == ""
+    assert len(capture_posts) == 0
 
 
 # ---------------------------------------------------------------------------

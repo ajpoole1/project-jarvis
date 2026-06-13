@@ -722,17 +722,23 @@ Articles:
         scored = json.loads(_strip_json_fences(score_resp.content[0].text))
         scored.sort(key=lambda x: x.get("score", 0), reverse=True)
         # Bias to longform: qualifying longform candidates fill slots first; news fills remainder.
+        # Coerce index to int defensively — LLM may return a string.
         qualifying = [s for s in scored if s.get("score", 0) >= 6]
-        longform_top = [
-            s["index"]
-            for s in qualifying
-            if s["index"] < len(candidates) and candidates[s["index"]].get("kind") == "longform"
-        ][:4]
-        news_top = [
-            s["index"]
-            for s in qualifying
-            if s["index"] < len(candidates) and candidates[s["index"]].get("kind") == "news"
-        ][:2]
+        n_cands = len(candidates)
+        longform_top: list[int] = []
+        news_top: list[int] = []
+        for s in qualifying:
+            try:
+                i = int(s.get("index", -1))
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= i < n_cands:
+                continue
+            kind = candidates[i].get("kind")
+            if kind == "longform" and len(longform_top) < 4:
+                longform_top.append(i)
+            elif kind == "news" and len(news_top) < 2:
+                news_top.append(i)
         top_indices = (longform_top + news_top)[:4]
     except Exception:  # noqa: BLE001
         return None
@@ -784,7 +790,10 @@ Candidates:
 
     final: list[dict] = []
     for p in picks[:2]:
-        idx = p.get("index", 0)
+        try:
+            idx = int(p.get("index", 0))
+        except (TypeError, ValueError):
+            continue
         if idx < len(top_candidates):
             final.append(
                 {

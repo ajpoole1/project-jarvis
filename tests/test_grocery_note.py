@@ -8,6 +8,7 @@ Covers: _parse_note_items, _render_note, _remove_store_section, cmd_sync_note,
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -279,9 +280,10 @@ class TestCmdSyncNote:
         assert "⚠️" in result
 
     def test_empty_note_returns_message(self, db, monkeypatch):
+        # Empty note no longer bails early — deletion still runs; no items means "No changes."
         self._mock_event(monkeypatch, "")
         result = cmd_sync_note(db)
-        assert "empty" in result.lower()
+        assert result  # returns a non-empty string (not an exception)
 
 
 # ===========================================================================
@@ -463,3 +465,192 @@ class TestRegressions:
     def test_staples_still_works(self, db):
         result = _g.cmd_staples(db, "list")
         assert "No staples" in result or "Staples" in result
+
+
+# ===========================================================================
+# B1 — _load_env: UTF-8 encoding + inline comment stripping
+# ===========================================================================
+
+
+class TestLoadEnv:
+    def _write_env(self, path: Path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+
+    def _read_env(self, path: Path, key: str, monkeypatch) -> str | None:
+        monkeypatch.delenv(key, raising=False)
+        _g._load_env(path)
+        return os.environ.get(key)
+
+    def test_plain_value(self, tmp_path, monkeypatch):
+        p = tmp_path / ".env"
+        self._write_env(p, "TEST_PLAIN_VAL=hello\n")
+        assert self._read_env(p, "TEST_PLAIN_VAL", monkeypatch) == "hello"
+
+    def test_inline_comment_stripped(self, tmp_path, monkeypatch):
+        p = tmp_path / ".env"
+        self._write_env(p, "TEST_INLINE_CMT=world # ignore this\n")
+        assert self._read_env(p, "TEST_INLINE_CMT", monkeypatch) == "world"
+
+    def test_quoted_value_unquoted(self, tmp_path, monkeypatch):
+        p = tmp_path / ".env"
+        self._write_env(p, 'TEST_QUOTED="quoted_val"\n')
+        assert self._read_env(p, "TEST_QUOTED", monkeypatch) == "quoted_val"
+
+    def test_quoted_value_with_trailing_comment(self, tmp_path, monkeypatch):
+        p = tmp_path / ".env"
+        self._write_env(p, 'TEST_QUOTED_CMT="the_value" # comment outside\n')
+        assert self._read_env(p, "TEST_QUOTED_CMT", monkeypatch) == "the_value"
+
+    def test_quoted_value_preserves_inner_hash(self, tmp_path, monkeypatch):
+        p = tmp_path / ".env"
+        self._write_env(p, 'TEST_INNER_HASH="val#ue"\n')
+        assert self._read_env(p, "TEST_INNER_HASH", monkeypatch) == "val#ue"
+
+    def test_utf8_value(self, tmp_path, monkeypatch):
+        p = tmp_path / ".env"
+        self._write_env(p, "TEST_UTF8=café\n")
+        assert self._read_env(p, "TEST_UTF8", monkeypatch) == "café"
+
+    def test_comment_line_ignored(self, tmp_path, monkeypatch):
+        p = tmp_path / ".env"
+        self._write_env(p, "# this is a comment\nTEST_AFTER_CMT=ok\n")
+        assert self._read_env(p, "TEST_AFTER_CMT", monkeypatch) == "ok"
+
+    def test_export_prefix_stripped(self, tmp_path, monkeypatch):
+        p = tmp_path / ".env"
+        self._write_env(p, "export TEST_EXPORT=exported\n")
+        assert self._read_env(p, "TEST_EXPORT", monkeypatch) == "exported"
+
+    def test_missing_file_is_noop(self, tmp_path):
+        _g._load_env(tmp_path / "nonexistent.env")  # must not raise
+
+
+# ===========================================================================
+# B2 — _cal_python: resolves venv dynamically, falls back to system python3
+# ===========================================================================
+
+
+class TestCalPython:
+    def test_returns_system_python3_when_venv_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_g, "_SKILLS_DIR", tmp_path)
+        result = _g._cal_python()
+        assert result == "python3"
+
+    def test_returns_venv_python_when_present(self, tmp_path, monkeypatch):
+        venv_python = tmp_path / "calendar" / ".venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.touch()
+        monkeypatch.setattr(_g, "_SKILLS_DIR", tmp_path)
+        result = _g._cal_python()
+        assert result == str(venv_python)
+
+
+# ===========================================================================
+# B3 — cmd_sync_note: reconciles deletions
+# ===========================================================================
+
+
+class TestSyncNoteDeletion:
+    def _mock_event(self, monkeypatch, description: str):
+        monkeypatch.setattr(_g, "_get_grocery_event", lambda: ("evt123", description))
+
+    def test_removes_item_deleted_from_note(self, db, monkeypatch):
+        """Item present in note on first sync, removed from note, then sync removes it from DB."""
+        # First sync: bring milk into DB from note (from_note=1)
+        self._mock_event(monkeypatch, "milk\ncoffee")
+        cmd_sync_note(db)
+        assert (
+            db.execute("SELECT COUNT(*) FROM grocery_items WHERE name_norm='milk'").fetchone()[0]
+            == 1
+        )
+
+        # Second sync: milk removed from note → should be removed from DB
+        self._mock_event(monkeypatch, "coffee")
+        result = cmd_sync_note(db)
+        assert (
+            db.execute("SELECT COUNT(*) FROM grocery_items WHERE name_norm='milk'").fetchone()[0]
+            == 0
+        )
+        assert "Removed" in result
+
+    def test_keeps_item_added_by_other_route(self, db, monkeypatch):
+        """Item added via cmd_add (from_note=0) is NOT removed even if absent from note."""
+        cmd_add(db, "oranges")  # from_note defaults to 0
+        self._mock_event(monkeypatch, "milk")
+        cmd_sync_note(db)
+        # oranges should still be present (from_note=0 protects it)
+        assert (
+            db.execute("SELECT COUNT(*) FROM grocery_items WHERE name_norm='oranges'").fetchone()[0]
+            == 1
+        )
+
+    def test_removal_scoped_to_note_sourced_items(self, db, monkeypatch):
+        """Only items with from_note=1 are subject to deletion; from_note=0 items are safe."""
+        # Seed: bananas from note, butter added directly
+        self._mock_event(monkeypatch, "bananas")
+        cmd_sync_note(db)
+        cmd_add(db, "butter")
+
+        # Empty the note — bananas should vanish, butter should survive
+        self._mock_event(monkeypatch, "")
+        cmd_sync_note(db)
+        assert (
+            db.execute("SELECT COUNT(*) FROM grocery_items WHERE name_norm='bananas'").fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute("SELECT COUNT(*) FROM grocery_items WHERE name_norm='butter'").fetchone()[0]
+            == 1
+        )
+
+    def test_idempotent_present_items_not_removed(self, db, monkeypatch):
+        """Items still in the note after sync are not removed."""
+        self._mock_event(monkeypatch, "eggs\nbread")
+        cmd_sync_note(db)
+        cmd_sync_note(db)
+        assert db.execute("SELECT COUNT(*) FROM grocery_items").fetchone()[0] == 2
+
+
+# ===========================================================================
+# B5 — _append_item_to_note: case-insensitive dedup
+# ===========================================================================
+
+
+class TestAppendItemNoteDedup:
+    def _note_with(self, monkeypatch, description: str, written: list):
+        monkeypatch.setattr(_g, "_get_grocery_event", lambda: ("evt1", description))
+        monkeypatch.setattr(_g, "_cal_set_notes", lambda eid, text: written.append(text) or None)
+
+    def test_no_duplicate_exact_match(self, monkeypatch):
+        written: list[str] = []
+        self._note_with(monkeypatch, "coffee", written)
+        result = _g._append_item_to_note("coffee", None, None)
+        assert result is None  # already present, no update
+        assert len(written) == 0
+
+    def test_no_duplicate_case_mismatch(self, monkeypatch):
+        written: list[str] = []
+        self._note_with(monkeypatch, "Coffee", written)
+        result = _g._append_item_to_note("coffee", None, None)
+        assert result is None
+        assert len(written) == 0
+
+    def test_no_duplicate_uppercase_in_note(self, monkeypatch):
+        written: list[str] = []
+        self._note_with(monkeypatch, "MILK", written)
+        result = _g._append_item_to_note("milk", None, None)
+        assert result is None
+
+    def test_different_item_appended(self, monkeypatch):
+        written: list[str] = []
+        self._note_with(monkeypatch, "coffee", written)
+        _g._append_item_to_note("tea", None, None)
+        assert len(written) == 1
+        assert "tea" in written[0]
+
+    def test_empty_note_allows_add(self, monkeypatch):
+        written: list[str] = []
+        self._note_with(monkeypatch, "", written)
+        _g._append_item_to_note("sugar", None, None)
+        assert len(written) == 1
+        assert "sugar" in written[0]

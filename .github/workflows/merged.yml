@@ -76,31 +76,42 @@ jobs:
         if: steps.item.outputs.found == 'true'
         id: archive
         run: |
+          set -euo pipefail
           ITEM_ID="${{ steps.item.outputs.item_id }}"
           QUEUE_PATH="knowledge/dev-notes/queue/$ITEM_ID.md"
           ARCHIVE_PATH="knowledge/dev-notes/archive/$ITEM_ID.md"
 
-          # Read spec from dev-queue
-          if ! SPEC=$(git show "origin/dev-queue:$QUEUE_PATH" 2>/dev/null); then
-            echo "Spec not found at dev-queue:$QUEUE_PATH — may already be archived or was never pushed."
+          # Read spec: prefer dev-queue; fall back to the main merge commit (start-build.sh
+          # copies the spec onto the feature branch, so it lands on main via the PR merge).
+          SPEC=""
+          if SPEC=$(git show "origin/dev-queue:$QUEUE_PATH" 2>/dev/null) && [ -n "$SPEC" ]; then
+            echo "Read spec from origin/dev-queue"
+          elif SPEC=$(git show "HEAD:$QUEUE_PATH" 2>/dev/null) && [ -n "$SPEC" ]; then
+            echo "Spec not on dev-queue — read from main merge commit (HEAD) as fallback"
+          else
+            echo "Spec not found at dev-queue:$QUEUE_PATH or HEAD:$QUEUE_PATH — may already be archived."
             echo "archived=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Flip status: built → merged (also handles authorized in edge cases)
-          UPDATED=$(echo "$SPEC" | python3 -c "
+          # Flip status: built/authorized/building → merged
+          UPDATED=$(printf '%s\n' "$SPEC" | python3 -c "
           import re, sys
           text = sys.stdin.read()
           def replace_status(m):
-              return re.sub(r'^(status:\s*).*$', r'\g<1>merged', m.group(0), flags=re.MULTILINE)
+              return re.sub(r'^(status:\s*).*\$', r'\g<1>merged', m.group(0), flags=re.MULTILINE)
           print(re.sub(r'^---\n.*?^---\n', replace_status, text, count=1, flags=re.DOTALL | re.MULTILINE), end='')
           ")
 
-          # Switch to dev-queue, write changes, commit
-          git checkout dev-queue
+          # Switch to dev-queue — fail loudly if checkout fails so nothing commits to main
+          git checkout dev-queue || {
+            echo "ERROR: could not checkout dev-queue branch — aborting archive."
+            echo "archived=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          }
 
           mkdir -p knowledge/dev-notes/archive
-          echo "$UPDATED" > "$ARCHIVE_PATH"
+          printf '%s\n' "$UPDATED" > "$ARCHIVE_PATH"
           git rm -f "$QUEUE_PATH" 2>/dev/null || true
           git add "$ARCHIVE_PATH"
           git commit -m "merge: archive $ITEM_ID (merged)"
@@ -108,8 +119,8 @@ jobs:
           echo "archived=true" >> "$GITHUB_OUTPUT"
           echo "archive_path=$ARCHIVE_PATH" >> "$GITHUB_OUTPUT"
 
-          # Store advisory notes for backlog seeding
-          echo "$UPDATED" > /tmp/merged-spec.md
+          # Store spec content for backlog seeding
+          printf '%s\n' "$UPDATED" > /tmp/merged-spec.md
 
       - name: Seed backlog stubs from QA advisory notes
         if: steps.item.outputs.found == 'true' && steps.archive.outputs.archived == 'true'
@@ -156,7 +167,7 @@ jobs:
             STUB_BASE="knowledge/dev-notes/backlog/${ITEM_ID}-advisory"
 
             python3 - "$ADVISORY_NOTES" "$STUB_BASE" "$ITEM_ID" "$TODAY" <<'PYEOF'
-          import json, sys, re
+          import json, sys, re, textwrap
           from pathlib import Path
 
           notes_raw, stub_base, item_id, today = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -185,7 +196,8 @@ jobs:
               path = Path(f"{stub_base}-{i:02d}-{slug}.md")
               path.parent.mkdir(parents=True, exist_ok=True)
 
-              content = f"""---
+              content = textwrap.dedent(f"""
+          ---
           id: {path.stem}
           title: "{title}"
           status: proposed
@@ -211,7 +223,7 @@ jobs:
 
           ## Notes
           Source: QA run on {item_id}.
-          """
+          """).lstrip("\n")
               path.write_text(content, encoding='utf-8')
               print(f"Seeded backlog stub: {path}")
           PYEOF
@@ -221,25 +233,32 @@ jobs:
           fi
 
       - name: Reconcile dev-queue onto main
-        if: steps.item.outputs.found == 'true'
+        if: steps.item.outputs.found == 'true' && steps.archive.outputs.archived == 'true'
         run: |
+          set -euo pipefail
           # Merge main into dev-queue so it stays current.
-          # dev-queue holds devnotes only on top of main, so this is always fast-forwardable
-          # after a merge to main (main is an ancestor of dev-queue).
           ITEM_ID="${{ steps.item.outputs.item_id }}"
           QUEUE_PATH="knowledge/dev-notes/queue/$ITEM_ID.md"
 
           git fetch origin main
-          git merge origin/main --no-edit -m "reconcile: merge main into dev-queue after merge" || true
+          # Merge may restore queue/ (start-build.sh copies the spec onto the feature branch,
+          # which lands on main via the PR merge). Conflict on the deleted queue file is
+          # expected and handled below; other conflicts would indicate a problem.
+          git merge origin/main --no-edit -m "reconcile: merge main into dev-queue after merge" || {
+            # Resolve the expected modify/delete conflict on the queue file, then commit.
+            git rm -f "$QUEUE_PATH" 2>/dev/null || true
+            git -c core.editor=true merge --continue || git commit -m "reconcile: merge main into dev-queue after merge (conflict resolved)"
+          }
 
-          # Re-assert queue file removal: start-build.sh copies the spec onto the feature
-          # branch, which lands on main via the PR merge. git merge sees it as "they added a
-          # file" (no conflict) and silently restores queue/ — undo that here.
+          # Re-assert queue file removal in case the merge restored it without conflict.
           if [ -f "$QUEUE_PATH" ]; then
             git rm -f "$QUEUE_PATH"
             git commit -m "cleanup: re-remove $ITEM_ID from queue/ after reconcile"
           fi
 
       - name: Push dev-queue
-        if: steps.item.outputs.found == 'true'
-        run: git push origin dev-queue
+        if: steps.item.outputs.found == 'true' && steps.archive.outputs.archived == 'true'
+        run: |
+          # Pull-rebase before push to handle concurrent workflow runs writing to dev-queue.
+          git pull --rebase origin dev-queue || true
+          git push origin dev-queue

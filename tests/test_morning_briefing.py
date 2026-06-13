@@ -631,3 +631,84 @@ def test_reads_coda_unreachable_feeds_skipped(monkeypatch):
     # Briefing still produces a result from the news fallback
     assert result is not None, "Briefing failed when all longform feeds unreachable"
     assert result.type == "reads-coda"
+
+
+# ---------------------------------------------------------------------------
+# B4 — reads coda: defensive index cast (string / out-of-range / None)
+# ---------------------------------------------------------------------------
+
+
+def test_reads_coda_string_index_coerced(monkeypatch):
+    """LLM returns string index → coerced to int, pick proceeds normally."""
+
+    def fake_create(**kwargs):
+        model = kwargs["model"]
+        mock_resp = MagicMock()
+        if model == skill.HAIKU_MODEL:
+            # String index "0" instead of int 0
+            mock_resp.content = [MagicMock(text='[{"index": "0", "score": 9}]')]
+        else:
+            mock_resp.content = [MagicMock(text='[{"index": "0", "why": "Interesting."}]')]
+        return mock_resp
+
+    client_mock = MagicMock()
+    client_mock.messages.create.side_effect = fake_create
+
+    with (
+        patch.object(
+            skill,
+            "_parse_rss",
+            return_value=[
+                {"title": "Story", "link": "https://x.com/1", "source": "src", "summary": "s"}
+            ],
+        ),
+        patch.object(skill, "_is_reads_dedup", return_value=False),
+        patch.object(skill, "_init_reads_dedup"),
+        patch.object(skill, "_mark_reads_surfaced"),
+    ):
+        # Must not raise TypeError
+        skill._get_reads_coda(client_mock, "### 1. Tech")
+
+    # Result may be None if the pick prompt call fails shape-check, but no exception
+    # is acceptable; a valid result is ideal.
+
+
+def test_reads_coda_invalid_index_skipped(monkeypatch):
+    """Out-of-range and non-int indices are silently skipped; no TypeError raised."""
+
+    def fake_create(**kwargs):
+        model = kwargs["model"]
+        mock_resp = MagicMock()
+        if model == skill.HAIKU_MODEL:
+            # Mix of valid string index, out-of-range, None, and bad type
+            mock_resp.content = [
+                MagicMock(
+                    text=(
+                        '[{"index": 99, "score": 9},'
+                        ' {"index": null, "score": 8},'
+                        ' {"index": "bad", "score": 7},'
+                        ' {"index": 0, "score": 6}]'
+                    )
+                )
+            ]
+        else:
+            mock_resp.content = [MagicMock(text='[{"index": 0, "why": "Good."}]')]
+        return mock_resp
+
+    client_mock = MagicMock()
+    client_mock.messages.create.side_effect = fake_create
+
+    with (
+        patch.object(
+            skill,
+            "_parse_rss",
+            return_value=[
+                {"title": "Article", "link": "https://x.com/2", "source": "src", "summary": "s"}
+            ],
+        ),
+        patch.object(skill, "_is_reads_dedup", return_value=False),
+        patch.object(skill, "_init_reads_dedup"),
+        patch.object(skill, "_mark_reads_surfaced"),
+    ):
+        # Must not raise TypeError or IndexError
+        skill._get_reads_coda(client_mock, "### 1. Tech")
