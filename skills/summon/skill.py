@@ -211,7 +211,12 @@ def capture_rc_url(url_file: Path, timeout: int = 15) -> str | None:
 
 
 def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
-    """Return (pr_url, tom_findings_comment_body). Best-effort; ('', '') on failure."""
+    """Return (pr_url, findings_comment_body). Best-effort; ('', '') on failure.
+
+    Prefers Tom QA comments; falls back to any review-shaped comment (one with
+    a ## markdown heading) when no Tom QA comment exists, so that stand-in
+    findings posted by the operator are picked up by --revise.
+    """
     branch = f"feature/{item_id}"
     try:
         pr = subprocess.run(
@@ -238,9 +243,16 @@ def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
         if comments.returncode != 0:
             return pr_url, ""
         cdata = json.loads(comments.stdout or "{}")
-        for c in reversed(cdata.get("comments", [])):
+        all_comments = cdata.get("comments", [])
+        # Prefer Tom QA comment.
+        for c in reversed(all_comments):
             body = c.get("body", "")
             if "Tom QA" in body:
+                return pr_url, body
+        # Fallback: any review-shaped comment with a ## heading.
+        for c in reversed(all_comments):
+            body = c.get("body", "")
+            if re.search(r"^## ", body, re.MULTILINE):
                 return pr_url, body
         return pr_url, ""
     except Exception:  # noqa: BLE001
@@ -685,6 +697,45 @@ def _branch_progressed(repo_dir: str, item_id: str) -> bool:
         return False
 
 
+# ── watchdog cancellation ────────────────────────────────────────────────────
+
+
+def _cancel_item_watchdogs(item_id: str) -> None:
+    """Disable outstanding stall-watchdog schedules for item_id in the DB.
+
+    Called on dismiss and at the start of summon so that re-summoning an item
+    does not leave stale once@ watchdogs from the previous build attempt armed —
+    they would later fire on the new build's DB row and emit spurious stall alerts.
+    Best-effort: scheduling failures never block the caller.
+    """
+    db_path = _db_path()
+    if not db_path.exists():
+        return
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT id FROM schedules "
+                "WHERE skill='summon' AND enabled=1 "
+                "AND args LIKE '%watchdog-check%' AND args LIKE ?",
+                (f"%{item_id}%",),
+            ).fetchall()
+            for (row_id,) in rows:
+                conn.execute("UPDATE schedules SET enabled = 0 WHERE id = ?", (row_id,))
+            if rows:
+                conn.commit()
+                print(
+                    f"Cancelled {len(rows)} watchdog schedule(s) for {item_id}.",
+                    file=sys.stderr,
+                )
+        except sqlite3.OperationalError:
+            pass  # schedules table not yet created — nothing to cancel
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"watchdog cancel error for {item_id}: {exc}", file=sys.stderr)
+
+
 # ── watchdog arming (reuses the schedules skill's once@ one-shot) ─────────────
 
 
@@ -821,8 +872,31 @@ def cmd_summon(args: list[str]) -> int:
     revise = "--revise" in args
     args = [a for a in args if a != "--revise"]
 
+    # Parse --findings / --findings-file (only meaningful with --revise).
+    explicit_findings: str | None = None
+    filtered: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--findings" and i + 1 < len(args):
+            explicit_findings = args[i + 1]
+            i += 2
+        elif args[i] == "--findings-file" and i + 1 < len(args):
+            try:
+                explicit_findings = Path(args[i + 1]).read_text(encoding="utf-8")
+            except OSError as exc:
+                print(f"Error reading --findings-file {args[i + 1]!r}: {exc}", file=sys.stderr)
+                return 1
+            i += 2
+        else:
+            filtered.append(args[i])
+            i += 1
+    args = filtered
+
     if len(args) < 2:
-        print("Usage: summon <persona> <id> [--revise]", file=sys.stderr)
+        print(
+            "Usage: summon <persona> <id> [--revise] [--findings TEXT | --findings-file PATH]",
+            file=sys.stderr,
+        )
         return 1
 
     persona_id, item_id = args[0], args[1]
@@ -937,8 +1011,11 @@ def cmd_summon(args: list[str]) -> int:
     # as a POSITIONAL prompt — the interactive RC session auto-submits it on startup.
     # No tmux send-keys: every argument is shell-quoted into one sh -c string.
     if revise:
-        pr_url, tom_findings = _fetch_pr_info(repo_dir, item_id)
-        kickoff = build_revise_kickoff(persona["name"], item_id, pr_url, tom_findings)
+        if explicit_findings is not None:
+            kickoff = build_revise_kickoff(persona["name"], item_id, "", explicit_findings)
+        else:
+            pr_url, tom_findings = _fetch_pr_info(repo_dir, item_id)
+            kickoff = build_revise_kickoff(persona["name"], item_id, pr_url, tom_findings)
     else:
         kickoff = build_kickoff(persona["name"], item_id)
 
@@ -971,6 +1048,7 @@ def cmd_summon(args: list[str]) -> int:
         return 1
 
     _record_summon(item_id, persona_id, str(wt), datetime.now(UTC))
+    _cancel_item_watchdogs(item_id)
     _arm_watchdog(item_id)
     _arm_verdict_sweep_if_needed()
 
@@ -1185,15 +1263,16 @@ def cmd_dismiss(args: list[str]) -> int:
         kill_session(sname)
         killed = True
 
-    # Remove worktrees recorded for this persona, then forget the runs.
+    # Cancel outstanding watchdog schedules and remove worktrees, then forget the runs.
     persona = load_roster().get(persona_id, {})
     repo_dir = persona.get("repo_dir", str(PROJECT))
     conn = _db()
     try:
         rows = conn.execute(
-            "SELECT worktree FROM dev_crew_runs WHERE persona = ?", (persona_id,)
+            "SELECT item, worktree FROM dev_crew_runs WHERE persona = ?", (persona_id,)
         ).fetchall()
-        for (wt,) in rows:
+        for item, wt in rows:
+            _cancel_item_watchdogs(item)
             if wt:
                 subprocess.run(
                     ["git", "-C", repo_dir, "worktree", "remove", "--force", wt],

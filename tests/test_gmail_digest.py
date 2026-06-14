@@ -71,19 +71,24 @@ def _read_queue(con):
 
 
 def test_cmd_digest_empty_queue_returns_confirmation():
-    with patch.object(skill, "init_db", return_value=_make_db()):
+    con = _make_db()
+    _seed_queue(con, [])
+    with patch.object(skill, "init_db", return_value=con):
         result = skill.cmd_digest()
     assert result == "📭 Gmail: inbox clean — nothing to action."
 
 
 def test_cmd_digest_empty_queue_single_line():
-    with patch.object(skill, "init_db", return_value=_make_db()):
+    con = _make_db()
+    _seed_queue(con, [])
+    with patch.object(skill, "init_db", return_value=con):
         result = skill.cmd_digest()
     assert "\n" not in result, "empty digest must be exactly one line"
 
 
 def test_cmd_digest_empty_queue_does_not_write_db():
     con = _make_db()
+    _seed_queue(con, [])
     written = []
 
     original = skill.set_heartbeat_state

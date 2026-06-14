@@ -174,7 +174,13 @@ def _increment_budget(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _mark_surfaced(conn: sqlite3.Connection, row_id: int, policy: str, cadence: int | None) -> None:
+def _mark_surfaced(
+    conn: sqlite3.Connection,
+    row_id: int,
+    policy: str,
+    cadence: int | None,
+    trigger_at_iso: str | None = None,
+) -> None:
     now_iso = _now_utc().isoformat()
     if policy == "check_once":
         conn.execute(
@@ -184,9 +190,23 @@ def _mark_surfaced(conn: sqlite3.Connection, row_id: int, policy: str, cadence: 
             (now_iso, row_id),
         )
     else:
-        # periodic / persistent: re-arm at trigger_at = now + cadence
+        # periodic / persistent: re-arm anchored to the intended cadence, not now+cadence.
+        # This prevents drift when a fire is late: a weekly Monday intention that fires
+        # Tuesday re-arms to next Monday, not next Tuesday.
         cadence_days = cadence or (7 if policy == "periodic" else 3)
-        next_trigger = (_now_utc() + timedelta(days=cadence_days)).isoformat()
+        if trigger_at_iso:
+            try:
+                anchor = datetime.fromisoformat(trigger_at_iso)
+                if anchor.tzinfo is None:
+                    anchor = anchor.replace(tzinfo=UTC)
+                next_trigger_dt = anchor
+                while next_trigger_dt <= _now_utc():
+                    next_trigger_dt += timedelta(days=cadence_days)
+                next_trigger = next_trigger_dt.isoformat()
+            except ValueError:
+                next_trigger = (_now_utc() + timedelta(days=cadence_days)).isoformat()
+        else:
+            next_trigger = (_now_utc() + timedelta(days=cadence_days)).isoformat()
         conn.execute(
             """UPDATE follow_ups
                SET surface_count = surface_count + 1, last_surfaced_at = ?,
@@ -202,7 +222,7 @@ def _mark_surfaced(conn: sqlite3.Connection, row_id: int, policy: str, cadence: 
 # ---------------------------------------------------------------------------
 
 _ELIGIBLE_SQL = """
-    SELECT id, subject, prompt, policy, window_until, priority, surface_count, cadence
+    SELECT id, subject, prompt, policy, window_until, priority, surface_count, cadence, trigger_at
     FROM follow_ups
     WHERE status = 'pending'
       AND policy != 'passive'
@@ -420,13 +440,13 @@ def cmd_surface(args: list[str]) -> None:
     conn = _init_db()
     try:
         row = conn.execute(
-            "SELECT policy, cadence FROM follow_ups WHERE id = ? AND status = 'pending'",
+            "SELECT policy, cadence, trigger_at FROM follow_ups WHERE id = ? AND status = 'pending'",
             (row_id,),
         ).fetchone()
         if not row:
             print(f"No pending follow-up with id={row_id}", file=sys.stderr)
             sys.exit(1)
-        _mark_surfaced(conn, row_id, row[0], row[1])
+        _mark_surfaced(conn, row_id, row[0], row[1], row[2])
         print(json.dumps({"id": row_id, "status": "surfaced"}))
     finally:
         conn.close()
@@ -593,9 +613,9 @@ def cmd_fire(args: list[str]) -> None:
         if not rows:
             return
 
-        row_id, subject, prompt_text, policy, _, _, _, cadence = rows[0]
+        row_id, subject, prompt_text, policy, _, _, _, cadence, trigger_at_iso = rows[0]
 
-        _mark_surfaced(conn, row_id, policy, cadence)
+        _mark_surfaced(conn, row_id, policy, cadence, trigger_at_iso)
         _increment_budget(conn)
 
         print(prompt_text)
