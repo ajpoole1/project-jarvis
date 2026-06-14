@@ -168,6 +168,150 @@ def test_watchdog_check_silent_when_no_record(tmp_db, capsys):
 
 
 # ---------------------------------------------------------------------------
+# A — #50: _cancel_item_watchdogs disables matching schedules
+# ---------------------------------------------------------------------------
+
+
+def _seed_watchdog_schedules(tmp_path: object, item_id: str, count: int = 3) -> list[int]:
+    """Insert fake watchdog schedule rows for item_id; return their IDs."""
+    import sqlite3 as _sqlite3
+
+    db = _mod._db_path()
+    conn = _sqlite3.connect(str(db))
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT '',
+                skill TEXT NOT NULL,
+                args TEXT NOT NULL DEFAULT '[]',
+                schedule TEXT NOT NULL DEFAULT '',
+                next_run TEXT NOT NULL DEFAULT '',
+                last_run TEXT,
+                last_status TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                approved INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL DEFAULT 'summon',
+                description TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        ids = []
+        for minutes in [5, 15, 30][:count]:
+            import json as _json
+
+            cur = conn.execute(
+                "INSERT INTO schedules (skill, args, schedule, next_run, enabled, approved, description) "
+                "VALUES (?, ?, ?, ?, 1, 1, ?)",
+                (
+                    "summon",
+                    _json.dumps(["watchdog-check", item_id, str(minutes)]),
+                    "once@2026-06-13T12:00",
+                    "2026-06-13T12:00:00+00:00",
+                    f"dev-crew stall watchdog for {item_id} (+{minutes}m)",
+                ),
+            )
+            ids.append(cur.lastrowid)
+        conn.commit()
+        return ids
+    finally:
+        conn.close()
+
+
+def _schedule_enabled(tmp_path: object, row_id: int) -> bool:
+    import sqlite3 as _sqlite3
+
+    conn = _sqlite3.connect(str(_mod._db_path()))
+    try:
+        row = conn.execute("SELECT enabled FROM schedules WHERE id = ?", (row_id,)).fetchone()
+        return bool(row[0]) if row else False
+    finally:
+        conn.close()
+
+
+def test_cancel_item_watchdogs_disables_matching_rows(tmp_db):
+    item = "2026-0050-cancel"
+    ids = _seed_watchdog_schedules(tmp_db, item)
+    assert all(_schedule_enabled(tmp_db, i) for i in ids)
+
+    _mod._cancel_item_watchdogs(item)
+
+    assert all(not _schedule_enabled(tmp_db, i) for i in ids)
+
+
+def test_cancel_item_watchdogs_does_not_affect_other_items(tmp_db):
+    item_a = "2026-0050-cancel-a"
+    item_b = "2026-0050-cancel-b"
+    ids_a = _seed_watchdog_schedules(tmp_db, item_a, count=1)
+    ids_b = _seed_watchdog_schedules(tmp_db, item_b, count=1)
+
+    _mod._cancel_item_watchdogs(item_a)
+
+    assert not _schedule_enabled(tmp_db, ids_a[0])
+    assert _schedule_enabled(tmp_db, ids_b[0])
+
+
+def test_cancel_item_watchdogs_noop_when_no_schedules_table(tmp_db):
+    """No crash when schedules table does not yet exist."""
+    _mod._cancel_item_watchdogs("2026-0050-no-table")
+    # Success = no exception raised
+
+
+# ---------------------------------------------------------------------------
+# B — #51: --revise with explicit findings bypasses _fetch_pr_info
+# ---------------------------------------------------------------------------
+
+
+def test_revise_kickoff_with_explicit_findings_contains_findings():
+    """build_revise_kickoff with explicit text embeds the findings."""
+    kickoff = _mod.build_revise_kickoff(
+        "Herr Mannkusser",
+        "2026-0051-revise",
+        "",
+        "AC1 failed: missing guard in skill.py:42",
+    )
+    assert "AC1 failed" in kickoff
+    assert "(Tom findings unavailable" not in kickoff
+
+
+def test_revise_kickoff_with_empty_findings_uses_placeholder():
+    """build_revise_kickoff with no findings uses the unavailable placeholder."""
+    kickoff = _mod.build_revise_kickoff(
+        "Herr Mannkusser",
+        "2026-0051-revise",
+        "",
+        "",
+    )
+    assert "unavailable" in kickoff
+
+
+def test_fetch_pr_info_falls_back_to_review_shaped_comment(monkeypatch):
+    """_fetch_pr_info falls back to a ## -headed comment when no Tom QA exists."""
+    import json as _json
+    import subprocess as _subprocess
+
+    review_body = "## Findings\n\nFix the null guard.\n## Notes\n\nSee line 42."
+
+    fake_prs = _json.dumps([{"number": 7, "url": "https://github.com/x/y/pull/7"}])
+    fake_comments = _json.dumps(
+        {"comments": [{"body": "Some unrelated comment."}, {"body": review_body}]}
+    )
+
+    def _fake_run(cmd, **kwargs):
+        if "pr" in cmd and "list" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_prs)
+        if "pr" in cmd and "view" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_comments)
+        return _subprocess.CompletedProcess(cmd, 0, stdout="")
+
+    monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
+
+    pr_url, body = _mod._fetch_pr_info("/fake/repo", "2026-0051-test")
+    assert pr_url == "https://github.com/x/y/pull/7"
+    assert "Findings" in body
+    assert "Fix the null guard" in body
+
+
+# ---------------------------------------------------------------------------
 # cmd_summon — preflight (spec absent on origin/dev-queue)
 # ---------------------------------------------------------------------------
 

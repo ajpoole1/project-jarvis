@@ -232,6 +232,25 @@ jobs:
             git commit -m "backlog: seed advisory stubs from $ITEM_ID QA" || true
           fi
 
+      - name: Remove spec from main queue
+        if: steps.item.outputs.found == 'true' && steps.archive.outputs.archived == 'true'
+        run: |
+          set -euo pipefail
+          ITEM_ID="${{ steps.item.outputs.item_id }}"
+          QUEUE_PATH="knowledge/dev-notes/queue/$ITEM_ID.md"
+
+          # start-build.sh copies the spec onto the feature branch; the PR merge
+          # carries it into main's queue/.  Remove it here so main stays clean and
+          # fresh build worktrees (off main) never inherit stale merged specs.
+          git checkout main
+          git pull origin main --ff-only
+
+          if [ -f "$QUEUE_PATH" ]; then
+            git rm -f "$QUEUE_PATH"
+            git commit -m "cleanup: remove $ITEM_ID from main queue/ (post-merge)"
+            git push origin main
+          fi
+
       - name: Reconcile dev-queue onto main
         if: steps.item.outputs.found == 'true' && steps.archive.outputs.archived == 'true'
         run: |
