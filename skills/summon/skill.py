@@ -1137,14 +1137,21 @@ def cmd_watchdog_check(args: list[str]) -> int:
     repo_dir = persona.get("repo_dir", str(PROJECT))
     progressed = _branch_progressed(repo_dir, item_id)
 
-    # ── PR milestone ping (fires once when PR is opened) ──────────────────────
-    if progressed and pr_pinged_at is None:
-        name = persona.get("name", persona_id)
-        print(f"🚀 PR opened for `{item_id}` — QA (Tom) running. Builder: {name}")
-        _set_pr_pinged(item_id, datetime.now(UTC))
-        return 0
+    # ── No-op when PR exists (open or merged) ────────────────────────────────
+    # Spec A: stale watchdogs from a previous summon cycle must never post stall
+    # alerts once a PR is open/merged.  Belt-and-suspenders: _cancel_item_watchdogs
+    # is called on every summon/dismiss, but a watchdog already picked up by the
+    # dispatcher before cancellation can still fire.  An explicit guard here is the
+    # correct place to kill it — the DB state and _branch_progressed result are both
+    # checked so neither gh failure nor a deleted remote branch causes a miss.
+    if progressed:
+        if pr_pinged_at is None:
+            name = persona.get("name", persona_id)
+            print(f"🚀 PR opened for `{item_id}` — QA (Tom) running. Builder: {name}")
+            _set_pr_pinged(item_id, datetime.now(UTC))
+        return 0  # no stall alert when PR exists
 
-    # ── escalating stall alert ────────────────────────────────────────────────
+    # ── escalating stall alert (no PR, no question, no progress) ────────────
     # SIGNAL:high prefix tells the dispatcher to @mention AJ on these posts.
     if is_stalled({"question_at": question_at}, progressed):
         name = persona.get("name", persona_id)
