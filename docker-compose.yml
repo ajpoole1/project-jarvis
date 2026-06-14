@@ -1,23 +1,8 @@
 services:
-  openclaw:
-    build: ./openclaw
-    restart: unless-stopped
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      - OPENCLAW_STATE_DIR=/openclaw-state
-      - OPENCLAW_CONFIG_PATH=/config/openclaw/openclaw.json
-      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
-    volumes:
-      - ./data:/data
-      - ./logs:/logs
-      - ./skills:/skills
-      - ./config:/config
-      - openclaw_state:/openclaw-state
-    ports:
-      - "18789:18789"
-
+  # NOTE: the `openclaw` gateway service was REMOVED 2026-06-11 — it's a zombie here.
+  # Jarvis's real gateway runs host-side as the systemd --user unit `openclaw-gateway.service`
+  # (Discord + agent, off Docker). The container only restart-looped (same bot token → couldn't
+  # connect). Backup: docker-compose.yml.bak-pre-zombie-2026-06-11. See workspace/gateway-off-docker-runbook.md.
   go2rtc:
     image: alexxit/go2rtc
     container_name: go2rtc
