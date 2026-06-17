@@ -80,6 +80,9 @@ Thumbs.db
 desktop.ini
 
 
+# Frigate POC (throwaway, contains real RTSP creds)
+frigate-poc/
+
 # Secrets / credentials
 *.pem
 *.key

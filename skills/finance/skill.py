@@ -12,11 +12,13 @@ Commands (P1):
   recurring
   bills-due [--days N]
   tag <txn_id> <personal|altaforma> [--category CAT]
+  scrape --bank <rbc|td> [--days 30] [--first-auth] [--dry-run]
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
 from datetime import UTC, date, datetime, timedelta
@@ -42,6 +44,7 @@ from skills.finance.db import (  # noqa: E402
     upsert_account,
     upsert_transaction,
 )
+from skills.finance.scraper_errors import ScraperError, SessionExpiredError  # noqa: E402
 from skills.finance.wealthica import get_institutions, get_token  # noqa: E402
 from skills.finance.wealthica import get_transactions as wealthica_get_transactions  # noqa: E402
 
@@ -588,6 +591,82 @@ def cmd_tag(conn, txn_id: str, owner: str, category: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Command: scrape
+# ---------------------------------------------------------------------------
+
+
+def cmd_scrape(
+    conn,
+    bank: str,
+    days: int = 30,
+    first_auth: bool = False,
+    dry_run: bool = False,
+) -> str:
+    if bank == "rbc":
+        from skills.finance import scraper_rbc  # lazy import — playwright optional
+
+        async def _run():
+            return await scraper_rbc.fetch_transactions(days=days, force_headful=first_auth)
+
+        try:
+            txns = asyncio.run(_run())
+        except SessionExpiredError as exc:
+            return str(exc)
+        except ScraperError as exc:
+            return f"Scrape failed: {exc}"
+    elif bank == "td":
+        from skills.finance import scraper_td
+
+        async def _run_td():
+            return await scraper_td.fetch_transactions(days=days)
+
+        try:
+            asyncio.run(_run_td())
+        except NotImplementedError as exc:
+            return str(exc)
+        return "TD scraper not yet implemented."
+    else:
+        return f"Unknown bank: {bank}. Supported: rbc, td"
+
+    if dry_run:
+        lines = [f"[dry-run] {len(txns)} transactions from {bank.upper()}:"]
+        for t in txns[:20]:
+            lines.append(
+                f"  {t['date']}  {_fmt_amount(t['amount'])}  {t['description']}  [{t['account']}]"
+            )
+        if len(txns) > 20:
+            lines.append(f"  … {len(txns) - 20} more")
+        return "\n".join(lines)
+
+    inserted = skipped = 0
+    for txn in txns:
+        row = {
+            "id": txn["id"],
+            "account_id": txn.get("account_id", f"{bank}-unknown"),
+            "date": txn["date"],
+            "amount": txn["amount"],
+            "description": txn["description"],
+            "category": txn.get("category"),
+            "currency": txn.get("currency", "CAD"),
+            "owner": "personal",
+            "is_pending": txn.get("is_pending", 0),
+            "source": txn.get("source", f"scraper_{bank}"),
+            "note": None,
+        }
+        if upsert_transaction(conn, row):
+            inserted += 1
+        else:
+            skipped += 1
+
+    next_bank = "td" if bank == "rbc" else ""
+    next_hint = f"  Next: finance scrape --bank {next_bank}" if next_bank else ""
+    return (
+        f"Scraped {len(txns)} transactions from {bank.upper()} "
+        f"({inserted} new, {skipped} already in DB).{next_hint}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -639,6 +718,12 @@ def main() -> None:
     p_tag.add_argument("owner", choices=["personal", "altaforma"])
     p_tag.add_argument("--category", default=None, metavar="CAT")
 
+    p_scrape = sub.add_parser("scrape", help="Scrape transactions from bank via Playwright")
+    p_scrape.add_argument("--bank", required=True, choices=["rbc", "td"], help="Bank to scrape")
+    p_scrape.add_argument("--days", type=int, default=30, metavar="N", help="Days of history")
+    p_scrape.add_argument("--first-auth", action="store_true", help="Force headful login + MFA")
+    p_scrape.add_argument("--dry-run", action="store_true", help="Print instead of importing")
+
     args = parser.parse_args()
     conn = init_db(str(DB_PATH))
 
@@ -685,6 +770,17 @@ def main() -> None:
 
         elif args.cmd == "tag":
             print(cmd_tag(conn, args.txn_id, args.owner, args.category))
+
+        elif args.cmd == "scrape":
+            print(
+                cmd_scrape(
+                    conn,
+                    bank=args.bank,
+                    days=args.days,
+                    first_auth=args.first_auth,
+                    dry_run=args.dry_run,
+                )
+            )
 
     finally:
         conn.close()
