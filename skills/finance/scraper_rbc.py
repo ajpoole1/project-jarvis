@@ -157,9 +157,10 @@ async def fetch_transactions(days: int = 30, force_headful: bool = False) -> lis
                 "RBC session expired — run: finance scrape --bank rbc --first-auth"
             )
 
-        # Wait for intercept to fire or timeout
+        # Wait for intercept to fire or timeout, then settle for concurrent account requests
         try:
             await asyncio.wait_for(intercept_event.wait(), timeout=_RESPONSE_WAIT_S)
+            await asyncio.sleep(3.0)
         except TimeoutError:
             pass
 
@@ -250,9 +251,13 @@ async def _csv_export_fallback(page, days: int) -> list[dict]:
             def _parse_amount(val: str | None) -> float:
                 return float((val or "0").replace(",", "").replace("$", "").strip() or "0")
 
-            debit = _parse_amount(row.get("Debit"))
-            credit = _parse_amount(row.get("Credit"))
-            amount = credit - debit  # credit=positive, debit=negative
+            amount_col = row.get("Amount")
+            if amount_col is not None:
+                amount = _parse_amount(amount_col)
+            else:
+                debit = _parse_amount(row.get("Debit"))
+                credit = _parse_amount(row.get("Credit"))
+                amount = credit - debit  # credit=positive, debit=negative
 
             account = (row.get("Account Number") or row.get("Account") or "rbc-csv").strip()
 
