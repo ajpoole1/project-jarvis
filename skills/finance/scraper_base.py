@@ -11,14 +11,13 @@ imported (and tested) in environments where playwright is not installed.
 from __future__ import annotations
 
 import asyncio
-import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from playwright.async_api import BrowserContext, Page
 
-_PROFILES_DIR = Path("/data/browser-profiles")
+_PROFILES_DIR = Path.home() / ".jarvis" / "browser-profiles"
 
 
 def _state_path(bank: str) -> Path:
@@ -50,7 +49,8 @@ async def ensure_session(bank: str, force_headful: bool = False) -> tuple[object
                 f"[finance scraper] Please log in to {bank} and complete MFA, "
                 "then press ENTER here."
             )
-            await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
+            with open("/dev/tty") as tty:
+                await asyncio.get_event_loop().run_in_executor(None, tty.readline)
             await save_session(bank, context)
             return pw, context
         else:

@@ -246,8 +246,12 @@ async def _csv_export_fallback(page, days: int) -> list[dict]:
                 continue
 
             description = (row.get("Description") or row.get("Memo") or "").strip()
-            debit = float((row.get("Debit") or "0").replace(",", "") or "0")
-            credit = float((row.get("Credit") or "0").replace(",", "") or "0")
+
+            def _parse_amount(val: str | None) -> float:
+                return float((val or "0").replace(",", "").replace("$", "").strip() or "0")
+
+            debit = _parse_amount(row.get("Debit"))
+            credit = _parse_amount(row.get("Credit"))
             amount = credit - debit  # credit=positive, debit=negative
 
             account = (row.get("Account Number") or row.get("Account") or "rbc-csv").strip()
