@@ -1,2 +1,4 @@
-# stdlib only — no third-party dependencies
-# urllib.request is used for Wealthica API calls (no requests needed)
+# Wealthica API calls use urllib.request (stdlib)
+# Playwright is required for the scraper subcommand only
+# Install: pip install playwright && playwright install chromium
+playwright>=1.44
