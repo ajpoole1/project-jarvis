@@ -119,14 +119,14 @@ def _extract_transactions_from_payload(payload: dict | list, days: int) -> list[
     return results
 
 
-async def fetch_transactions(days: int = 30) -> list[dict]:
+async def fetch_transactions(days: int = 30, force_headful: bool = False) -> list[dict]:
     """Fetch RBC transactions for the last `days` days.
 
     Returns list of dicts compatible with finance.db upsert_transaction schema.
     Raises SessionExpiredError if auth has lapsed.
     Raises ScraperError on unrecoverable failure.
     """
-    pw, context = await ensure_session("rbc")
+    pw, context = await ensure_session("rbc", force_headful=force_headful)
 
     try:
         page = await context.new_page()

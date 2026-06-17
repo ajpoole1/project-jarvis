@@ -10,6 +10,7 @@ imported (and tested) in environments where playwright is not installed.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,24 +38,28 @@ async def ensure_session(bank: str, force_headful: bool = False) -> tuple[object
     state_file = _state_path(bank)
 
     pw = await async_playwright().start()
-
-    if not state_file.exists() or force_headful:
-        print(
-            f"[finance scraper] No saved session for {bank}. "
-            "Opening browser for first-time login + MFA."
-        )
-        browser = await pw.chromium.launch(headless=False)
-        context = await browser.new_context()
-        print(
-            f"[finance scraper] Please log in to {bank} and complete MFA, " "then press ENTER here."
-        )
-        sys.stdin.readline()
-        await save_session(bank, context)
-        return pw, context
-    else:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(storage_state=str(state_file))
-        return pw, context
+    try:
+        if not state_file.exists() or force_headful:
+            print(
+                f"[finance scraper] No saved session for {bank}. "
+                "Opening browser for first-time login + MFA."
+            )
+            browser = await pw.chromium.launch(headless=False)
+            context = await browser.new_context()
+            print(
+                f"[finance scraper] Please log in to {bank} and complete MFA, "
+                "then press ENTER here."
+            )
+            await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
+            await save_session(bank, context)
+            return pw, context
+        else:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(storage_state=str(state_file))
+            return pw, context
+    except Exception:
+        await pw.stop()
+        raise
 
 
 async def save_session(bank: str, context: BrowserContext) -> None:

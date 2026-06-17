@@ -606,7 +606,7 @@ def cmd_scrape(
         from skills.finance import scraper_rbc  # lazy import — playwright optional
 
         async def _run():
-            return await scraper_rbc.fetch_transactions(days=days)
+            return await scraper_rbc.fetch_transactions(days=days, force_headful=first_auth)
 
         try:
             txns = asyncio.run(_run())
