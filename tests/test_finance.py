@@ -103,8 +103,7 @@ def _sample_txn(overrides: dict | None = None) -> dict:
 
 def test_init_db_creates_tables(db):
     tables = {
-        r[0]
-        for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
     assert {"accounts", "transactions", "recurring", "rules", "sync_state", "goals"} <= tables
 
@@ -180,19 +179,22 @@ def _insert_recurring_series(db, merchant: str, amounts: list[float], days_apart
     base = date(2026, 3, 1)
     for i, amount in enumerate(amounts):
         d = (base + timedelta(days=i * days_apart)).isoformat()
-        upsert_transaction(db, {
-            "id": f"rec-{merchant}-{i}",
-            "account_id": "acct-001",
-            "date": d,
-            "amount": -amount,
-            "description": merchant,
-            "category": "Entertainment",
-            "currency": "CAD",
-            "owner": "personal",
-            "is_pending": 0,
-            "source": "wealthica",
-            "note": None,
-        })
+        upsert_transaction(
+            db,
+            {
+                "id": f"rec-{merchant}-{i}",
+                "account_id": "acct-001",
+                "date": d,
+                "amount": -amount,
+                "description": merchant,
+                "category": "Entertainment",
+                "currency": "CAD",
+                "owner": "personal",
+                "is_pending": 0,
+                "source": "wealthica",
+                "note": None,
+            },
+        )
 
 
 def test_detect_recurring_monthly(db):
@@ -215,8 +217,12 @@ def test_detect_recurring_weekly(db):
 
 def test_detect_recurring_skips_irregular(db):
     """Transactions with no consistent interval should not appear."""
-    upsert_transaction(db, _sample_txn({"id": "ir1", "date": "2026-03-01", "description": "RANDOM VENDOR"}))
-    upsert_transaction(db, _sample_txn({"id": "ir2", "date": "2026-04-20", "description": "RANDOM VENDOR"}))
+    upsert_transaction(
+        db, _sample_txn({"id": "ir1", "date": "2026-03-01", "description": "RANDOM VENDOR"})
+    )
+    upsert_transaction(
+        db, _sample_txn({"id": "ir2", "date": "2026-04-20", "description": "RANDOM VENDOR"})
+    )
     detect_recurring(db)
     rows = [r for r in get_recurring(db) if "RANDOM" in (r["merchant_norm"] or "")]
     assert len(rows) == 0
@@ -313,20 +319,38 @@ def test_csv_dedup_key_is_stable(mbna_csv):
 
 
 def _seed_accounts(db, chequing: float = 2840.00, cc: float = 1240.00) -> None:
-    upsert_account(db, _sample_account({"id": "acct-chequing", "type": "bank", "balance_current": chequing}))
-    upsert_account(db, {"id": "acct-cc", "institution": "TD", "name": "TD Visa",
-                        "type": "credit", "currency": "CAD", "balance_current": cc,
-                        "owner": "personal", "source": "wealthica", "last_synced": None})
+    upsert_account(
+        db, _sample_account({"id": "acct-chequing", "type": "bank", "balance_current": chequing})
+    )
+    upsert_account(
+        db,
+        {
+            "id": "acct-cc",
+            "institution": "TD",
+            "name": "TD Visa",
+            "type": "credit",
+            "currency": "CAD",
+            "balance_current": cc,
+            "owner": "personal",
+            "source": "wealthica",
+            "last_synced": None,
+        },
+    )
 
 
 def test_alert_large_unusual_new_merchant(db):
     _seed_accounts(db)
-    upsert_transaction(db, _sample_txn({
-        "id": "t-big-001",
-        "amount": -340.00,
-        "description": "BEST BUY CANADA",
-        "category": "Electronics",
-    }))
+    upsert_transaction(
+        db,
+        _sample_txn(
+            {
+                "id": "t-big-001",
+                "amount": -340.00,
+                "description": "BEST BUY CANADA",
+                "category": "Electronics",
+            }
+        ),
+    )
     alerts = _check_large_unusual(db, ["t-big-001"])
     assert len(alerts) == 1
     assert alerts[0]["type"] == "large_unusual_charge"
@@ -335,11 +359,16 @@ def test_alert_large_unusual_new_merchant(db):
 
 def test_alert_large_unusual_below_threshold_no_alert(db):
     _seed_accounts(db)
-    upsert_transaction(db, _sample_txn({
-        "id": "t-small-001",
-        "amount": -150.00,
-        "description": "SOME VENDOR",
-    }))
+    upsert_transaction(
+        db,
+        _sample_txn(
+            {
+                "id": "t-small-001",
+                "amount": -150.00,
+                "description": "SOME VENDOR",
+            }
+        ),
+    )
     alerts = _check_large_unusual(db, ["t-small-001"])
     assert len(alerts) == 0
 
@@ -349,19 +378,29 @@ def test_alert_large_unusual_known_merchant_no_alert(db):
     _seed_accounts(db)
     # Seed 5 prior Metro transactions so it's a known merchant
     for i in range(5):
-        upsert_transaction(db, _sample_txn({
-            "id": f"metro-prior-{i}",
-            "amount": -145.00,
-            "description": "METRO GROCERIES",
-            "category": "Groceries",
-        }))
+        upsert_transaction(
+            db,
+            _sample_txn(
+                {
+                    "id": f"metro-prior-{i}",
+                    "amount": -145.00,
+                    "description": "METRO GROCERIES",
+                    "category": "Groceries",
+                }
+            ),
+        )
     # New Metro txn within normal range
-    upsert_transaction(db, _sample_txn({
-        "id": "metro-new",
-        "amount": -155.00,
-        "description": "METRO GROCERIES",
-        "category": "Groceries",
-    }))
+    upsert_transaction(
+        db,
+        _sample_txn(
+            {
+                "id": "metro-new",
+                "amount": -155.00,
+                "description": "METRO GROCERIES",
+                "category": "Groceries",
+            }
+        ),
+    )
     alerts = _check_large_unusual(db, ["metro-new"])
     assert len(alerts) == 0
 
@@ -400,8 +439,18 @@ def test_alert_bill_shortfall_no_alert_when_covered(db):
 
 def test_alert_duplicate_charge(db):
     today = date.today().isoformat()
-    upsert_transaction(db, _sample_txn({"id": "dup-001", "date": today, "amount": -49.99, "description": "SOME SERVICE"}))
-    upsert_transaction(db, _sample_txn({"id": "dup-002", "date": today, "amount": -49.99, "description": "SOME SERVICE"}))
+    upsert_transaction(
+        db,
+        _sample_txn(
+            {"id": "dup-001", "date": today, "amount": -49.99, "description": "SOME SERVICE"}
+        ),
+    )
+    upsert_transaction(
+        db,
+        _sample_txn(
+            {"id": "dup-002", "date": today, "amount": -49.99, "description": "SOME SERVICE"}
+        ),
+    )
     alerts = _check_duplicate_charges(db, ["dup-002"])
     assert len(alerts) == 1
     assert alerts[0]["type"] == "duplicate_charge"
@@ -410,8 +459,12 @@ def test_alert_duplicate_charge(db):
 
 def test_alert_duplicate_no_false_positive_different_amounts(db):
     today = date.today().isoformat()
-    upsert_transaction(db, _sample_txn({"id": "a1", "date": today, "amount": -49.99, "description": "VENDOR X"}))
-    upsert_transaction(db, _sample_txn({"id": "a2", "date": today, "amount": -99.99, "description": "VENDOR X"}))
+    upsert_transaction(
+        db, _sample_txn({"id": "a1", "date": today, "amount": -49.99, "description": "VENDOR X"})
+    )
+    upsert_transaction(
+        db, _sample_txn({"id": "a2", "date": today, "amount": -99.99, "description": "VENDOR X"})
+    )
     alerts = _check_duplicate_charges(db, ["a2"])
     assert len(alerts) == 0
 
@@ -435,14 +488,28 @@ def test_finance_brief_with_data(tmp_path, monkeypatch):
     conn = init_db(str(db_file))
 
     upsert_account(conn, _sample_account({"balance_current": 3000.00}))
-    upsert_account(conn, {"id": "acct-cc", "institution": "TD", "name": "TD Visa",
-                          "type": "credit", "currency": "CAD", "balance_current": 500.00,
-                          "owner": "personal", "source": "wealthica", "last_synced": None})
+    upsert_account(
+        conn,
+        {
+            "id": "acct-cc",
+            "institution": "TD",
+            "name": "TD Visa",
+            "type": "credit",
+            "currency": "CAD",
+            "balance_current": 500.00,
+            "owner": "personal",
+            "source": "wealthica",
+            "last_synced": None,
+        },
+    )
 
     today = date.today().isoformat()
-    upsert_transaction(conn, _sample_txn({"date": today, "amount": -120.00, "category": "Groceries"}))
+    upsert_transaction(
+        conn, _sample_txn({"date": today, "amount": -120.00, "category": "Groceries"})
+    )
 
     from datetime import UTC, datetime
+
     now = datetime.now(UTC).isoformat()
     conn.execute(
         "INSERT OR REPLACE INTO sync_state (key, value, updated) VALUES ('last_sync', ?, ?)",
@@ -469,6 +536,7 @@ def test_finance_brief_with_data(tmp_path, monkeypatch):
 def _load_skill():
     """Load skill.py functions for testing without running main()."""
     import importlib.util
+
     spec = importlib.util.spec_from_file_location("finance_skill", _FINANCE_DIR / "skill.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -486,20 +554,59 @@ def populated_db(tmp_path, monkeypatch):
     conn = init_db(str(db_file))
 
     upsert_account(conn, _sample_account({"balance_current": 2840.00}))
-    upsert_account(conn, {"id": "acct-cc", "institution": "TD", "name": "TD Visa",
-                          "type": "credit", "currency": "CAD", "balance_current": 1240.00,
-                          "owner": "personal", "source": "wealthica", "last_synced": None})
+    upsert_account(
+        conn,
+        {
+            "id": "acct-cc",
+            "institution": "TD",
+            "name": "TD Visa",
+            "type": "credit",
+            "currency": "CAD",
+            "balance_current": 1240.00,
+            "owner": "personal",
+            "source": "wealthica",
+            "last_synced": None,
+        },
+    )
 
     today = date.today().isoformat()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     month_start = date.today().replace(day=1).isoformat()
 
-    upsert_transaction(conn, _sample_txn({"id": "t1", "date": today, "amount": -145.00, "category": "Groceries"}))
-    upsert_transaction(conn, _sample_txn({"id": "t2", "date": yesterday, "amount": -78.00, "category": "Transportation"}))
-    upsert_transaction(conn, _sample_txn({"id": "t3", "date": month_start, "amount": 2800.00, "category": "Income",
-                                          "description": "PAYROLL DEPOSIT"}))
-    upsert_transaction(conn, _sample_txn({"id": "t4", "date": today, "amount": -25.00, "category": "Technology",
-                                          "owner": "altaforma", "description": "DIGITALOCEAN"}))
+    upsert_transaction(
+        conn, _sample_txn({"id": "t1", "date": today, "amount": -145.00, "category": "Groceries"})
+    )
+    upsert_transaction(
+        conn,
+        _sample_txn(
+            {"id": "t2", "date": yesterday, "amount": -78.00, "category": "Transportation"}
+        ),
+    )
+    upsert_transaction(
+        conn,
+        _sample_txn(
+            {
+                "id": "t3",
+                "date": month_start,
+                "amount": 2800.00,
+                "category": "Income",
+                "description": "PAYROLL DEPOSIT",
+            }
+        ),
+    )
+    upsert_transaction(
+        conn,
+        _sample_txn(
+            {
+                "id": "t4",
+                "date": today,
+                "amount": -25.00,
+                "category": "Technology",
+                "owner": "altaforma",
+                "description": "DIGITALOCEAN",
+            }
+        ),
+    )
     yield conn
     conn.close()
 
