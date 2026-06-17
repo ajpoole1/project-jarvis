@@ -69,7 +69,9 @@ def _mock_institutions() -> list[dict]:
     ]
 
 
-def _mock_transactions(start_date: str, end_date: str, institution_id: str | None = None) -> list[dict]:
+def _mock_transactions(
+    start_date: str, end_date: str, institution_id: str | None = None
+) -> list[dict]:
     all_txns = [
         # RBC Chequing income + expenses
         {
@@ -255,10 +257,7 @@ def _mock_transactions(start_date: str, end_date: str, institution_id: str | Non
         },
     ]
 
-    filtered = [
-        t for t in all_txns
-        if t["date"] >= start_date and t["date"] <= end_date
-    ]
+    filtered = [t for t in all_txns if t["date"] >= start_date and t["date"] <= end_date]
     if institution_id:
         filtered = [t for t in filtered if t["account"] == institution_id]
     return filtered

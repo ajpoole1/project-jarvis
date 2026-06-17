@@ -23,7 +23,6 @@ if str(_FINANCE_DIR.parents[1]) not in sys.path:
     sys.path.insert(0, str(_FINANCE_DIR.parents[1]))
 
 
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -92,14 +91,16 @@ def _check_large_unusual(conn: sqlite3.Connection, new_txn_ids: list[str]) -> li
                 reasons.append("new merchant")
             if is_unusual_amount:
                 reasons.append("above category norm")
-            alerts.append({
-                "type": "large_unusual_charge",
-                "txn_id": txn_id,
-                "amount": amount,
-                "description": desc,
-                "date": date_str,
-                "reason": ", ".join(reasons),
-            })
+            alerts.append(
+                {
+                    "type": "large_unusual_charge",
+                    "txn_id": txn_id,
+                    "amount": amount,
+                    "description": desc,
+                    "date": date_str,
+                    "reason": ", ".join(reasons),
+                }
+            )
 
     return alerts
 
@@ -137,15 +138,17 @@ def _check_bill_shortfall(conn: sqlite3.Connection) -> list[dict]:
         )
         if amount_median > chequing:
             days_until = (date.fromisoformat(next_expected) - today).days
-            alerts.append({
-                "type": "bill_shortfall",
-                "merchant": merchant,
-                "amount": amount_median,
-                "due_date": next_expected,
-                "days_until": days_until,
-                "chequing_balance": chequing,
-                "shortfall": round(amount_median - chequing, 2),
-            })
+            alerts.append(
+                {
+                    "type": "bill_shortfall",
+                    "merchant": merchant,
+                    "amount": amount_median,
+                    "due_date": next_expected,
+                    "days_until": days_until,
+                    "chequing_balance": chequing,
+                    "shortfall": round(amount_median - chequing, 2),
+                }
+            )
 
     return alerts
 
@@ -184,14 +187,16 @@ def _check_duplicate_charges(conn: sqlite3.Connection, new_txn_ids: list[str]) -
         ).fetchall()
 
         if dupes:
-            alerts.append({
-                "type": "duplicate_charge",
-                "txn_id": txn_id,
-                "duplicate_ids": [r["id"] for r in dupes],
-                "amount": amount,
-                "description": desc,
-                "date": date_str,
-            })
+            alerts.append(
+                {
+                    "type": "duplicate_charge",
+                    "txn_id": txn_id,
+                    "duplicate_ids": [r["id"] for r in dupes],
+                    "amount": amount,
+                    "description": desc,
+                    "date": date_str,
+                }
+            )
 
     return alerts
 

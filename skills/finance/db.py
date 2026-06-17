@@ -149,7 +149,9 @@ def upsert_transaction(conn: sqlite3.Connection, txn: dict) -> bool:
     Returns True if new row was inserted, False if it already existed.
     For pending→cleared transitions, updates is_pending on the existing row.
     """
-    existing = conn.execute("SELECT id, is_pending FROM transactions WHERE id = ?", (txn["id"],)).fetchone()
+    existing = conn.execute(
+        "SELECT id, is_pending FROM transactions WHERE id = ?", (txn["id"],)
+    ).fetchone()
     if existing:
         if existing["is_pending"] and not txn.get("is_pending", 0):
             conn.execute("UPDATE transactions SET is_pending = 0 WHERE id = ?", (txn["id"],))
@@ -219,9 +221,9 @@ def get_transactions(
 
 
 _CADENCE_RANGES = [
-    (5, 9, 7),      # weekly
-    (12, 16, 14),   # biweekly
-    (25, 35, 30),   # monthly
+    (5, 9, 7),  # weekly
+    (12, 16, 14),  # biweekly
+    (25, 35, 30),  # monthly
     (85, 100, 90),  # quarterly
 ]
 
@@ -268,9 +270,7 @@ def detect_recurring(conn: sqlite3.Connection) -> int:
 
         dates_sorted = sorted(e[0] for e in entries)
         intervals = [
-            (
-                date.fromisoformat(dates_sorted[i + 1]) - date.fromisoformat(dates_sorted[i])
-            ).days
+            (date.fromisoformat(dates_sorted[i + 1]) - date.fromisoformat(dates_sorted[i])).days
             for i in range(len(dates_sorted) - 1)
         ]
 
@@ -301,7 +301,5 @@ def detect_recurring(conn: sqlite3.Connection) -> int:
 
 def get_recurring(conn: sqlite3.Connection) -> list[dict]:
     """Return all recurring charges sorted by next expected date."""
-    rows = conn.execute(
-        "SELECT * FROM recurring ORDER BY next_expected"
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM recurring ORDER BY next_expected").fetchall()
     return [dict(r) for r in rows]

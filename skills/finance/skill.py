@@ -175,7 +175,9 @@ def cmd_sync(conn, since: str | None = None, full: bool = False) -> str:
     token: str | None = None
     if client_id:
         token_row = conn.execute("SELECT value FROM sync_state WHERE key = 'token'").fetchone()
-        expiry_row = conn.execute("SELECT value FROM sync_state WHERE key = 'token_expiry'").fetchone()
+        expiry_row = conn.execute(
+            "SELECT value FROM sync_state WHERE key = 'token_expiry'"
+        ).fetchone()
         now_iso = datetime.now(UTC).isoformat()
         if token_row and expiry_row and expiry_row["value"] > now_iso:
             token = token_row["value"]
@@ -197,16 +199,19 @@ def cmd_sync(conn, since: str | None = None, full: bool = False) -> str:
     institutions = get_institutions(token)
     now_str = datetime.now(UTC).isoformat()
     for inst in institutions:
-        upsert_account(conn, {
-            "id": inst.get("_id"),
-            "institution": inst.get("institution"),
-            "name": inst.get("name"),
-            "type": inst.get("type"),
-            "currency": inst.get("currency", "CAD"),
-            "balance_current": inst.get("balance", 0.0),
-            "source": "wealthica",
-            "last_synced": now_str,
-        })
+        upsert_account(
+            conn,
+            {
+                "id": inst.get("_id"),
+                "institution": inst.get("institution"),
+                "name": inst.get("name"),
+                "type": inst.get("type"),
+                "currency": inst.get("currency", "CAD"),
+                "balance_current": inst.get("balance", 0.0),
+                "source": "wealthica",
+                "last_synced": now_str,
+            },
+        )
 
     # Sync transactions
     txns = wealthica_get_transactions(token, start_date, today)
@@ -300,7 +305,9 @@ def cmd_accounts(conn) -> str:
         for acct in group:
             bal = acct.get("balance_current") or 0.0
             synced = (acct.get("last_synced") or "never")[:10]
-            lines.append(f"  {acct.get('institution', '?')} {acct.get('name', '?')}: ${bal:,.2f}  (synced {synced})")
+            lines.append(
+                f"  {acct.get('institution', '?')} {acct.get('name', '?')}: ${bal:,.2f}  (synced {synced})"
+            )
             subtotal += bal
         lines.append(f"  Subtotal: ${subtotal:,.2f}")
         lines.append("")
@@ -471,7 +478,9 @@ def cmd_recurring(conn) -> str:
 
     today = date.today()
     lines = ["**Recurring charges**"]
-    lines.append(f"  {'Merchant':<32} {'Amount':>9}  {'Cadence':>11}  {'Next Expected':<14}  Status")
+    lines.append(
+        f"  {'Merchant':<32} {'Amount':>9}  {'Cadence':>11}  {'Next Expected':<14}  Status"
+    )
     lines.append("  " + "─" * 78)
 
     for r in rows:
@@ -509,7 +518,9 @@ def cmd_bills_due(conn, days: int = 7) -> str:
         (today_str, cutoff),
     ).fetchall()
 
-    chequing_row = conn.execute("SELECT SUM(balance_current) FROM accounts WHERE type = 'bank'").fetchone()
+    chequing_row = conn.execute(
+        "SELECT SUM(balance_current) FROM accounts WHERE type = 'bank'"
+    ).fetchone()
     chequing = chequing_row[0] or 0.0
 
     if not bills:
@@ -645,7 +656,9 @@ def main() -> None:
             print(cmd_liquid(conn))
 
         elif args.cmd == "spend":
-            period_start, period_end = _resolve_period(args.month, args.week, args.from_date, args.to_date)
+            period_start, period_end = _resolve_period(
+                args.month, args.week, args.from_date, args.to_date
+            )
             print(cmd_spend(conn, period_start, period_end, args.owner))
 
         elif args.cmd == "top":
@@ -659,7 +672,9 @@ def main() -> None:
             print(cmd_search(conn, args.term))
 
         elif args.cmd == "net":
-            period_start, period_end = _resolve_period(args.month, False, args.from_date, args.to_date)
+            period_start, period_end = _resolve_period(
+                args.month, False, args.from_date, args.to_date
+            )
             print(cmd_net(conn, period_start, period_end))
 
         elif args.cmd == "recurring":

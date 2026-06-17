@@ -130,7 +130,11 @@ def _build_brief(conn) -> dict:
     today_str = today.isoformat()
     recurring = get_recurring(conn)
     bills_due = [
-        {"merchant": r["merchant_norm"], "amount": r["amount_median"], "due_date": r["next_expected"]}
+        {
+            "merchant": r["merchant_norm"],
+            "amount": r["amount_median"],
+            "due_date": r["next_expected"],
+        }
         for r in recurring
         if r.get("next_expected") and today_str <= r["next_expected"] <= cutoff
     ]

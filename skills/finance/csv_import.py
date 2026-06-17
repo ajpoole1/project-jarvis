@@ -103,17 +103,19 @@ def _parse_mbna(path: str, account_id: str) -> list[dict]:
                 description = (row.get("Name") or row.get("Transaction") or "").strip()
                 if not description:
                     continue
-                txns.append({
-                    "id": _dedup_key(date_str, amount, description),
-                    "account_id": account_id,
-                    "date": date_str,
-                    "amount": amount,
-                    "description": description,
-                    "category": None,
-                    "currency": "CAD",
-                    "is_pending": 0,
-                    "source": "csv_import",
-                })
+                txns.append(
+                    {
+                        "id": _dedup_key(date_str, amount, description),
+                        "account_id": account_id,
+                        "date": date_str,
+                        "amount": amount,
+                        "description": description,
+                        "category": None,
+                        "currency": "CAD",
+                        "is_pending": 0,
+                        "source": "csv_import",
+                    }
+                )
             except (ValueError, KeyError):
                 continue
     return txns
@@ -136,17 +138,19 @@ def _parse_rogers(path: str, account_id: str) -> list[dict]:
                 if not description:
                     continue
                 category = (row.get("Category") or "").strip() or None
-                txns.append({
-                    "id": _dedup_key(date_str, amount, description),
-                    "account_id": account_id,
-                    "date": date_str,
-                    "amount": amount,
-                    "description": description,
-                    "category": category,
-                    "currency": "CAD",
-                    "is_pending": 0,
-                    "source": "csv_import",
-                })
+                txns.append(
+                    {
+                        "id": _dedup_key(date_str, amount, description),
+                        "account_id": account_id,
+                        "date": date_str,
+                        "amount": amount,
+                        "description": description,
+                        "category": category,
+                        "currency": "CAD",
+                        "is_pending": 0,
+                        "source": "csv_import",
+                    }
+                )
             except (ValueError, KeyError):
                 continue
     return txns
@@ -167,7 +171,11 @@ def _parse_generic(path: str, account_id: str) -> list[dict]:
         date_col = next((headers_lower[k] for k in headers_lower if "date" in k), None)
         amount_col = next((headers_lower[k] for k in headers_lower if "amount" in k), None)
         desc_col = next(
-            (headers_lower[k] for k in headers_lower if k in ("description", "name", "memo", "payee")),
+            (
+                headers_lower[k]
+                for k in headers_lower
+                if k in ("description", "name", "memo", "payee")
+            ),
             None,
         )
 
@@ -181,17 +189,19 @@ def _parse_generic(path: str, account_id: str) -> list[dict]:
                     continue
                 amount = _clean_amount(row.get(amount_col, "0"))
                 description = (row.get(desc_col, "") if desc_col else "").strip() or "Unknown"
-                txns.append({
-                    "id": _dedup_key(date_str, amount, description),
-                    "account_id": account_id,
-                    "date": date_str,
-                    "amount": amount,
-                    "description": description,
-                    "category": None,
-                    "currency": "CAD",
-                    "is_pending": 0,
-                    "source": "csv_import",
-                })
+                txns.append(
+                    {
+                        "id": _dedup_key(date_str, amount, description),
+                        "account_id": account_id,
+                        "date": date_str,
+                        "amount": amount,
+                        "description": description,
+                        "category": None,
+                        "currency": "CAD",
+                        "is_pending": 0,
+                        "source": "csv_import",
+                    }
+                )
             except (ValueError, KeyError):
                 continue
     return txns
