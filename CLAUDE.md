@@ -49,6 +49,7 @@ Every skill lives in `/skills/<skill-name>/`:
 **SQLite usage:**
 - DB file lives in `/data/jarvis.db` — this path is gitignored
 - Skills read/write via the shared schema — never create skill-specific DBs
+- **Exception:** suites that are large, sensitive, or multi-table domain systems (e.g. `finance/`) may use a dedicated DB file (e.g. `/data/finance.db`). This must be an explicit architectural decision, not a lazy default. The rule for routine skills remains `jarvis.db`.
 - Rule caches (Gmail sender rules, job deduplication) go in SQLite, not in memory
 
 **Logging:**
