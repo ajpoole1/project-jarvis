@@ -24,7 +24,7 @@ def _state_path(bank: str) -> Path:
     return _PROFILES_DIR / f"{bank}_state.json"
 
 
-async def ensure_session(bank: str, force_headful: bool = False) -> tuple[object, "BrowserContext"]:
+async def ensure_session(bank: str, force_headful: bool = False) -> tuple[object, BrowserContext]:
     """Return (playwright_instance, BrowserContext) for the given bank.
 
     If no saved state exists or force_headful is True, launches a headful browser,
@@ -46,8 +46,7 @@ async def ensure_session(bank: str, force_headful: bool = False) -> tuple[object
         browser = await pw.chromium.launch(headless=False)
         context = await browser.new_context()
         print(
-            f"[finance scraper] Please log in to {bank} and complete MFA, "
-            "then press ENTER here."
+            f"[finance scraper] Please log in to {bank} and complete MFA, " "then press ENTER here."
         )
         sys.stdin.readline()
         await save_session(bank, context)
@@ -58,14 +57,14 @@ async def ensure_session(bank: str, force_headful: bool = False) -> tuple[object
         return pw, context
 
 
-async def save_session(bank: str, context: "BrowserContext") -> None:
+async def save_session(bank: str, context: BrowserContext) -> None:
     """Persist BrowserContext storage state to /data/browser-profiles/{bank}_state.json."""
     _PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     state_file = _state_path(bank)
     await context.storage_state(path=str(state_file))
 
 
-async def is_auth_expired(page: "Page") -> bool:
+async def is_auth_expired(page: Page) -> bool:
     """Return True if the current page URL indicates a login redirect."""
     url = page.url.lower()
     return "signin" in url or "login" in url
