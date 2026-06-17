@@ -1,0 +1,2 @@
+# stdlib only — no third-party dependencies
+# urllib.request is used for Wealthica API calls (no requests needed)

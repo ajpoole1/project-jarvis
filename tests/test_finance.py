@@ -1,0 +1,590 @@
+"""Unit tests for finance skill P1.
+
+All tests use fixture data — no live API calls, no ~/.jarvis.env required.
+WEALTHICA_CLIENT_ID is intentionally absent so wealthica.py uses mock mode.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Wire up imports — add repo root and skill dir so we can import directly
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parents[1]
+_FINANCE_DIR = _REPO_ROOT / "skills" / "finance"
+for _p in (str(_REPO_ROOT), str(_FINANCE_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# Remove any live Wealthica credentials so all tests use mock mode
+os.environ.pop("WEALTHICA_CLIENT_ID", None)
+os.environ.pop("WEALTHICA_SECRET", None)
+os.environ.pop("WEALTHICA_USER", None)
+
+from skills.finance.alerts import (  # noqa: E402
+    _check_bill_shortfall,
+    _check_duplicate_charges,
+    _check_large_unusual,
+)
+from skills.finance.brief import MORTGAGE_BUFFER_GOAL, finance_brief  # noqa: E402
+from skills.finance.csv_import import detect_format, parse_csv  # noqa: E402
+from skills.finance.db import (  # noqa: E402
+    detect_recurring,
+    get_accounts,
+    get_recurring,
+    get_transactions,
+    init_db,
+    upsert_account,
+    upsert_transaction,
+)
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def db(tmp_path):
+    """Isolated SQLite connection wired to a temp file."""
+    conn = init_db(str(tmp_path / "finance.db"))
+    yield conn
+    conn.close()
+
+
+@pytest.fixture()
+def db_path(tmp_path):
+    """Return path string for a fresh finance.db."""
+    return str(tmp_path / "finance.db")
+
+
+def _sample_account(overrides: dict | None = None) -> dict:
+    base = {
+        "id": "acct-rbc-chequing",
+        "institution": "RBC",
+        "name": "RBC Chequing",
+        "type": "bank",
+        "currency": "CAD",
+        "balance_current": 2840.00,
+        "owner": "personal",
+        "source": "wealthica",
+        "last_synced": "2026-06-17T10:00:00+00:00",
+    }
+    return {**base, **(overrides or {})}
+
+
+def _sample_txn(overrides: dict | None = None) -> dict:
+    base = {
+        "id": "txn-001",
+        "account_id": "acct-rbc-chequing",
+        "date": "2026-06-15",
+        "amount": -85.00,
+        "description": "METRO GROCERIES MONTREAL",
+        "category": "Groceries",
+        "currency": "CAD",
+        "owner": "personal",
+        "is_pending": 0,
+        "source": "wealthica",
+        "note": None,
+    }
+    return {**base, **(overrides or {})}
+
+
+# ---------------------------------------------------------------------------
+# DB init
+# ---------------------------------------------------------------------------
+
+
+def test_init_db_creates_tables(db):
+    tables = {
+        r[0]
+        for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    assert {"accounts", "transactions", "recurring", "rules", "sync_state", "goals"} <= tables
+
+
+# ---------------------------------------------------------------------------
+# upsert_account
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_account_insert(db):
+    upsert_account(db, _sample_account())
+    rows = get_accounts(db)
+    assert len(rows) == 1
+    assert rows[0]["institution"] == "RBC"
+    assert rows[0]["balance_current"] == 2840.00
+
+
+def test_upsert_account_update_balance(db):
+    upsert_account(db, _sample_account())
+    upsert_account(db, _sample_account({"balance_current": 3000.00}))
+    rows = get_accounts(db)
+    assert len(rows) == 1
+    assert rows[0]["balance_current"] == 3000.00
+
+
+# ---------------------------------------------------------------------------
+# upsert_transaction
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_transaction_returns_true_for_new(db):
+    assert upsert_transaction(db, _sample_txn()) is True
+
+
+def test_upsert_transaction_returns_false_for_duplicate(db):
+    txn = _sample_txn()
+    upsert_transaction(db, txn)
+    assert upsert_transaction(db, txn) is False
+
+
+def test_upsert_transaction_pending_cleared(db):
+    txn = _sample_txn({"is_pending": 1})
+    upsert_transaction(db, txn)
+    # Re-upsert as cleared
+    upsert_transaction(db, _sample_txn({"is_pending": 0}))
+    row = db.execute("SELECT is_pending FROM transactions WHERE id = 'txn-001'").fetchone()
+    assert row["is_pending"] == 0
+
+
+def test_get_transactions_filter_by_date(db):
+    upsert_transaction(db, _sample_txn({"id": "t1", "date": "2026-06-10"}))
+    upsert_transaction(db, _sample_txn({"id": "t2", "date": "2026-06-15"}))
+    upsert_transaction(db, _sample_txn({"id": "t3", "date": "2026-06-20"}))
+    results = get_transactions(db, start_date="2026-06-11", end_date="2026-06-18")
+    assert len(results) == 1
+    assert results[0]["id"] == "t2"
+
+
+def test_get_transactions_filter_by_owner(db):
+    upsert_transaction(db, _sample_txn({"id": "t1", "owner": "personal"}))
+    upsert_transaction(db, _sample_txn({"id": "t2", "owner": "altaforma"}))
+    personal = get_transactions(db, owner="personal")
+    assert len(personal) == 1
+    assert personal[0]["id"] == "t1"
+
+
+# ---------------------------------------------------------------------------
+# detect_recurring
+# ---------------------------------------------------------------------------
+
+
+def _insert_recurring_series(db, merchant: str, amounts: list[float], days_apart: int) -> None:
+    base = date(2026, 3, 1)
+    for i, amount in enumerate(amounts):
+        d = (base + timedelta(days=i * days_apart)).isoformat()
+        upsert_transaction(db, {
+            "id": f"rec-{merchant}-{i}",
+            "account_id": "acct-001",
+            "date": d,
+            "amount": -amount,
+            "description": merchant,
+            "category": "Entertainment",
+            "currency": "CAD",
+            "owner": "personal",
+            "is_pending": 0,
+            "source": "wealthica",
+            "note": None,
+        })
+
+
+def test_detect_recurring_monthly(db):
+    _insert_recurring_series(db, "NETFLIX.COM", [17.99, 17.99, 17.99], days_apart=30)
+    count = detect_recurring(db)
+    assert count >= 1
+    rows = get_recurring(db)
+    assert len(rows) >= 1
+    assert rows[0]["cadence_days"] == 30
+    assert abs(rows[0]["amount_median"] - 17.99) < 0.01
+
+
+def test_detect_recurring_weekly(db):
+    _insert_recurring_series(db, "GYM MEMBERSHIP", [25.00, 25.00, 25.00], days_apart=7)
+    detect_recurring(db)
+    rows = get_recurring(db)
+    weekly = [r for r in rows if r["cadence_days"] == 7]
+    assert len(weekly) == 1
+
+
+def test_detect_recurring_skips_irregular(db):
+    """Transactions with no consistent interval should not appear."""
+    upsert_transaction(db, _sample_txn({"id": "ir1", "date": "2026-03-01", "description": "RANDOM VENDOR"}))
+    upsert_transaction(db, _sample_txn({"id": "ir2", "date": "2026-04-20", "description": "RANDOM VENDOR"}))
+    detect_recurring(db)
+    rows = [r for r in get_recurring(db) if "RANDOM" in (r["merchant_norm"] or "")]
+    assert len(rows) == 0
+
+
+def test_detect_recurring_sets_next_expected(db):
+    _insert_recurring_series(db, "SPOTIFY.COM", [10.99, 10.99, 10.99], days_apart=30)
+    detect_recurring(db)
+    rows = get_recurring(db)
+    assert rows[0]["next_expected"] is not None
+    # next_expected should be in the future or recent past (test data uses 2026-03)
+    ne = date.fromisoformat(rows[0]["next_expected"])
+    ls = date.fromisoformat(rows[0]["last_seen"])
+    assert (ne - ls).days == 30
+
+
+# ---------------------------------------------------------------------------
+# CSV import
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def mbna_csv(tmp_path):
+    path = tmp_path / "mbna.csv"
+    path.write_text(
+        "Date,Transaction,Name,Memo,Amount\n"
+        "04/15/2026,Debit,AMAZON.CA MARKETPLACE,,84.99\n"
+        "04/10/2026,Credit,PAYMENT,,-200.00\n"
+        "04/05/2026,Debit,METRO GROCERIES,,55.40\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+@pytest.fixture()
+def rogers_csv(tmp_path):
+    path = tmp_path / "rogers.csv"
+    path.write_text(
+        "Transaction Date,Post Date,Description,Category,Card Number,Credit,Debit\n"
+        "2026-04-15,2026-04-17,AMAZON.CA,Shopping,xxxx1234,,84.99\n"
+        "2026-04-10,2026-04-10,PAYMENT,,xxxx1234,200.00,\n"
+        "2026-04-05,2026-04-06,METRO GROCERIES,Groceries,xxxx1234,,55.40\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_detect_format_mbna(mbna_csv):
+    assert detect_format(mbna_csv) == "mbna"
+
+
+def test_detect_format_rogers(rogers_csv):
+    assert detect_format(rogers_csv) == "rogers"
+
+
+def test_parse_mbna_sign_convention(mbna_csv):
+    txns = parse_csv(mbna_csv, "acct-mbna")
+    # purchases should be negative (money out)
+    purchases = [t for t in txns if "AMAZON" in t["description"] or "METRO" in t["description"]]
+    assert all(t["amount"] < 0 for t in purchases)
+    # payment should be positive (money in — reduces CC balance)
+    payments = [t for t in txns if "PAYMENT" in t["description"]]
+    assert all(t["amount"] > 0 for t in payments)
+
+
+def test_parse_rogers_sign_convention(rogers_csv):
+    txns = parse_csv(rogers_csv, "acct-rogers")
+    purchases = [t for t in txns if "AMAZON" in t["description"] or "METRO" in t["description"]]
+    assert all(t["amount"] < 0 for t in purchases)
+    payments = [t for t in txns if "PAYMENT" in t["description"]]
+    assert all(t["amount"] > 0 for t in payments)
+
+
+def test_csv_dedup_same_row_twice(db, mbna_csv):
+    txns = parse_csv(mbna_csv, "acct-mbna")
+    for txn in txns:
+        txn["owner"] = "personal"
+    inserted_first = sum(1 for t in txns if upsert_transaction(db, t))
+    inserted_second = sum(1 for t in txns if upsert_transaction(db, {**t}))
+    assert inserted_first == 3
+    assert inserted_second == 0  # all duplicates
+
+
+def test_csv_dedup_key_is_stable(mbna_csv):
+    """Same file parsed twice produces identical ids."""
+    ids_a = {t["id"] for t in parse_csv(mbna_csv, "acct-mbna")}
+    ids_b = {t["id"] for t in parse_csv(mbna_csv, "acct-mbna")}
+    assert ids_a == ids_b
+
+
+# ---------------------------------------------------------------------------
+# Alerts
+# ---------------------------------------------------------------------------
+
+
+def _seed_accounts(db, chequing: float = 2840.00, cc: float = 1240.00) -> None:
+    upsert_account(db, _sample_account({"id": "acct-chequing", "type": "bank", "balance_current": chequing}))
+    upsert_account(db, {"id": "acct-cc", "institution": "TD", "name": "TD Visa",
+                        "type": "credit", "currency": "CAD", "balance_current": cc,
+                        "owner": "personal", "source": "wealthica", "last_synced": None})
+
+
+def test_alert_large_unusual_new_merchant(db):
+    _seed_accounts(db)
+    upsert_transaction(db, _sample_txn({
+        "id": "t-big-001",
+        "amount": -340.00,
+        "description": "BEST BUY CANADA",
+        "category": "Electronics",
+    }))
+    alerts = _check_large_unusual(db, ["t-big-001"])
+    assert len(alerts) == 1
+    assert alerts[0]["type"] == "large_unusual_charge"
+    assert "new merchant" in alerts[0]["reason"]
+
+
+def test_alert_large_unusual_below_threshold_no_alert(db):
+    _seed_accounts(db)
+    upsert_transaction(db, _sample_txn({
+        "id": "t-small-001",
+        "amount": -150.00,
+        "description": "SOME VENDOR",
+    }))
+    alerts = _check_large_unusual(db, ["t-small-001"])
+    assert len(alerts) == 0
+
+
+def test_alert_large_unusual_known_merchant_no_alert(db):
+    """Known merchant with normal amount should not trigger."""
+    _seed_accounts(db)
+    # Seed 5 prior Metro transactions so it's a known merchant
+    for i in range(5):
+        upsert_transaction(db, _sample_txn({
+            "id": f"metro-prior-{i}",
+            "amount": -145.00,
+            "description": "METRO GROCERIES",
+            "category": "Groceries",
+        }))
+    # New Metro txn within normal range
+    upsert_transaction(db, _sample_txn({
+        "id": "metro-new",
+        "amount": -155.00,
+        "description": "METRO GROCERIES",
+        "category": "Groceries",
+    }))
+    alerts = _check_large_unusual(db, ["metro-new"])
+    assert len(alerts) == 0
+
+
+def test_alert_bill_shortfall_triggered(db):
+    # Very low chequing
+    _seed_accounts(db, chequing=100.00)
+    # Insert recurring bill due tomorrow
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    last_month = (date.today() - timedelta(days=30)).isoformat()
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("DESJARDINS MORTGAGE", 2140.00, 30, last_month, tomorrow, "personal"),
+    )
+    db.commit()
+    alerts = _check_bill_shortfall(db)
+    assert len(alerts) == 1
+    assert alerts[0]["type"] == "bill_shortfall"
+    assert alerts[0]["shortfall"] > 0
+
+
+def test_alert_bill_shortfall_no_alert_when_covered(db):
+    _seed_accounts(db, chequing=5000.00)
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    last_month = (date.today() - timedelta(days=30)).isoformat()
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("NETFLIX COM", 17.99, 30, last_month, tomorrow, "personal"),
+    )
+    db.commit()
+    alerts = _check_bill_shortfall(db)
+    assert len(alerts) == 0
+
+
+def test_alert_duplicate_charge(db):
+    today = date.today().isoformat()
+    upsert_transaction(db, _sample_txn({"id": "dup-001", "date": today, "amount": -49.99, "description": "SOME SERVICE"}))
+    upsert_transaction(db, _sample_txn({"id": "dup-002", "date": today, "amount": -49.99, "description": "SOME SERVICE"}))
+    alerts = _check_duplicate_charges(db, ["dup-002"])
+    assert len(alerts) == 1
+    assert alerts[0]["type"] == "duplicate_charge"
+    assert "dup-001" in alerts[0]["duplicate_ids"]
+
+
+def test_alert_duplicate_no_false_positive_different_amounts(db):
+    today = date.today().isoformat()
+    upsert_transaction(db, _sample_txn({"id": "a1", "date": today, "amount": -49.99, "description": "VENDOR X"}))
+    upsert_transaction(db, _sample_txn({"id": "a2", "date": today, "amount": -99.99, "description": "VENDOR X"}))
+    alerts = _check_duplicate_charges(db, ["a2"])
+    assert len(alerts) == 0
+
+
+# ---------------------------------------------------------------------------
+# finance_brief()
+# ---------------------------------------------------------------------------
+
+
+def test_finance_brief_empty_db(tmp_path):
+    """brief() on a fresh DB should return sensible zero values."""
+    # brief() returns _empty when db doesn't exist yet
+    result = finance_brief(db_path=str(tmp_path / "nonexistent.db"))
+    assert result["liquid"] == 0.0
+    assert result["buffer_gap"] == float(MORTGAGE_BUFFER_GOAL)
+    assert result["data_age_hours"] is None
+
+
+def test_finance_brief_with_data(tmp_path, monkeypatch):
+    db_file = tmp_path / "finance.db"
+    conn = init_db(str(db_file))
+
+    upsert_account(conn, _sample_account({"balance_current": 3000.00}))
+    upsert_account(conn, {"id": "acct-cc", "institution": "TD", "name": "TD Visa",
+                          "type": "credit", "currency": "CAD", "balance_current": 500.00,
+                          "owner": "personal", "source": "wealthica", "last_synced": None})
+
+    today = date.today().isoformat()
+    upsert_transaction(conn, _sample_txn({"date": today, "amount": -120.00, "category": "Groceries"}))
+
+    from datetime import UTC, datetime
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (key, value, updated) VALUES ('last_sync', ?, ?)",
+        (now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    result = finance_brief(db_path=str(db_file))
+    assert result["liquid"] == pytest.approx(3000.00 - 500.00)
+    assert result["cc_outstanding"] == pytest.approx(500.00)
+    assert result["buffer_gap"] == pytest.approx(max(0, MORTGAGE_BUFFER_GOAL - 3000.00))
+    assert result["data_age_hours"] is not None
+    assert result["data_age_hours"] < 1  # just synced
+    assert result["top_spend_this_week"] is not None
+    assert result["top_spend_this_week"]["category"] == "Groceries"
+
+
+# ---------------------------------------------------------------------------
+# P1 command smoke tests (via skill.py functions directly)
+# ---------------------------------------------------------------------------
+
+
+def _load_skill():
+    """Load skill.py functions for testing without running main()."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("finance_skill", _FINANCE_DIR / "skill.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_skill = _load_skill()
+
+
+@pytest.fixture()
+def populated_db(tmp_path, monkeypatch):
+    """DB with one account + several transactions."""
+    db_file = tmp_path / "finance.db"
+    monkeypatch.setattr(_skill, "DB_PATH", db_file)
+    conn = init_db(str(db_file))
+
+    upsert_account(conn, _sample_account({"balance_current": 2840.00}))
+    upsert_account(conn, {"id": "acct-cc", "institution": "TD", "name": "TD Visa",
+                          "type": "credit", "currency": "CAD", "balance_current": 1240.00,
+                          "owner": "personal", "source": "wealthica", "last_synced": None})
+
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    month_start = date.today().replace(day=1).isoformat()
+
+    upsert_transaction(conn, _sample_txn({"id": "t1", "date": today, "amount": -145.00, "category": "Groceries"}))
+    upsert_transaction(conn, _sample_txn({"id": "t2", "date": yesterday, "amount": -78.00, "category": "Transportation"}))
+    upsert_transaction(conn, _sample_txn({"id": "t3", "date": month_start, "amount": 2800.00, "category": "Income",
+                                          "description": "PAYROLL DEPOSIT"}))
+    upsert_transaction(conn, _sample_txn({"id": "t4", "date": today, "amount": -25.00, "category": "Technology",
+                                          "owner": "altaforma", "description": "DIGITALOCEAN"}))
+    yield conn
+    conn.close()
+
+
+def test_cmd_accounts_output(populated_db):
+    result = _skill.cmd_accounts(populated_db)
+    assert "RBC" in result
+    assert "Bank accounts" in result
+    assert "Net liquid" in result
+
+
+def test_cmd_liquid_output(populated_db):
+    result = _skill.cmd_liquid(populated_db)
+    assert "Net liquid" in result
+    assert "Mortgage buffer goal" in result
+
+
+def test_cmd_spend_output(populated_db):
+    start, end = date.today().replace(day=1).isoformat(), date.today().isoformat()
+    result = _skill.cmd_spend(populated_db, start, end)
+    assert "Groceries" in result
+
+
+def test_cmd_net_output(populated_db):
+    start, end = date.today().replace(day=1).isoformat(), date.today().isoformat()
+    result = _skill.cmd_net(populated_db, start, end)
+    assert "In:" in result
+    assert "Out:" in result
+    assert "Net:" in result
+
+
+def test_cmd_search_finds_match(populated_db):
+    result = _skill.cmd_search(populated_db, "PAYROLL")
+    assert "PAYROLL" in result
+
+
+def test_cmd_search_no_match(populated_db):
+    result = _skill.cmd_search(populated_db, "NONEXISTENT_VENDOR_XYZ")
+    assert "No transactions matching" in result
+
+
+def test_cmd_top_output(populated_db):
+    start, end = date.today().replace(day=1).isoformat(), date.today().isoformat()
+    result = _skill.cmd_top(populated_db, 5, start, end)
+    assert "Top 5 merchants" in result
+
+
+def test_cmd_tag_updates_owner(populated_db):
+    result = _skill.cmd_tag(populated_db, "t1", "altaforma")
+    assert "owner=altaforma" in result
+    row = populated_db.execute("SELECT owner FROM transactions WHERE id = 't1'").fetchone()
+    assert row["owner"] == "altaforma"
+
+
+def test_cmd_tag_with_category(populated_db):
+    result = _skill.cmd_tag(populated_db, "t1", "altaforma", category="Infrastructure")
+    assert "category=Infrastructure" in result
+
+
+def test_cmd_tag_prefix_match(populated_db):
+    result = _skill.cmd_tag(populated_db, "t2", "personal")
+    assert "owner=personal" in result
+
+
+def test_cmd_tag_not_found(populated_db):
+    result = _skill.cmd_tag(populated_db, "zzz-no-such", "personal")
+    assert "not found" in result.lower()
+
+
+def test_cmd_sync_mock_mode(tmp_path, monkeypatch):
+    """sync with no credentials uses mock Wealthica data."""
+    db_file = tmp_path / "finance.db"
+    monkeypatch.setattr(_skill, "DB_PATH", db_file)
+    conn = init_db(str(db_file))
+    result = _skill.cmd_sync(conn)
+    assert "Synced" in result
+    assert "mock mode" in result
+    conn.close()
+
+
+def test_cmd_bills_due_no_bills(populated_db):
+    result = _skill.cmd_bills_due(populated_db, days=7)
+    assert "No bills due" in result
+
+
+def test_cmd_recurring_no_data(populated_db):
+    result = _skill.cmd_recurring(populated_db)
+    assert "No recurring" in result
