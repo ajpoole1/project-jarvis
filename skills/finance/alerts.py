@@ -136,7 +136,7 @@ def _check_bill_shortfall(conn: sqlite3.Connection) -> list[dict]:
             row["amount_median"],
             row["next_expected"],
         )
-        if amount_median > chequing:
+        if amount_median is not None and amount_median > chequing:
             days_until = (date.fromisoformat(next_expected) - today).days
             alerts.append(
                 {

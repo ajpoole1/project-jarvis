@@ -228,8 +228,10 @@ _CADENCE_RANGES = [
 ]
 
 
-def _normalize_merchant(desc: str) -> str:
+def _normalize_merchant(desc: str | None) -> str:
     """Normalize a raw transaction description for merchant grouping."""
+    if not desc:
+        return "UNKNOWN"
     s = desc.upper()
     s = re.sub(r"[.\-/]", " ", s)
     s = re.sub(r"\b\d{4,}\b", "", s)
