@@ -317,6 +317,55 @@ class TestRoundTrip:
         ).fetchone()
         assert row[0] == "2"
 
+    def test_unit_qty_round_trip_no_duplicate(self, db, monkeypatch):
+        """Bug C (#57): unit-bearing qty like '3 lb' must not create a duplicate row.
+
+        Before the fix, _TRAILING_QTY_RE used \\S+ which stopped at the space before the
+        unit suffix — so '×3 lb' was not stripped and the whole 'pork shoulder ×3 lb'
+        string became a new item name on re-sync.
+        """
+        cmd_add(db, "pork shoulder", qty="3 lb", store="Costco")
+        note = _render_note(db)
+        assert "×3 lb" in note  # rendered correctly
+
+        # First sync — note has "- pork shoulder ×3 lb"
+        monkeypatch.setattr(_g, "_get_grocery_event", lambda: ("evt", note))
+        cmd_sync_note(db)
+
+        count = db.execute("SELECT COUNT(*) FROM grocery_items").fetchone()[0]
+        assert count == 1, "first sync must not duplicate the item"
+
+        # Second sync (simulates cmd_plan calling sync twice) — re-render and sync again
+        note2 = _render_note(db)
+        monkeypatch.setattr(_g, "_get_grocery_event", lambda: ("evt2", note2))
+        cmd_sync_note(db)
+
+        count2 = db.execute("SELECT COUNT(*) FROM grocery_items").fetchone()[0]
+        assert count2 == 1, "second sync must still produce exactly one row"
+
+    def test_parse_trailing_qty_with_unit(self):
+        """_TRAILING_QTY_RE must match unit-bearing quantities like '×3 lb'."""
+        items = _parse_note_items("pork shoulder ×3 lb")
+        assert len(items) == 1
+        name, qty, _, _ = items[0]
+        assert name == "pork shoulder"
+        assert qty == "3 lb"
+
+    def test_parse_trailing_qty_with_gram_unit(self):
+        items = _parse_note_items("olive oil ×500 g")
+        assert len(items) == 1
+        name, qty, _, _ = items[0]
+        assert name == "olive oil"
+        assert qty == "500 g"
+
+    def test_parse_trailing_qty_plain_int_still_works(self):
+        """Existing plain-integer qty must still parse correctly after the regex change."""
+        items = _parse_note_items("milk ×2")
+        assert len(items) == 1
+        name, qty, _, _ = items[0]
+        assert name == "milk"
+        assert qty == "2"
+
 
 # ===========================================================================
 # cmd_plan — store auto-assign from history
