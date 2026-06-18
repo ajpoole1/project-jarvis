@@ -702,7 +702,11 @@ def cmd_anchor_weekday(args: list[str]) -> None:
         if not row:
             print(f"No follow-up with id={row_id}", file=sys.stderr)
             sys.exit(1)
-        next_trigger = _next_weekday_trigger(cadence_spec)
+        try:
+            next_trigger = _next_weekday_trigger(cadence_spec)
+        except ValueError as exc:
+            print(f"Error: invalid time in cadence_spec: {exc}", file=sys.stderr)
+            sys.exit(1)
         conn.execute(
             "UPDATE follow_ups SET cadence_spec = ?, trigger_at = ? WHERE id = ?",
             (cadence_spec, next_trigger.isoformat(), row_id),

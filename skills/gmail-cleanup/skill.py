@@ -278,7 +278,7 @@ def init_db():
             "ALTER TABLE gmail_pending_actions ADD COLUMN label_ids_json TEXT NOT NULL DEFAULT '[]'"
         )
         con.commit()
-    except Exception:
+    except sqlite3.OperationalError:
         pass  # column already exists
     con.execute("""
         CREATE TABLE IF NOT EXISTS gmail_heartbeat_state (
