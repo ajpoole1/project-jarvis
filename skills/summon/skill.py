@@ -6,6 +6,8 @@ Commands:
   summon <persona> <id>             Launch a named RC builder for an authorized item
   summon <persona> <id> --revise    Resume a refix cycle on the existing feature branch,
                                     seeding Tom's QA findings + PR link into the kickoff
+  summon <persona> <id> --revise --findings "text"   Inject findings directly (skip PR lookup)
+  summon <persona> <id> --revise --findings @/path   Read findings from file
   ask <id> <question...>    (builder) post a blocking question to the dev-loop Discord
   watchdog-check <id> [min] (scheduler) stall check + milestone ping; prints if action needed
   verdict-sweep             (scheduler) check all active builds for new Tom QA verdicts
@@ -210,12 +212,34 @@ def capture_rc_url(url_file: Path, timeout: int = 15) -> str | None:
     return None
 
 
-def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
-    """Return (pr_url, findings_comment_body). Best-effort; ('', '') on failure.
+_ERROR_PATTERNS = (
+    "could not produce findings",
+    "JSON parse and partial recovery both failed",
+)
 
-    Prefers Tom QA comments; falls back to any review-shaped comment (one with
-    a ## markdown heading) when no Tom QA comment exists, so that stand-in
-    findings posted by the operator are picked up by --revise.
+_REVISE_ERROR_MSG = (
+    "summon --revise: Tom returned an ERROR, not findings. "
+    "Use --findings to inject a stand-in review, "
+    "or wait for Tom to produce a substantive verdict."
+)
+
+
+def _is_error_body(body: str) -> bool:
+    """Return True if body is a Tom ERROR body, not real findings."""
+    return any(p in body for p in _ERROR_PATTERNS)
+
+
+def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
+    """Return (pr_url, findings_body). Best-effort; ('', '') on failure.
+
+    4-level priority (highest → lowest); ERROR bodies skipped at each level:
+    1. Latest PR REVIEW with state CHANGES_REQUESTED or APPROVED.
+    2. Latest PR comment whose body starts with '## Tom QA'.
+    3. Latest PR comment containing ## QA, blocking, FAIL, or PASS.
+    4. Latest PR comment from any [bot] account.
+
+    'Latest' = highest comment/review ID (last in chronological order).
+    Returns (pr_url, '') when no valid findings are found.
     """
     branch = f"feature/{item_id}"
     try:
@@ -233,27 +257,88 @@ def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
             return "", ""
         pr_number = str(data[0]["number"])
         pr_url = data[0]["url"]
-        comments = subprocess.run(
+
+        # Fetch PR comments
+        comments_result = subprocess.run(
             ["gh", "pr", "view", pr_number, "--json", "comments"],
             cwd=repo_dir,
             capture_output=True,
             text=True,
             timeout=20,
         )
-        if comments.returncode != 0:
-            return pr_url, ""
-        cdata = json.loads(comments.stdout or "{}")
-        all_comments = cdata.get("comments", [])
-        # Prefer Tom QA comment.
+        all_comments: list[dict] = []
+        if comments_result.returncode == 0:
+            cdata = json.loads(comments_result.stdout or "{}")
+            all_comments = cdata.get("comments", [])
+
+        # Fetch formal PR reviews (objects with state field)
+        reviews_result = subprocess.run(
+            ["gh", "pr", "view", pr_number, "--json", "reviews"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        all_reviews: list[dict] = []
+        if reviews_result.returncode == 0:
+            rdata = json.loads(reviews_result.stdout or "{}")
+            all_reviews = rdata.get("reviews", [])
+
+        # Priority 1: latest PR REVIEW with CHANGES_REQUESTED or APPROVED
+        for r in reversed(all_reviews):
+            state = r.get("state", "").upper()
+            if state not in ("CHANGES_REQUESTED", "APPROVED"):
+                continue
+            body = r.get("body", "")
+            if _is_error_body(body):
+                print(
+                    f"summon --revise: skipping PR review (state={state}) — ERROR body",
+                    file=sys.stderr,
+                )
+                continue
+            return pr_url, body
+
+        # Priority 2: latest comment starting with ## Tom QA
         for c in reversed(all_comments):
             body = c.get("body", "")
-            if "Tom QA" in body:
-                return pr_url, body
-        # Fallback: any review-shaped comment with a ## heading.
+            if not body.startswith("## Tom QA"):
+                continue
+            if _is_error_body(body):
+                print(
+                    "summon --revise: skipping '## Tom QA' comment — ERROR body",
+                    file=sys.stderr,
+                )
+                continue
+            return pr_url, body
+
+        # Priority 3: latest comment containing ## QA, blocking, FAIL, or PASS
         for c in reversed(all_comments):
             body = c.get("body", "")
-            if re.search(r"^## ", body, re.MULTILINE):
-                return pr_url, body
+            if not re.search(r"(## QA|blocking|FAIL|PASS)", body):
+                continue
+            if _is_error_body(body):
+                print(
+                    "summon --revise: skipping review-shaped comment — ERROR body",
+                    file=sys.stderr,
+                )
+                continue
+            return pr_url, body
+
+        # Priority 4: latest [bot] comment
+        for c in reversed(all_comments):
+            author = c.get("author", {})
+            login = author.get("login", "") if isinstance(author, dict) else str(author)
+            if "[bot]" not in login:
+                continue
+            body = c.get("body", "")
+            if _is_error_body(body):
+                print(
+                    "summon --revise: skipping [bot] comment — ERROR body",
+                    file=sys.stderr,
+                )
+                continue
+            return pr_url, body
+
         return pr_url, ""
     except Exception:  # noqa: BLE001
         return "", ""
@@ -304,7 +389,10 @@ def build_revise_kickoff(persona_name: str, item_id: str, pr_url: str, tom_findi
     """Single-line refix kickoff: resume on the existing feature branch with Tom's feedback.
 
     Kept to one line for the same reason as build_kickoff.
+    Raises SystemExit if tom_findings is an ERROR body — never feed HM error text as notes.
     """
+    if tom_findings and _is_error_body(tom_findings):
+        raise SystemExit(_REVISE_ERROR_MSG)
     spec_path = f"{DEVNOTES_QUEUE}/{item_id}.md"
     if tom_findings:
         findings_summary = (tom_findings[:2000] + "…") if len(tom_findings) > 2000 else tom_findings
@@ -878,7 +966,16 @@ def cmd_summon(args: list[str]) -> int:
     i = 0
     while i < len(args):
         if args[i] == "--findings" and i + 1 < len(args):
-            explicit_findings = args[i + 1]
+            val = args[i + 1]
+            if val.startswith("@"):
+                file_path = val[1:]
+                try:
+                    explicit_findings = Path(file_path).read_text(encoding="utf-8")
+                except OSError as exc:
+                    print(f"Error reading findings file {file_path!r}: {exc}", file=sys.stderr)
+                    return 1
+            else:
+                explicit_findings = val
             i += 2
         elif args[i] == "--findings-file" and i + 1 < len(args):
             try:
@@ -894,7 +991,7 @@ def cmd_summon(args: list[str]) -> int:
 
     if len(args) < 2:
         print(
-            "Usage: summon <persona> <id> [--revise] [--findings TEXT | --findings-file PATH]",
+            "Usage: summon <persona> <id> [--revise] [--findings <text|@file> | --findings-file PATH]",
             file=sys.stderr,
         )
         return 1
@@ -1015,6 +1112,21 @@ def cmd_summon(args: list[str]) -> int:
             kickoff = build_revise_kickoff(persona["name"], item_id, "", explicit_findings)
         else:
             pr_url, tom_findings = _fetch_pr_info(repo_dir, item_id)
+            if not tom_findings:
+                if not pr_url:
+                    print(
+                        f"summon --revise: no open PR found for feature/{item_id}. "
+                        "Use --findings to inject findings directly.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "summon --revise: no review-shaped comment or PR review found. "
+                        "Use --findings to inject a stand-in review, "
+                        "or wait for Tom to produce a verdict.",
+                        file=sys.stderr,
+                    )
+                return 1
             kickoff = build_revise_kickoff(persona["name"], item_id, pr_url, tom_findings)
     else:
         kickoff = build_kickoff(persona["name"], item_id)
