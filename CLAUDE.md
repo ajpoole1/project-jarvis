@@ -1,6 +1,6 @@
 # Project Jarvis — Claude Code Memory
 
-Personal AI assistant. Stack: OpenClaw (Node.js) · Claude API · Python · Docker · Discord · Home Assistant.
+Personal AI assistant. Stack: OpenClaw (Node.js) · Claude API · Python · Discord · Home Assistant.
 Private repo. Personal data and knowledge live here. Logic and personal state are both local-only.
 
 ---
@@ -20,7 +20,7 @@ Private repo. Personal data and knowledge live here. Logic and personal state ar
 
 | Layer | Where | What runs |
 |---|---|---|
-| Local brain | Windows PC / WSL2 | VS Code, Docker Compose, OpenClaw, Python skills, SQLite |
+| Local brain | Windows PC / WSL2 | VS Code, OpenClaw (systemd user service), Python skills, SQLite |
 | Cloud brain | Hetzner VPS + Cloudflare tunnel | Discord bot, job scraper, Gmail agent, morning briefing (Phase 4) |
 | Hardware controller | Windows PC / WSL2 | Home Assistant Container (Phase 2+). Raspberry Pi + garden irrigation deferred to 2027. |
 
@@ -81,6 +81,7 @@ Every skill lives in `/skills/<skill-name>/`:
 - **Skills and scripts are read-only to the agent.** Edit and Write tools are denied for `skills/`, `scripts/`, `.github/`, `docker-compose.yml`, `requirements*.txt`, `pyproject.toml`, and all instruction files. You write these from Claude Code or your IDE; the agent runs them. See Write Boundary section for the full model.
 - **No autonomous push.** The agent may branch and commit locally. `git push` is hard-denied at the tool level and listed as a Red Line in AGENTS.md. Push is always initiated by you.
 - **Injection guard is in SOUL.md.** Treat it as the weakest layer — the structural controls above are what actually hold. Do not rely on the instruction layer alone.
+- **OpenClaw permission model — known structural gap (2026-06-18).** OpenClaw hardcodes `--setting-sources user`, meaning the workspace `.claude/settings.json` deny list is never loaded by Jarvis's session. The active structural control is `exec-policy allowlist + on-miss` (set via `openclaw exec-policy set --security allowlist --ask on-miss`) — any non-allowlisted tool call prompts before executing, including Edit/Write on skill files. A `write_guard.py` PreToolUse hook exists at `~/.openclaw/workspace/scripts/write_guard.py` and is registered in the workspace settings; it will become the hard block if/when `--setting-sources` is exposed as a config option. See `knowledge/dev-crew/jarvis-memory.md` for the full picture.
 
 ---
 
@@ -96,11 +97,13 @@ Three tiers, by who holds the pen:
 
 ### Permission engine construction
 
-The agent's settings (`~/.openclaw/workspace/.claude/settings.json`) use **default-deny + narrow allow**:
+The agent's settings (`~/.openclaw/workspace/.claude/settings.json`) contain deny and allow rules, but **these are not the load-bearing control** due to a structural OpenClaw constraint:
 
-- `deny` always overrides `allow` in Claude Code's permission engine. A broad `deny(**)` would cancel a specific `allow(knowledge/**/*.md)`, so that construction is wrong.
-- Correct construction: explicit `allow(knowledge/**/*.md)` + explicit `allow(~/.jarvis/knowledge/**/*.md)` + explicit `deny` for belt-and-suspenders on the highest-value targets + **unlisted = denied** in the non-interactive OpenClaw runtime (the agent runs headlessly; unknown permissions are not prompted, they are denied).
-- Result: the only paths the agent can write via Edit/Write tools are `knowledge/**/*.md` (committed) and `~/.jarvis/knowledge/**/*.md` (private).
+- OpenClaw hardcodes `--setting-sources user` — it only loads `~/.claude/settings.json` (user-level), never the workspace `.claude/settings.json`. The deny list in the workspace settings is structurally unreachable from Jarvis's session.
+- The active structural control is **`exec-policy allowlist + on-miss`**: any Edit/Write tool call on a non-allowlisted path prompts before executing. Run `openclaw exec-policy show` to verify current state.
+- A `write_guard.py` PreToolUse hook at `~/.openclaw/workspace/scripts/write_guard.py` is the intended hard block — it works correctly when invoked, but cannot be registered in a settings file Jarvis can load. It is ready to wire into `~/.claude/settings.json` if a Herr-safe approach is found.
+- The deny list in workspace settings remains as belt-and-suspenders in case `--setting-sources` is ever fixed upstream.
+- Intended result: the only paths Jarvis can write without a prompt are `knowledge/**/*.md` (committed) and `~/.jarvis/knowledge/**/*.md` (private).
 
 ### Private knowledge root
 
@@ -118,10 +121,10 @@ CI workflows run with repository secrets and can push code if misconfigured. The
 
 | File | Who reads it | Purpose |
 |---|---|---|
-| `~/.openclaw/workspace/.claude/settings.json` | OpenClaw agent runtime | Restrictive: deny-by-default, allow only knowledge writes + skill runner + safe read-only ops |
+| `~/.openclaw/workspace/.claude/settings.json` | Intended for OpenClaw agent runtime — **NOT actually loaded** (see structural gap above) | Contains deny list + write_guard hook registration; unreachable due to `--setting-sources user` hardcoding |
 | `<repo>/.claude/settings.json` | Claude Code (AJ as author) | Permissive: author-level tools, `git pull`, `sudo service`, `python3 -c` for setup tasks |
 
-The agent's working directory is `~/.openclaw/workspace/`. It loads the workspace settings, **not** the repo settings. The workspace settings' `permissions.additionalDirectories` currently includes `~/.jarvis/knowledge` (so the agent's Edit/Write tools can reach the private root). The repo settings' `additionalDirectories` config is a Claude Code author feature only. If `python3 -c` in the repo settings worries you, remove it — it is only needed occasionally during setup.
+The agent's working directory is `~/.openclaw/workspace/`. OpenClaw hardcodes `--setting-sources user`, so it loads only `~/.claude/settings.json`, not the workspace settings. The workspace settings' `permissions.additionalDirectories` includes `~/.jarvis/knowledge` (intended so Edit/Write tools can reach the private root — verify this still works given the load path issue). The repo settings' `additionalDirectories` config is a Claude Code author feature only.
 
 ---
 
@@ -152,6 +155,7 @@ jarvis/
 │   ├── recipes/               ← family recipe library (promoted from family/)
 │   ├── preferences/           ← generic preferences (voice, food, media — no PII)
 │   ├── projects/              ← Altaforma, Bolas
+│   ├── dev-crew/              ← dev-loop docs: roster, Jarvis memory system, OpenClaw recovery
 │   └── examples/              ← fake-data schema placeholders for private domains
 ├── config/
 │   ├── personal/              ← gitignored, all personal config here
