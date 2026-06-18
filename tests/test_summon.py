@@ -285,11 +285,12 @@ def test_revise_kickoff_with_empty_findings_uses_placeholder():
 
 
 def test_fetch_pr_info_falls_back_to_review_shaped_comment(monkeypatch):
-    """_fetch_pr_info falls back to a ## -headed comment when no Tom QA exists."""
+    """_fetch_pr_info falls back to a stand-in comment matching level-3 keywords."""
     import json as _json
     import subprocess as _subprocess
 
-    review_body = "## Findings\n\nFix the null guard.\n## Notes\n\nSee line 42."
+    # body must contain one of: ## QA, blocking, FAIL, PASS — use blocking
+    review_body = "## Findings\n\nblocking: Fix the null guard.\n## Notes\n\nSee line 42."
 
     fake_prs = _json.dumps([{"number": 7, "url": "https://github.com/x/y/pull/7"}])
     fake_comments = _json.dumps(
@@ -470,3 +471,173 @@ def test_verdict_sweep_surfaces_unknown_verdict_as_error(tmp_db, monkeypatch):
     msg, mention = posts[0]
     assert item in msg
     assert mention is True
+
+
+# ---------------------------------------------------------------------------
+# C — #2026-0023: _is_error_body, _fetch_pr_info 4-level priority,
+#                 build_revise_kickoff ERROR guard, --findings @file
+# ---------------------------------------------------------------------------
+
+
+def test_is_error_body_detects_patterns():
+    assert _mod._is_error_body("could not produce findings") is True
+    assert _mod._is_error_body("JSON parse and partial recovery both failed") is True
+    assert _mod._is_error_body("## Tom QA — PASS\n\nLooks good.") is False
+
+
+def test_fetch_pr_info_prefers_pr_review_over_comments(monkeypatch):
+    """Priority 1: a CHANGES_REQUESTED PR review beats any comment."""
+    import json as _json
+    import subprocess as _subprocess
+
+    fake_prs = _json.dumps([{"number": 10, "url": "https://github.com/x/y/pull/10"}])
+    fake_comments = _json.dumps({"comments": [{"body": "## Tom QA — PASS\n\nAll good."}]})
+    fake_reviews = _json.dumps(
+        {"reviews": [{"state": "CHANGES_REQUESTED", "body": "blocking: fix the auth guard"}]}
+    )
+
+    def _fake_run(cmd, **kwargs):
+        if "pr" in cmd and "list" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_prs)
+        if "reviews" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_reviews)
+        if "pr" in cmd and "view" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_comments)
+        return _subprocess.CompletedProcess(cmd, 0, stdout="")
+
+    monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
+
+    pr_url, body = _mod._fetch_pr_info("/fake/repo", "2026-0023-test")
+    assert "fix the auth guard" in body
+    assert "PASS" not in body
+
+
+def test_fetch_pr_info_skips_error_body_and_falls_back(monkeypatch):
+    """ERROR body at priority 2 is skipped; level 3 match is returned."""
+    import json as _json
+    import subprocess as _subprocess
+
+    error_body = "## Tom QA — ERROR\n\ncould not produce findings"
+    standin_body = "## QA Stand-in\n\nblocking: null pointer on line 42"
+
+    fake_prs = _json.dumps([{"number": 11, "url": "https://github.com/x/y/pull/11"}])
+    # error comment comes after stand-in (reversed iteration checks error first)
+    fake_comments = _json.dumps({"comments": [{"body": standin_body}, {"body": error_body}]})
+    fake_reviews = _json.dumps({"reviews": []})
+
+    def _fake_run(cmd, **kwargs):
+        if "pr" in cmd and "list" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_prs)
+        if "reviews" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_reviews)
+        if "pr" in cmd and "view" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_comments)
+        return _subprocess.CompletedProcess(cmd, 0, stdout="")
+
+    monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
+
+    pr_url, body = _mod._fetch_pr_info("/fake/repo", "2026-0023-skip-error")
+    # level 2: error_body matches ## Tom QA but is skipped
+    # level 3: standin_body matches ## QA and blocking, not an error → returned
+    assert "null pointer" in body
+    assert "could not produce findings" not in body
+
+
+def test_fetch_pr_info_bot_comment_is_priority_4(monkeypatch):
+    """Priority 4: [bot] comment is selected when nothing else matches."""
+    import json as _json
+    import subprocess as _subprocess
+
+    bot_body = "Automated analysis: PASS — no issues found."
+    fake_prs = _json.dumps([{"number": 12, "url": "https://github.com/x/y/pull/12"}])
+    fake_comments = _json.dumps(
+        {
+            "comments": [
+                {"body": "Just a discussion comment.", "author": {"login": "alice"}},
+                {
+                    "body": bot_body,
+                    "author": {"login": "somebot[bot]"},
+                },
+            ]
+        }
+    )
+    fake_reviews = _json.dumps({"reviews": []})
+
+    def _fake_run(cmd, **kwargs):
+        if "pr" in cmd and "list" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_prs)
+        if "reviews" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_reviews)
+        if "pr" in cmd and "view" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0, stdout=fake_comments)
+        return _subprocess.CompletedProcess(cmd, 0, stdout="")
+
+    monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
+
+    pr_url, body = _mod._fetch_pr_info("/fake/repo", "2026-0023-bot")
+    assert "Automated analysis" in body
+
+
+def test_build_revise_kickoff_raises_on_error_body():
+    """ERROR body in tom_findings raises SummonError — never feeds HM error text."""
+    import pytest
+
+    error_body = "## Tom QA — ERROR\n\ncould not produce findings"
+    with pytest.raises(_mod.SummonError) as exc_info:
+        _mod.build_revise_kickoff("Herr Mannkusser", "2026-0023-x", "", error_body)
+    assert "Tom returned an ERROR" in str(exc_info.value)
+
+
+def test_findings_at_file_syntax(tmp_path, monkeypatch):
+    """--findings @/path reads from file and injects as review findings."""
+    import subprocess as _subprocess
+
+    findings_file = tmp_path / "review.txt"
+    findings_file.write_text("blocking: critical null deref on skill.py:77")
+
+    captured: list[str] = []
+
+    def _fake_build(persona_name, item_id, pr_url, findings):
+        captured.append(findings)
+        return "KICKOFF"
+
+    monkeypatch.setattr(_mod, "check_claude_version", lambda: None)
+    monkeypatch.setattr(_mod, "concurrency_check", lambda: None)
+    monkeypatch.setattr(_mod, "list_crew_sessions", lambda: [])
+    monkeypatch.setattr(
+        _mod,
+        "get_persona",
+        lambda _: {
+            "name": "Herr Mannkusser",
+            "role": "builder",
+            "repo_dir": "/fake/repo",
+            "permission_mode": "auto",
+        },
+    )
+    monkeypatch.setattr(_mod, "build_revise_kickoff", _fake_build)
+
+    def _fake_run(cmd, **kwargs):
+        if "cat-file" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0)
+        if "worktree" in cmd and "add" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0)
+        if "fetch" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0)
+        if "new-session" in cmd:
+            return _subprocess.CompletedProcess(cmd, 0)
+        return _subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(_mod, "_record_summon", lambda *a, **k: None)
+    monkeypatch.setattr(_mod, "_cancel_item_watchdogs", lambda *a: None)
+    monkeypatch.setattr(_mod, "_arm_watchdog", lambda *a: None)
+    monkeypatch.setattr(_mod, "_arm_verdict_sweep_if_needed", lambda: None)
+    monkeypatch.setattr(_mod, "capture_rc_url", lambda *a, **k: None)
+    monkeypatch.setattr(_mod, "_post_discord", lambda *a, **k: True)
+
+    rc = _mod.cmd_summon(
+        ["mannkusser", "2026-0023-revise", "--revise", "--findings", f"@{findings_file}"]
+    )
+    assert rc == 0
+    assert len(captured) == 1
+    assert "critical null deref" in captured[0]
