@@ -1,3 +1,6 @@
+# NOTE: Work in progress — not production-ready. See feature/finance-skill-p1 branch.
+# Blocked on Canadian open banking / API access legislation going live before Plaid integration can proceed.
+
 """Finance skill — personal CFO backed by Wealthica + SQLite.
 
 Commands (P1):
