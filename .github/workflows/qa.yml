@@ -228,7 +228,7 @@ jobs:
               {"role": "user", "content": user_content}
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": 8192,
+            "max_tokens": 65536,
           }
 
           # Outer loop: retry the full model call if JSON parse fails (up to _MAX_JSON_ATTEMPTS).
