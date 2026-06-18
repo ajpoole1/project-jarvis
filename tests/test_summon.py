@@ -579,11 +579,11 @@ def test_fetch_pr_info_bot_comment_is_priority_4(monkeypatch):
 
 
 def test_build_revise_kickoff_raises_on_error_body():
-    """ERROR body in tom_findings raises SystemExit — never feeds HM error text."""
+    """ERROR body in tom_findings raises SummonError — never feeds HM error text."""
     import pytest
 
     error_body = "## Tom QA — ERROR\n\ncould not produce findings"
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises(_mod.SummonError) as exc_info:
         _mod.build_revise_kickoff("Herr Mannkusser", "2026-0023-x", "", error_body)
     assert "Tom returned an ERROR" in str(exc_info.value)
 

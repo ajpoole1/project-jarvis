@@ -96,6 +96,10 @@ WATCHDOG_CHECKS = [5, 15, 30]
 _LOCAL_TZ = ZoneInfo("America/Toronto")
 
 
+class SummonError(Exception):
+    pass
+
+
 # ── roster parser ─────────────────────────────────────────────────────────────
 
 
@@ -289,7 +293,7 @@ def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
             state = r.get("state", "").upper()
             if state not in ("CHANGES_REQUESTED", "APPROVED"):
                 continue
-            body = r.get("body", "")
+            body = r.get("body") or ""
             if _is_error_body(body):
                 print(
                     f"summon --revise: skipping PR review (state={state}) — ERROR body",
@@ -300,7 +304,7 @@ def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
 
         # Priority 2: latest comment starting with ## Tom QA
         for c in reversed(all_comments):
-            body = c.get("body", "")
+            body = c.get("body") or ""
             if not body.startswith("## Tom QA"):
                 continue
             if _is_error_body(body):
@@ -313,7 +317,7 @@ def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
 
         # Priority 3: latest comment containing ## QA, blocking, FAIL, or PASS
         for c in reversed(all_comments):
-            body = c.get("body", "")
+            body = c.get("body") or ""
             if not re.search(r"(## QA|blocking|FAIL|PASS)", body):
                 continue
             if _is_error_body(body):
@@ -330,7 +334,7 @@ def _fetch_pr_info(repo_dir: str, item_id: str) -> tuple[str, str]:
             login = author.get("login", "") if isinstance(author, dict) else str(author)
             if "[bot]" not in login:
                 continue
-            body = c.get("body", "")
+            body = c.get("body") or ""
             if _is_error_body(body):
                 print(
                     "summon --revise: skipping [bot] comment — ERROR body",
@@ -392,7 +396,7 @@ def build_revise_kickoff(persona_name: str, item_id: str, pr_url: str, tom_findi
     Raises SystemExit if tom_findings is an ERROR body — never feed HM error text as notes.
     """
     if tom_findings and _is_error_body(tom_findings):
-        raise SystemExit(_REVISE_ERROR_MSG)
+        raise SummonError(_REVISE_ERROR_MSG)
     spec_path = f"{DEVNOTES_QUEUE}/{item_id}.md"
     if tom_findings:
         findings_summary = (tom_findings[:2000] + "…") if len(tom_findings) > 2000 else tom_findings
@@ -547,7 +551,7 @@ def _comment_identity(comment: dict) -> str:
     node_id = comment.get("id", "").strip()
     if node_id:
         return node_id
-    body = comment.get("body", "")
+    body = comment.get("body") or ""
     return "hash:" + hashlib.sha256(body.encode()).hexdigest()[:16]
 
 
@@ -689,7 +693,7 @@ def _fetch_active_verdict(
         summoned_dt = _parse_iso(summoned_at)
         tom_after_summon = []
         for c in cdata.get("comments", []):
-            if "## Tom QA" not in c.get("body", ""):
+            if "## Tom QA" not in (c.get("body") or ""):
                 continue
             created_dt = _parse_iso(c.get("createdAt", ""))
             if summoned_dt and created_dt and created_dt <= summoned_dt:
@@ -701,7 +705,7 @@ def _fetch_active_verdict(
 
         latest = tom_after_summon[-1]  # gh returns in chronological order
         comment_id = _comment_identity(latest)
-        comment_body = latest.get("body", "")
+        comment_body = latest.get("body") or ""
         verdict = _classify_verdict(comment_body)
         return pr_state, pr_url, verdict, comment_id, comment_body, False
     except FileNotFoundError:
@@ -1108,26 +1112,30 @@ def cmd_summon(args: list[str]) -> int:
     # as a POSITIONAL prompt — the interactive RC session auto-submits it on startup.
     # No tmux send-keys: every argument is shell-quoted into one sh -c string.
     if revise:
-        if explicit_findings is not None:
-            kickoff = build_revise_kickoff(persona["name"], item_id, "", explicit_findings)
-        else:
-            pr_url, tom_findings = _fetch_pr_info(repo_dir, item_id)
-            if not tom_findings:
-                if not pr_url:
-                    print(
-                        f"summon --revise: no open PR found for feature/{item_id}. "
-                        "Use --findings to inject findings directly.",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(
-                        "summon --revise: no review-shaped comment or PR review found. "
-                        "Use --findings to inject a stand-in review, "
-                        "or wait for Tom to produce a verdict.",
-                        file=sys.stderr,
-                    )
-                return 1
-            kickoff = build_revise_kickoff(persona["name"], item_id, pr_url, tom_findings)
+        try:
+            if explicit_findings is not None:
+                kickoff = build_revise_kickoff(persona["name"], item_id, "", explicit_findings)
+            else:
+                pr_url, tom_findings = _fetch_pr_info(repo_dir, item_id)
+                if not tom_findings:
+                    if not pr_url:
+                        print(
+                            f"summon --revise: no open PR found for feature/{item_id}. "
+                            "Use --findings to inject findings directly.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "summon --revise: no review-shaped comment or PR review found. "
+                            "Use --findings to inject a stand-in review, "
+                            "or wait for Tom to produce a verdict.",
+                            file=sys.stderr,
+                        )
+                    return 1
+                kickoff = build_revise_kickoff(persona["name"], item_id, pr_url, tom_findings)
+        except SummonError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     else:
         kickoff = build_kickoff(persona["name"], item_id)
 
