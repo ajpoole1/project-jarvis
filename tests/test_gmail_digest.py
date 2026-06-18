@@ -132,3 +132,115 @@ def test_cmd_digest_non_empty_clears_queue():
     with patch.object(skill, "init_db", return_value=con):
         skill.cmd_digest()
     assert _read_queue(con) == [], "non-empty digest must clear digest_queue"
+
+
+# ---------------------------------------------------------------------------
+# Bug A — pending label_ids_json round-trip (DEV_NOTES #59a)
+# ---------------------------------------------------------------------------
+
+
+def _make_pending_db():
+    """In-memory DB with the tables needed for save_pending / load_pending."""
+    con = sqlite3.connect(":memory:")
+    con.execute("""
+        CREATE TABLE gmail_pending_actions (
+            msg_id          TEXT PRIMARY KEY,
+            sender_email    TEXT NOT NULL,
+            sender_display  TEXT NOT NULL,
+            subject         TEXT NOT NULL,
+            action          TEXT NOT NULL,
+            tag             TEXT NOT NULL DEFAULT 'none',
+            reason          TEXT,
+            staged_at       TEXT DEFAULT (datetime('now')),
+            label_ids_json  TEXT NOT NULL DEFAULT '[]'
+        )
+    """)
+    return con
+
+
+def test_save_pending_persists_label_ids():
+    """save_pending must serialise current_label_ids into label_ids_json."""
+    con = _make_pending_db()
+    summary = skill.EmailSummary(
+        msg_id="msg1",
+        sender="Sender",
+        sender_email="sender@example.com",
+        subject="Test",
+        action="archive",
+        reason="test",
+        tag="receipts",
+        current_label_ids=["INBOX", "Label_none_id"],
+    )
+    skill.save_pending(con, [summary])
+    row = con.execute(
+        "SELECT label_ids_json FROM gmail_pending_actions WHERE msg_id = 'msg1'"
+    ).fetchone()
+    assert row is not None
+    assert json.loads(row[0]) == ["INBOX", "Label_none_id"]
+
+
+def test_load_pending_restores_label_ids():
+    """load_pending must deserialise label_ids_json back into current_label_ids."""
+    con = _make_pending_db()
+    con.execute(
+        "INSERT INTO gmail_pending_actions"
+        " (msg_id, sender_email, sender_display, subject, action, tag, reason, label_ids_json)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("msg2", "s@e.com", "S", "Subj", "archive", "receipts", "", '["INBOX","Label_none"]'),
+    )
+    con.commit()
+    summaries = skill.load_pending(con)
+    assert len(summaries) == 1
+    assert summaries[0].current_label_ids == ["INBOX", "Label_none"]
+
+
+def test_load_pending_missing_column_falls_back_to_empty():
+    """load_pending on a DB without label_ids_json must not crash (migration guard)."""
+    con = sqlite3.connect(":memory:")
+    con.execute("""
+        CREATE TABLE gmail_pending_actions (
+            msg_id          TEXT PRIMARY KEY,
+            sender_email    TEXT NOT NULL,
+            sender_display  TEXT NOT NULL,
+            subject         TEXT NOT NULL,
+            action          TEXT NOT NULL,
+            tag             TEXT NOT NULL DEFAULT 'none',
+            reason          TEXT,
+            staged_at       TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    con.execute(
+        "INSERT INTO gmail_pending_actions"
+        " (msg_id, sender_email, sender_display, subject, action, tag)"
+        " VALUES ('m1','s@e.com','S','Sub','archive','receipts')"
+    )
+    con.commit()
+    # ALTER-table migration adds the column; simulate that it ran
+    con.execute(
+        "ALTER TABLE gmail_pending_actions ADD COLUMN label_ids_json TEXT NOT NULL DEFAULT '[]'"
+    )
+    con.commit()
+    summaries = skill.load_pending(con)
+    assert summaries[0].current_label_ids == []
+
+
+# ---------------------------------------------------------------------------
+# Bug B — tier-1 prompt routes uncertain to 'none', not 'other' (DEV_NOTES #58)
+# ---------------------------------------------------------------------------
+
+
+def test_tier1_prompt_instructs_none_for_uncertain():
+    """The tier-1 system prompt must instruct the LLM to use 'none' for uncertain items."""
+    prompt = skill._build_classifier_system_prompt("receipts: purchase emails", "", "")
+    assert "none" in prompt.lower()
+    assert "uncertain" in prompt.lower()
+
+
+def test_tier1_prompt_does_not_assign_other_directly():
+    """The tier-1 prompt must NOT tell the LLM to freely assign 'other' — tier-2 does that."""
+    prompt = skill._build_classifier_system_prompt("receipts: purchase emails", "", "")
+    assert (
+        "do not assign 'other' directly" in prompt.lower()
+        or "do not assign other directly" in prompt.lower()
+        or "only by tier-2" in prompt.lower()
+    )

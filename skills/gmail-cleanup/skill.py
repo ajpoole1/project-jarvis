@@ -269,9 +269,17 @@ def init_db():
             action          TEXT NOT NULL,
             tag             TEXT NOT NULL DEFAULT 'none',
             reason          TEXT,
-            staged_at       TEXT DEFAULT (datetime('now'))
+            staged_at       TEXT DEFAULT (datetime('now')),
+            label_ids_json  TEXT NOT NULL DEFAULT '[]'
         )
     """)
+    try:
+        con.execute(
+            "ALTER TABLE gmail_pending_actions ADD COLUMN label_ids_json TEXT NOT NULL DEFAULT '[]'"
+        )
+        con.commit()
+    except Exception:
+        pass  # column already exists
     con.execute("""
         CREATE TABLE IF NOT EXISTS gmail_heartbeat_state (
             key   TEXT PRIMARY KEY,
@@ -481,16 +489,26 @@ def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
     for s in summaries:
         con.execute(
             """INSERT OR REPLACE INTO gmail_pending_actions
-               (msg_id, sender_email, sender_display, subject, action, tag, reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (s.msg_id, s.sender_email, s.sender, s.subject, s.action, s.tag, s.reason),
+               (msg_id, sender_email, sender_display, subject, action, tag, reason, label_ids_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                s.msg_id,
+                s.sender_email,
+                s.sender,
+                s.subject,
+                s.action,
+                s.tag,
+                s.reason,
+                json.dumps(s.current_label_ids),
+            ),
         )
     con.commit()
 
 
 def load_pending(con: sqlite3.Connection) -> list[EmailSummary]:
     rows = con.execute(
-        "SELECT msg_id, sender_email, sender_display, subject, action, tag, reason FROM gmail_pending_actions"
+        "SELECT msg_id, sender_email, sender_display, subject, action, tag, reason, label_ids_json"
+        " FROM gmail_pending_actions"
     ).fetchall()
     return [
         EmailSummary(
@@ -501,6 +519,7 @@ def load_pending(con: sqlite3.Connection) -> list[EmailSummary]:
             action=r[4],
             tag=r[5],
             reason=r[6] or "",
+            current_label_ids=json.loads(r[7] or "[]"),
         )
         for r in rows
     ]
@@ -692,6 +711,40 @@ def fetch_calendar_context(days: int = 30) -> str:
         return ""
 
 
+def _build_classifier_system_prompt(
+    tag_definitions: str,
+    priority_rules: str,
+    calendar_context: str = "",
+) -> str:
+    parts = ["Classify each email as one of: archive, trash, unsubscribe, keep.\n"]
+    if calendar_context:
+        parts.append(calendar_context + "\n")
+    parts.append(
+        "Rules:\n"
+        "- keep: personal correspondence from real people, financial alerts (low balance, fraud, CRA/tax), health/medical, travel bookings, anything related to the user's family\n"
+        "- archive: invoices, receipts, billing statements, order confirmations, shipping/delivery notifications, and purchase receipts from any retailer or marketplace (Amazon, Shopify, etc.) — tag these as receipts; also archive account statements\n"
+        "- archive: job applications, application confirmations, recruiter outreach, interview invitations, hiring process emails — tag these as job-search\n"
+        "- unsubscribe: marketing/promotional email, retail sale announcements, newsletters the user did not explicitly request\n"
+        '- trash: spam, irrelevant bulk mail, duplicate notifications, automated alerts with no action required; gamification/rewards emails ("you\'ve earned points", "you\'ve earned sparkles", "reward available", loyalty program fluff with no transaction detail); ANY email from a retailer or vendor that does not contain a specific order number, tracking number, or account-specific transaction detail — generic "sale", "new arrivals", "don\'t miss out" emails from stores are always trash even if the store is known\n'
+    )
+    if priority_rules:
+        parts.append(f"\n{priority_rules}\n")
+    parts.append(
+        "\nAPPOINTMENT RULE:\n"
+        "- If the email is marked [ICS attached], the calendar event was automatically imported — archive it, tag=job-search if interview-related, do NOT set calendar_hint.\n"
+        "- If the email subject or preview references an appointment already listed in the calendar context above, archive it — it is already saved, do NOT set calendar_hint.\n"
+        "- If the email is appointment-related but no matching event appears in the calendar, keep it AND set calendar_hint: true.\n"
+        "- Only set calendar_hint: true when there is genuinely no matching event in the calendar — avoid flagging confirmations for events that are already there.\n"
+        f"\nAlso assign a topic tag. Tag definitions:\n{tag_definitions}\n"
+        "  none: use for ANY email where you are uncertain — these get body-depth review by tier-2; prefer 'none' over guessing wrong\n"
+        "  NOTE: do NOT assign 'other' directly — 'other' is the permanent catch-all assigned only by tier-2 after body inspection; assign 'none' instead when uncertain\n"
+        "\nSet uncertain: true if you genuinely cannot determine the correct action and want a human to decide.\n"
+        "\nRespond with a JSON array, one object per email, in the same order:\n"
+        '[{"action": "keep", "tag": "health", "reason": "brief reason", "calendar_hint": true, "uncertain": false}, ...]'
+    )
+    return "\n".join(parts)
+
+
 def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSummary]:
     client = anthropic.Anthropic()
     results = []
@@ -749,36 +802,9 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
     priority_rules = _build_priority_rules()
     tag_definitions = _build_tag_definitions(con)
 
-    def _build_system_prompt() -> str:
-        parts = ["Classify each email as one of: archive, trash, unsubscribe, keep.\n"]
-        if calendar_context:
-            parts.append(calendar_context + "\n")
-        parts.append(
-            "Rules:\n"
-            "- keep: personal correspondence from real people, financial alerts (low balance, fraud, CRA/tax), health/medical, travel bookings, anything related to the user's family\n"
-            "- archive: invoices, receipts, billing statements, order confirmations, shipping/delivery notifications, and purchase receipts from any retailer or marketplace (Amazon, Shopify, etc.) — tag these as receipts; also archive account statements\n"
-            "- archive: job applications, application confirmations, recruiter outreach, interview invitations, hiring process emails — tag these as job-search\n"
-            "- unsubscribe: marketing/promotional email, retail sale announcements, newsletters the user did not explicitly request\n"
-            '- trash: spam, irrelevant bulk mail, duplicate notifications, automated alerts with no action required; gamification/rewards emails ("you\'ve earned points", "you\'ve earned sparkles", "reward available", loyalty program fluff with no transaction detail); ANY email from a retailer or vendor that does not contain a specific order number, tracking number, or account-specific transaction detail — generic "sale", "new arrivals", "don\'t miss out" emails from stores are always trash even if the store is known\n'
-        )
-        if priority_rules:
-            parts.append(f"\n{priority_rules}\n")
-        parts.append(
-            "\nAPPOINTMENT RULE:\n"
-            "- If the email is marked [ICS attached], the calendar event was automatically imported — archive it, tag=job-search if interview-related, do NOT set calendar_hint.\n"
-            "- If the email subject or preview references an appointment already listed in the calendar context above, archive it — it is already saved, do NOT set calendar_hint.\n"
-            "- If the email is appointment-related but no matching event appears in the calendar, keep it AND set calendar_hint: true.\n"
-            "- Only set calendar_hint: true when there is genuinely no matching event in the calendar — avoid flagging confirmations for events that are already there.\n"
-            f"\nAlso assign a tag — use 'none' only as a last resort (it is a temporary queue, not a real category). "
-            f"Use 'other' for emails that don't fit any specific tag below. Tag definitions:\n{tag_definitions}\n"
-            "  none: only if the email genuinely does not fit any category AND you want it reviewed by the tier-2 classifier\n"
-            "\nSet uncertain: true if you genuinely cannot determine the correct action and want a human to decide.\n"
-            "\nRespond with a JSON array, one object per email, in the same order:\n"
-            '[{"action": "keep", "tag": "health", "reason": "brief reason", "calendar_hint": true, "uncertain": false}, ...]'
-        )
-        return "\n".join(parts)
-
-    system_prompt = _build_system_prompt()
+    system_prompt = _build_classifier_system_prompt(
+        tag_definitions, priority_rules, calendar_context
+    )
 
     for chunk_start in range(0, len(uncached), CLASSIFY_CHUNK):
         chunk = uncached[chunk_start : chunk_start + CLASSIFY_CHUNK]

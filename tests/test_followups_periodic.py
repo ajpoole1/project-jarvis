@@ -44,7 +44,8 @@ def _make_db() -> sqlite3.Connection:
             resolution       TEXT,
             knowledge_target TEXT,
             source           TEXT NOT NULL DEFAULT 'explicit',
-            thread_id        TEXT
+            thread_id        TEXT,
+            cadence_spec     TEXT
         )
     """)
     conn.execute("""
@@ -186,3 +187,103 @@ def test_persistent_rearms_with_anchor():
     assert next_trigger > now
     expected = intended + timedelta(days=3)
     assert abs((next_trigger - expected).total_seconds()) < 5
+
+
+# ---------------------------------------------------------------------------
+# Bug D — cadence_spec weekday-anchor (DEV_NOTES #45)
+# ---------------------------------------------------------------------------
+
+
+def _insert_periodic_with_spec(
+    conn: sqlite3.Connection,
+    trigger_at: datetime,
+    cadence: int = 7,
+    cadence_spec: str | None = None,
+) -> int:
+    cur = conn.execute(
+        """INSERT INTO follow_ups
+           (created_at, subject, prompt, policy, trigger_at, cadence, status, cadence_spec)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            datetime.now(UTC).isoformat(),
+            "Friday check-in",
+            "How was your week?",
+            "periodic",
+            trigger_at.isoformat(),
+            cadence,
+            "pending",
+            cadence_spec,
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def _get_weekday_utc(conn: sqlite3.Connection, row_id: int) -> int:
+    """Return the weekday (0=Mon … 6=Sun) of the stored trigger_at in local time."""
+    from zoneinfo import ZoneInfo
+
+    row = conn.execute("SELECT trigger_at FROM follow_ups WHERE id = ?", (row_id,)).fetchone()
+    dt = datetime.fromisoformat(row[0])
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(ZoneInfo("America/Toronto")).weekday()
+
+
+def test_cadence_spec_friday_rearms_to_friday():
+    """Weekly Friday cadence_spec must always re-arm on a Friday regardless of when it fires."""
+    conn = _make_db()
+    now = datetime.now(UTC)
+    # Trigger set to some time in the past (simulates a missed/late fire)
+    intended = now - timedelta(days=3)
+    row_id = _insert_periodic_with_spec(conn, intended, cadence=7, cadence_spec="weekly@fri@21:00")
+
+    _mod._mark_surfaced(conn, row_id, "periodic", 7, intended.isoformat(), "weekly@fri@21:00")
+
+    next_trigger = _get_trigger_at(conn, row_id)
+    assert next_trigger > now, "next trigger must be in the future"
+    assert _get_weekday_utc(conn, row_id) == 4, "next trigger must be a Friday (weekday=4)"
+
+
+def test_cadence_spec_monday_rearms_to_monday():
+    """Weekly Monday cadence_spec must always re-arm on a Monday."""
+    conn = _make_db()
+    now = datetime.now(UTC)
+    intended = now - timedelta(days=5)
+    row_id = _insert_periodic_with_spec(conn, intended, cadence=7, cadence_spec="weekly@mon@20:30")
+
+    _mod._mark_surfaced(conn, row_id, "periodic", 7, intended.isoformat(), "weekly@mon@20:30")
+
+    next_trigger = _get_trigger_at(conn, row_id)
+    assert next_trigger > now
+    assert _get_weekday_utc(conn, row_id) == 0, "next trigger must be a Monday (weekday=0)"
+
+
+def test_cadence_spec_late_fire_stays_on_weekday():
+    """A late fire with cadence_spec must not drift the weekday — fires Tuesday, still re-arms to Friday."""
+    conn = _make_db()
+    now = datetime.now(UTC)
+    # Simulate firing 3 days after the intended Friday
+    row_id = _insert_periodic_with_spec(
+        conn, now - timedelta(hours=1), cadence=7, cadence_spec="weekly@fri@21:00"
+    )
+
+    _mod._mark_surfaced(
+        conn, row_id, "periodic", 7, (now - timedelta(hours=1)).isoformat(), "weekly@fri@21:00"
+    )
+
+    assert _get_weekday_utc(conn, row_id) == 4, "must re-arm to Friday even when fired late"
+
+
+def test_cadence_spec_none_falls_back_to_day_count_anchor():
+    """When cadence_spec is None, the existing anchor-from-trigger_at logic must run unchanged."""
+    conn = _make_db()
+    now = datetime.now(UTC)
+    intended = now - timedelta(days=6)
+    row_id = _insert_periodic_with_spec(conn, intended, cadence=7, cadence_spec=None)
+
+    _mod._mark_surfaced(conn, row_id, "periodic", 7, intended.isoformat(), None)
+
+    next_trigger = _get_trigger_at(conn, row_id)
+    expected = intended + timedelta(days=7)
+    assert abs((next_trigger - expected).total_seconds()) < 5, "day-count anchor must still work"

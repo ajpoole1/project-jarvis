@@ -462,8 +462,9 @@ def _cal_set_notes(event_id: str, text: str) -> str | None:
 # Section header prefix in the canonical Jarvis-written note format
 _SECTION_PREFIX = "🛒"
 
-# Trailing qty: "item ×2" or "item x2" (case-insensitive)
-_TRAILING_QTY_RE = re.compile(r"^(.+?)\s*[×xX](\S+)\s*$")
+# Trailing qty: "item ×2", "item x2", "item ×3 lb", "item ×500 g" — explicit digit pattern
+# handles unit-bearing qtys; \S+ would stop at the space before the unit suffix.
+_TRAILING_QTY_RE = re.compile(r"^(.+?)\s*[×xX](\d+(?:\.\d+)?(?:\s*[a-zA-Z]+)?)\s*$")
 
 # Leading qty: "2 item" or "500g item" — leading token is digit(s) with optional unit
 _LEADING_QTY_RE = re.compile(

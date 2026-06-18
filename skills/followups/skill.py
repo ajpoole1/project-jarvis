@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
@@ -49,6 +50,29 @@ POLICIES = ("check_once", "periodic", "persistent", "passive")
 # ---------------------------------------------------------------------------
 
 
+_DOW_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+_CADENCE_SPEC_RE = re.compile(r"^weekly@([a-z]+)@(\d{1,2}):(\d{2})$", re.IGNORECASE)
+
+
+def _next_weekday_trigger(cadence_spec: str) -> datetime:
+    """Compute the next UTC trigger time from a weekly@DOW@HH:MM spec."""
+    m = _CADENCE_SPEC_RE.match(cadence_spec)
+    if not m:
+        raise ValueError(f"Invalid cadence_spec: {cadence_spec!r}")
+    dow_str = m.group(1).lower()
+    if dow_str not in _DOW_MAP:
+        raise ValueError(f"Unknown day of week: {dow_str!r}")
+    target_dow = _DOW_MAP[dow_str]
+    h, mn = int(m.group(2)), int(m.group(3))
+    local = _now_local()
+    candidate = local.replace(hour=h, minute=mn, second=0, microsecond=0)
+    days_ahead = (target_dow - candidate.weekday()) % 7
+    if days_ahead == 0 and candidate <= local:
+        days_ahead = 7
+    candidate += timedelta(days=days_ahead)
+    return candidate.astimezone(UTC)
+
+
 def _init_db() -> sqlite3.Connection:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(_DB_PATH))
@@ -70,9 +94,15 @@ def _init_db() -> sqlite3.Connection:
             resolution       TEXT,
             knowledge_target TEXT,
             source           TEXT NOT NULL DEFAULT 'explicit',
-            thread_id        TEXT
+            thread_id        TEXT,
+            cadence_spec     TEXT
         )
     """)
+    try:
+        conn.execute("ALTER TABLE follow_ups ADD COLUMN cadence_spec TEXT")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jarvis_kv (
             key   TEXT PRIMARY KEY,
@@ -180,6 +210,7 @@ def _mark_surfaced(
     policy: str,
     cadence: int | None,
     trigger_at_iso: str | None = None,
+    cadence_spec: str | None = None,
 ) -> None:
     now_iso = _now_utc().isoformat()
     if policy == "check_once":
@@ -190,23 +221,29 @@ def _mark_surfaced(
             (now_iso, row_id),
         )
     else:
-        # periodic / persistent: re-arm anchored to the intended cadence, not now+cadence.
-        # This prevents drift when a fire is late: a weekly Monday intention that fires
-        # Tuesday re-arms to next Monday, not next Tuesday.
-        cadence_days = cadence or (7 if policy == "periodic" else 3)
-        if trigger_at_iso:
+        # periodic / persistent: re-arm to the next scheduled occurrence.
+        # cadence_spec (weekly@DOW@HH:MM) takes priority — drift-proof weekday anchor.
+        # Falls back to day-count anchor from original trigger_at, then now+cadence.
+        if cadence_spec:
             try:
-                anchor = datetime.fromisoformat(trigger_at_iso)
-                if anchor.tzinfo is None:
-                    anchor = anchor.replace(tzinfo=UTC)
-                next_trigger_dt = anchor
-                while next_trigger_dt <= _now_utc():
-                    next_trigger_dt += timedelta(days=cadence_days)
-                next_trigger = next_trigger_dt.isoformat()
+                next_trigger = _next_weekday_trigger(cadence_spec).isoformat()
             except ValueError:
-                next_trigger = (_now_utc() + timedelta(days=cadence_days)).isoformat()
+                next_trigger = (_now_utc() + timedelta(days=cadence or 7)).isoformat()
         else:
-            next_trigger = (_now_utc() + timedelta(days=cadence_days)).isoformat()
+            cadence_days = cadence or (7 if policy == "periodic" else 3)
+            if trigger_at_iso:
+                try:
+                    anchor = datetime.fromisoformat(trigger_at_iso)
+                    if anchor.tzinfo is None:
+                        anchor = anchor.replace(tzinfo=UTC)
+                    next_trigger_dt = anchor
+                    while next_trigger_dt <= _now_utc():
+                        next_trigger_dt += timedelta(days=cadence_days)
+                    next_trigger = next_trigger_dt.isoformat()
+                except ValueError:
+                    next_trigger = (_now_utc() + timedelta(days=cadence_days)).isoformat()
+            else:
+                next_trigger = (_now_utc() + timedelta(days=cadence_days)).isoformat()
         conn.execute(
             """UPDATE follow_ups
                SET surface_count = surface_count + 1, last_surfaced_at = ?,
@@ -222,7 +259,8 @@ def _mark_surfaced(
 # ---------------------------------------------------------------------------
 
 _ELIGIBLE_SQL = """
-    SELECT id, subject, prompt, policy, window_until, priority, surface_count, cadence, trigger_at
+    SELECT id, subject, prompt, policy, window_until, priority, surface_count, cadence, trigger_at,
+           cadence_spec
     FROM follow_ups
     WHERE status = 'pending'
       AND policy != 'passive'
@@ -302,6 +340,14 @@ def cmd_add(args: list[str]) -> None:
     elif policy == "persistent":
         cadence = 3
 
+    cadence_spec: str | None = params.get("cadence_spec") or None
+    if cadence_spec and not _CADENCE_SPEC_RE.match(cadence_spec):
+        print(
+            "Error: --cadence-spec must be weekly@DOW@HH:MM (e.g. weekly@fri@21:00)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     priority = int(params.get("priority", "5"))
     knowledge_target = params.get("knowledge_target") or None
     source = params.get("source", "explicit")
@@ -312,8 +358,8 @@ def cmd_add(args: list[str]) -> None:
         cur = conn.execute(
             """INSERT INTO follow_ups
                (created_at, subject, prompt, policy, trigger_at, window_until,
-                cadence, priority, knowledge_target, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                cadence, priority, knowledge_target, source, cadence_spec)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 now_iso,
                 subject,
@@ -325,6 +371,7 @@ def cmd_add(args: list[str]) -> None:
                 priority,
                 knowledge_target,
                 source,
+                cadence_spec,
             ),
         )
         conn.commit()
@@ -424,6 +471,7 @@ def cmd_due(args: list[str]) -> None:
                 "priority": r[5],
                 "surface_count": r[6],
                 "cadence": r[7],
+                "cadence_spec": r[9],
             }
             for r in rows
         ]
@@ -440,13 +488,14 @@ def cmd_surface(args: list[str]) -> None:
     conn = _init_db()
     try:
         row = conn.execute(
-            "SELECT policy, cadence, trigger_at FROM follow_ups WHERE id = ? AND status = 'pending'",
+            "SELECT policy, cadence, trigger_at, cadence_spec FROM follow_ups"
+            " WHERE id = ? AND status = 'pending'",
             (row_id,),
         ).fetchone()
         if not row:
             print(f"No pending follow-up with id={row_id}", file=sys.stderr)
             sys.exit(1)
-        _mark_surfaced(conn, row_id, row[0], row[1], row[2])
+        _mark_surfaced(conn, row_id, row[0], row[1], row[2], row[3])
         print(json.dumps({"id": row_id, "status": "surfaced"}))
     finally:
         conn.close()
@@ -613,12 +662,63 @@ def cmd_fire(args: list[str]) -> None:
         if not rows:
             return
 
-        row_id, subject, prompt_text, policy, _, _, _, cadence, trigger_at_iso = rows[0]
+        row_id, subject, prompt_text, policy, _, _, _, cadence, trigger_at_iso, cadence_spec = rows[
+            0
+        ]
 
-        _mark_surfaced(conn, row_id, policy, cadence, trigger_at_iso)
+        _mark_surfaced(conn, row_id, policy, cadence, trigger_at_iso, cadence_spec)
         _increment_budget(conn)
 
         print(prompt_text)
+    finally:
+        conn.close()
+
+
+def cmd_anchor_weekday(args: list[str]) -> None:
+    """
+    anchor-weekday <id> weekly@DOW@HH:MM
+
+    Migrate a periodic followup to weekday-anchored cadence. Resets trigger_at
+    to the next correct weekday occurrence. Safe to run multiple times.
+    """
+    if len(args) < 2:
+        print("Usage: anchor-weekday <id> weekly@DOW@HH:MM", file=sys.stderr)
+        sys.exit(1)
+    try:
+        row_id = int(args[0])
+    except ValueError:
+        print("Error: id must be an integer", file=sys.stderr)
+        sys.exit(1)
+    cadence_spec = args[1]
+    if not _CADENCE_SPEC_RE.match(cadence_spec):
+        print(
+            f"Error: invalid cadence_spec {cadence_spec!r}. Use weekly@DOW@HH:MM",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    conn = _init_db()
+    try:
+        row = conn.execute("SELECT id, subject FROM follow_ups WHERE id = ?", (row_id,)).fetchone()
+        if not row:
+            print(f"No follow-up with id={row_id}", file=sys.stderr)
+            sys.exit(1)
+        next_trigger = _next_weekday_trigger(cadence_spec)
+        conn.execute(
+            "UPDATE follow_ups SET cadence_spec = ?, trigger_at = ? WHERE id = ?",
+            (cadence_spec, next_trigger.isoformat(), row_id),
+        )
+        conn.commit()
+        next_local = next_trigger.astimezone(_LOCAL_TZ).strftime("%A %b %d %H:%M")
+        print(
+            json.dumps(
+                {
+                    "id": row_id,
+                    "subject": row[1],
+                    "cadence_spec": cadence_spec,
+                    "next_trigger": next_local,
+                }
+            )
+        )
     finally:
         conn.close()
 
@@ -634,8 +734,8 @@ def main() -> None:
             "Usage: skill.py <command> [args...]\n"
             "Commands:\n"
             "  add --subject S --prompt P --policy POLICY --trigger-at T\n"
-            "      [--window-until W] [--cadence DAYS] [--priority N]\n"
-            "      [--knowledge-target FILE] [--source explicit|open_loop]\n"
+            "      [--window-until W] [--cadence DAYS] [--cadence-spec weekly@DOW@HH:MM]\n"
+            "      [--priority N] [--knowledge-target FILE] [--source explicit|open_loop]\n"
             "  list [status]\n"
             "  due\n"
             "  surface <id>\n"
@@ -644,7 +744,8 @@ def main() -> None:
             "  snooze <id> <until YYYY-MM-DD[THH:MM]>\n"
             "  reap\n"
             "  ping\n"
-            "  fire",
+            "  fire\n"
+            "  anchor-weekday <id> weekly@DOW@HH:MM",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -663,6 +764,7 @@ def main() -> None:
         "reap": cmd_reap,
         "ping": cmd_ping,
         "fire": cmd_fire,
+        "anchor-weekday": cmd_anchor_weekday,
     }
 
     if cmd not in dispatch:
