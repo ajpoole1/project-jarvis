@@ -66,13 +66,13 @@ def parse_holdings(path: str) -> list[dict]:
                 account_id = _WS_ACCOUNT_MAP.get(acct_code, f"ws-{acct_code}")
                 symbol = row["Symbol"].strip()
                 name = row["Name"].strip()
-                quantity = float(row["Quantity"])
-                market_price = float(row["Market Price"])
+                quantity = _clean_amount(row["Quantity"])
+                market_price = _clean_amount(row["Market Price"])
                 price_currency = row["Market Price Currency"].strip()
                 market_value_native = quantity * market_price
 
-                book_value_cad = float(row["Book Value (CAD)"])
-                book_value_native = float(row["Book Value (Market)"])
+                book_value_cad = _clean_amount(row["Book Value (CAD)"])
+                book_value_native = _clean_amount(row["Book Value (Market)"])
 
                 # Derive CAD market value
                 if price_currency == "CAD":
@@ -254,7 +254,7 @@ def parse_csv_balances(path: str, account_id: str | None = None) -> dict[str, fl
                         aid = f"dsj-ln1-{member_id}"
                     else:
                         continue
-                    date_str = row[0].strip()
+                    date_str = row[3].strip()
                     bal = _clean_amount(row[13])
                     if aid not in best or date_str > best[aid][0]:
                         best[aid] = (date_str, bal)
