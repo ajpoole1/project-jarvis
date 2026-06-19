@@ -140,7 +140,9 @@ def detect_format(path: str) -> str:
         return "mbna"
     if "post date" in headers and ("credit" in headers or "debit" in headers):
         return "rogers"
-    if headers == ["date", "transaction", "description", "amount", "balance", "currency"]:
+    if {"date", "transaction", "description", "amount", "balance", "currency"}.issubset(
+        set(headers)
+    ):
         return "wealthsimple"
 
     # Desjardins: no header, 14 columns, account type in col[2] (PCA or LN1)
@@ -243,10 +245,13 @@ def parse_csv_balances(path: str, account_id: str | None = None) -> dict[str, fl
                 try:
                     acct_type = row[2].strip()
                     member_id = row[1].strip()
+                    # Always derive per-account keys from the row — an explicit
+                    # account_id would collapse PCA+LN1 onto the same key and
+                    # lose one account's balance.
                     if acct_type == "PCA":
-                        aid = account_id or f"dsj-pca-{member_id}"
+                        aid = f"dsj-pca-{member_id}"
                     elif acct_type == "LN1":
-                        aid = account_id or f"dsj-ln1-{member_id}"
+                        aid = f"dsj-ln1-{member_id}"
                     else:
                         continue
                     date_str = row[0].strip()
