@@ -228,7 +228,7 @@ def parse_csv_balances(path: str, account_id: str | None = None) -> dict[str, fl
                         "%Y-%m-%d"
                     )
                     bal = _clean_amount(row[4])
-                    if aid not in best or date_str > best[aid][0]:
+                    if aid not in best or date_str >= best[aid][0]:
                         best[aid] = (date_str, bal)
                 except ValueError:
                     pass
@@ -256,7 +256,7 @@ def parse_csv_balances(path: str, account_id: str | None = None) -> dict[str, fl
                         continue
                     date_str = row[3].strip()
                     bal = _clean_amount(row[13])
-                    if aid not in best or date_str > best[aid][0]:
+                    if aid not in best or date_str >= best[aid][0]:
                         best[aid] = (date_str, bal)
                 except ValueError:
                     pass
@@ -276,7 +276,7 @@ def parse_csv_balances(path: str, account_id: str | None = None) -> dict[str, fl
                 try:
                     date_str = (row.get("date") or "").strip()
                     bal = _clean_amount(row.get("balance", "0"))
-                    if aid not in best or date_str > best[aid][0]:
+                    if aid not in best or date_str >= best[aid][0]:
                         best[aid] = (date_str, bal)
                 except ValueError:
                     pass
