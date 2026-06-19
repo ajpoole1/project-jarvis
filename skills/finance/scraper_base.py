@@ -25,11 +25,14 @@ def _state_path(bank: str) -> Path:
     return _PROFILES_DIR / f"{bank}_state.json"
 
 
-async def ensure_session(bank: str, force_headful: bool = False) -> tuple[object, BrowserContext]:
+async def ensure_session(
+    bank: str, force_headful: bool = False, login_url: str | None = None
+) -> tuple[object, BrowserContext]:
     """Return (playwright_instance, BrowserContext) for the given bank.
 
     If no saved state exists or force_headful is True, launches a headful browser,
-    waits for the user to complete login + MFA, saves the session, then returns.
+    navigates to login_url (if provided), waits for the user to complete login + MFA,
+    saves the session, then returns.
     Caller is responsible for closing playwright_instance when done.
     """
     from playwright.async_api import async_playwright
@@ -41,21 +44,27 @@ async def ensure_session(bank: str, force_headful: bool = False) -> tuple[object
     try:
         if not state_file.exists() or force_headful:
             print(
-                f"[finance scraper] No saved session for {bank}. "
-                "Opening browser for first-time login + MFA."
-            )
-            browser = await pw.chromium.launch(headless=False)
-            context = await browser.new_context()
-            print(
-                f"[finance scraper] Please log in to {bank} and complete MFA, "
-                "then press ENTER here."
+                f"[finance scraper] First-auth mode for {bank}.\n"
+                "  1. Close Chrome completely.\n"
+                '  2. Launch Chrome with: chrome.exe --remote-debugging-port=9222\n'
+                "     (see README for the exact command)\n"
+                f"  3. Navigate to: {login_url or 'your bank login page'}\n"
+                "  4. Log in and complete MFA.\n"
+                "  5. Press ENTER here when done."
             )
             try:
                 with open("/dev/tty") as tty:
                     await asyncio.get_event_loop().run_in_executor(None, tty.readline)
             except OSError:
                 await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
+
+            # Connect to the already-running Chrome via CDP over TCP.
+            # Chrome was launched by the user with --remote-debugging-port=9222.
+            browser = await pw.chromium.connect_over_cdp("http://localhost:9222")
+            contexts = browser.contexts
+            context = contexts[0] if contexts else await browser.new_context()
             await save_session(bank, context)
+            await browser.close()
             return pw, context
         else:
             browser = await pw.chromium.launch(headless=True)

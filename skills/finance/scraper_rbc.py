@@ -24,8 +24,7 @@ from skills.finance.scraper_base import ensure_session, is_auth_expired, save_se
 from skills.finance.scraper_errors import ScraperError, SessionExpiredError
 
 _RBC_LOGIN_URL = (
-    "https://www.rbcroyalbank.com/cgi-bin/rbaccess/rbunxcgi"
-    "?F6=1&F7=IB&F21=IB&F22=IB&REQUEST=ClientSignin&LANGUAGE=ENGLISH"
+    "https://secure.royalbank.com/statics/login-service-ui/index#/full/signin?LANGUAGE=ENGLISH"
 )
 _RBC_SUMMARY_URL = (
     "https://www1.royalbank.com/cgi-bin/rbaccess/rbunxcgi"
@@ -126,7 +125,7 @@ async def fetch_transactions(days: int = 30, force_headful: bool = False) -> lis
     Raises SessionExpiredError if auth has lapsed.
     Raises ScraperError on unrecoverable failure.
     """
-    pw, context = await ensure_session("rbc", force_headful=force_headful)
+    pw, context = await ensure_session("rbc", force_headful=force_headful, login_url=_RBC_LOGIN_URL)
 
     try:
         page = await context.new_page()
