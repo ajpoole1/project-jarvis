@@ -201,36 +201,41 @@ def parse_csv(path: str, account_id: str | None = None) -> list[dict]:
 
 
 def parse_csv_balances(path: str, account_id: str | None = None) -> dict[str, float]:
-    """Return {account_id: last_balance} for each account found in the file.
+    """Return {account_id: latest_balance} for each account found in the file.
 
-    Uses the last row encountered per account (chronologically last in the file)
-    as the most recent balance. Returns empty dict if the format has no balance column.
+    Picks the row with the latest date per account so the result is correct
+    regardless of whether the bank exports oldest-first or newest-first.
+    Returns empty dict if the format has no balance column.
     """
     fmt = detect_format(path)
-    balances: dict[str, float] = {}
+    # {aid: (date_str, balance)} — date_str kept sortable (ISO or padded)
+    best: dict[str, tuple[str, float]] = {}
 
     if fmt == "rbc":
-        # RBC has no balance column — skip
-        return balances
+        return {}
 
     if fmt in ("td_cc", "td_bank"):
-        # col[4] = balance; account_id supplied externally
         aid = account_id or ("td-cc-unknown" if fmt == "td_cc" else "td-bank-unknown")
+        date_fmt = "%m/%d/%Y" if fmt == "td_cc" else "%Y-%m-%d"
         with Path(path).open(newline="", encoding="utf-8-sig") as f:
             for row in csv.reader(f):
-                if len(row) >= 5:
-                    try:
-                        balances[aid] = _clean_amount(row[4])
-                    except ValueError:
-                        pass
-        return balances
+                if len(row) < 5:
+                    continue
+                try:
+                    date_str = datetime.strptime(row[0].strip().strip('"'), date_fmt).strftime(
+                        "%Y-%m-%d"
+                    )
+                    bal = _clean_amount(row[4])
+                    if aid not in best or date_str > best[aid][0]:
+                        best[aid] = (date_str, bal)
+                except ValueError:
+                    pass
+        return {aid: v[1] for aid, v in best.items()}
 
     if fmt == "mbna_new":
-        # MBNA new format has no balance column
-        return balances
+        return {}
 
     if fmt == "desjardins":
-        # col[13] = balance (last column)
         with Path(path).open(newline="", encoding="utf-8-sig") as f:
             for row in csv.reader(f):
                 if len(row) < 14:
@@ -244,10 +249,13 @@ def parse_csv_balances(path: str, account_id: str | None = None) -> dict[str, fl
                         aid = account_id or f"dsj-ln1-{member_id}"
                     else:
                         continue
-                    balances[aid] = _clean_amount(row[13])
+                    date_str = row[0].strip()
+                    bal = _clean_amount(row[13])
+                    if aid not in best or date_str > best[aid][0]:
+                        best[aid] = (date_str, bal)
                 except ValueError:
                     pass
-        return balances
+        return {aid: v[1] for aid, v in best.items()}
 
     if fmt == "wealthsimple":
         filename_stem = Path(path).stem
@@ -261,12 +269,15 @@ def parse_csv_balances(path: str, account_id: str | None = None) -> dict[str, fl
                 if currency != "CAD":
                     continue
                 try:
-                    balances[aid] = _clean_amount(row.get("balance", "0"))
+                    date_str = (row.get("date") or "").strip()
+                    bal = _clean_amount(row.get("balance", "0"))
+                    if aid not in best or date_str > best[aid][0]:
+                        best[aid] = (date_str, bal)
                 except ValueError:
                     pass
-        return balances
+        return {aid: v[1] for aid, v in best.items()}
 
-    return balances
+    return {}
 
 
 # ---------------------------------------------------------------------------
