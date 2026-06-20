@@ -377,10 +377,12 @@ def _get_active_tags(con: sqlite3.Connection) -> list[str]:
 def _build_tag_definitions(con: sqlite3.Connection) -> str:
     """Return a formatted tag-definitions block for the classifier prompt."""
     rows = con.execute(
-        "SELECT name, definition FROM gmail_tags WHERE active = 1 AND name NOT IN ('none') ORDER BY name"
+        "SELECT name, definition FROM gmail_tags WHERE active = 1 AND name NOT IN ('none', 'other') ORDER BY name"
     ).fetchall()
     if not rows:
-        return "\n".join(f"  {name}: {defn}" for name, defn in _DEFAULT_TAGS if name != "none")
+        return "\n".join(
+            f"  {name}: {defn}" for name, defn in _DEFAULT_TAGS if name not in ("none", "other")
+        )
     return "\n".join(f"  {name}: {defn}" for name, defn in rows)
 
 
@@ -844,6 +846,8 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             tag = cls.get("tag", "none")
             if tag not in active_tags:
                 tag = "none"
+            if tag == OTHER_TAG:
+                tag = "none"  # tier-1 must not resolve to catch-all; tier-2 assigns other
             uncertain = bool(cls.get("uncertain", False))
             results.append(
                 EmailSummary(
@@ -1684,6 +1688,10 @@ def _classify_tier2(body: str, subject: str, sender_email: str, real_tags: list[
         "was not classified in the first pass ('none'). Using the full email body, assign it "
         "to the correct existing category, propose a new broad category, or route to the catch-all.\n\n"
         f"Existing categories:\n{tags_block}\n\n"
+        "Project domain signals — always route to the 'projects' tag:\n"
+        "  - plaid.com, info@email.plaid.com — Plaid (finance-management tool)\n"
+        "  - expo.dev, hello@expo.dev — Expo (mobile app dev tool)\n"
+        "  - github.com, notifications@github.com — GitHub developer notifications\n\n"
         "Respond with exactly one of these JSON forms:\n"
         '{"status": "existing_tag", "tag": "<name>", "reason": "<brief>"}\n'
         '{"status": "propose", "proposed_tag": "<broad name>", "definition": "<what it covers>", '
@@ -1781,6 +1789,11 @@ def cmd_drain_none(args: list[str]) -> str:
                     current_label_ids=current_label_ids,
                 )
             )
+            # A1: atomically update any staged pending row so cmd_execute uses the correct tag
+            con.execute(
+                "UPDATE gmail_pending_actions SET tag = ? WHERE msg_id = ?",
+                (tag, msg_id),
+            )
         elif status == "propose":
             proposals.append(
                 {
@@ -1806,6 +1819,11 @@ def cmd_drain_none(args: list[str]) -> str:
                     tag=OTHER_TAG,
                     current_label_ids=current_label_ids,
                 )
+            )
+            # A1: atomically update any staged pending row to catch-all
+            con.execute(
+                "UPDATE gmail_pending_actions SET tag = ? WHERE msg_id = ?",
+                (OTHER_TAG, msg_id),
             )
 
     # Apply resolved tags immediately
