@@ -37,3 +37,21 @@ def make_skip_findings(changed_lines: int, threshold: int) -> dict:
             f"QA skipped — trivial diff ({changed_lines} changed lines, threshold {threshold}). No model call made."
         ],
     }
+
+
+def is_spec_only_diff(diff: str) -> bool:
+    """Return True if every changed file in the diff is a spec/knowledge/doc file."""
+    import re
+
+    SPEC_PATHS = ("knowledge/", "docs/")
+    SPEC_EXTENSIONS = (".spec.md", ".plan.md")
+    changed_files = re.findall(r"^(?:---|\+\+\+) [ab]/(.+)$", diff, re.MULTILINE)
+    if not changed_files:
+        return False
+    real_files = [f for f in changed_files if not f.startswith("/dev/null")]
+    if not real_files:
+        return False
+    return all(
+        any(f.startswith(p) for p in SPEC_PATHS) or any(f.endswith(e) for e in SPEC_EXTENSIONS)
+        for f in real_files
+    )
