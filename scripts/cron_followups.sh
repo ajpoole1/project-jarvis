@@ -46,5 +46,6 @@ fi
 # Guard: skip silently on feature branches — ff-only against main fails there.
 if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "main" ]; then
     git pull --ff-only origin main >> "$PROJECT/logs/deploy.log" 2>&1 || \
-        echo "⚠️ Auto-deploy: git pull --ff-only failed — runtime may be stale. Check logs/deploy.log."
+        echo "⚠️ Auto-deploy: git pull --ff-only failed — runtime may be stale. Check logs/deploy.log." | \
+        python3 "$PROJECT/scripts/discord_post.py"
 fi
