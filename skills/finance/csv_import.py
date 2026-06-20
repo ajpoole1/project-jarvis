@@ -381,10 +381,14 @@ def _rbc_dedup_key(date_str: str, amount: float, description: str) -> str:
     """Dedup key for RBC transactions — canonicalizes all known duplicate description forms.
 
     Handles: Interac purchase variants, payment variants (WWW/ONLINE BANKING),
-    transfer variants (WWW/ONLINE BANKING), and payroll case variants.
-    Shadow 'Email Trfs' rows are deleted post-import by the cleanup script.
+    transfer variants (WWW/ONLINE BANKING), payroll case variants, and e-transfer
+    shadow rows ("Email Trfs E-TRANSFER SENT/RECEIVED" → "E-TRANSFER SENT/RECEIVED").
     """
-    canonical = _rbc_interac_canonical(description)
+    canonical = description
+    m = _RBC_ETRANSFER_SHADOW_PATTERN.match(canonical)
+    if m:
+        canonical = m.group(1)
+    canonical = _rbc_interac_canonical(canonical)
     canonical = _rbc_payment_canonical(canonical)
     canonical = _rbc_transfer_canonical(canonical)
     # Payroll descriptions are case-inconsistent across CSV exports — uppercase to normalize.
