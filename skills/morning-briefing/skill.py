@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -62,6 +63,9 @@ _RAIN_POSSIBLE = 30  # ≥30 → pack rain coat (just in case)
 
 # Sentinel: distinguishes "caller passed no data" from "caller passed None (fetch failed)"
 _UNSPECIFIED: object = object()
+
+# Deadline line regex: matches lines that are due within 3 days (for live state block)
+_DUE_SOON_RE = re.compile(r"— (OVERDUE|due TODAY|due TOMORROW|due in [123]d )")
 
 # Wind speed (kmph) above which "breezy" appears in the conditions note
 _WIND_STRONG = 30
@@ -895,6 +899,121 @@ def _get_dev_crew_standup() -> BriefBlock | None:
 
 
 # ---------------------------------------------------------------------------
+# Live state — write ## Today block to workspace MEMORY.md
+# ---------------------------------------------------------------------------
+
+
+def _parse_calendar_for_state(block: BriefBlock) -> list[str]:
+    """Extract compact 'HH:MM Title' entries from a calendar BriefBlock (up to 5)."""
+    results = []
+    for raw_line in block.detail.split("\n"):
+        line = raw_line.strip().lstrip("•").strip()
+        if not line or line == "Nothing scheduled today.":
+            continue
+        if "·" in line and " — " in line:
+            after_dot = line.split("·", 1)[1].strip()
+            time_part, _, title = after_dot.partition(" — ")
+            results.append(f"{time_part.strip()} {title.strip()}")
+        else:
+            results.append(line)
+    return results[:5]
+
+
+def _parse_gmail_for_state(block: BriefBlock) -> list[str]:
+    """Extract up to 2 bullet thread lines from a gmail priority BriefBlock."""
+    results = []
+    for raw_line in block.detail.split("\n"):
+        line = raw_line.strip()
+        if line.startswith("•"):
+            results.append(line.lstrip("•").strip())
+            if len(results) == 2:
+                break
+    return results
+
+
+def _parse_deadlines_for_state(block: BriefBlock) -> list[str]:
+    """Extract task lines due within 3 days from a deadline BriefBlock."""
+    results = []
+    for raw_line in block.detail.split("\n"):
+        line = raw_line.strip()
+        if line.startswith("•") and _DUE_SOON_RE.search(line):
+            results.append(line.lstrip("•").strip())
+    return results
+
+
+def _replace_today_section(content: str, today_block: str) -> str:
+    """Replace the ## Today section in content, or prepend it if absent."""
+    today_match = re.search(r"^## Today\b", content, re.MULTILINE)
+    if today_match:
+        start = today_match.start()
+        rest = content[today_match.end() :]
+        next_h2 = re.search(r"^## ", rest, re.MULTILINE)
+        if next_h2:
+            return content[:start] + today_block + rest[next_h2.start() :]
+        return content[:start] + today_block
+    first_h2 = re.search(r"^## ", content, re.MULTILINE)
+    if first_h2:
+        return content[: first_h2.start()] + today_block + content[first_h2.start() :]
+    return today_block + content
+
+
+def _write_live_state(
+    calendar_block: BriefBlock | None,
+    gmail_block: BriefBlock | None,
+    deadline_block: BriefBlock | None,
+    weather_block: BriefBlock | None,
+    ellie_block: BriefBlock | None,
+) -> None:
+    """Write a compact ## Today block to workspace MEMORY.md (atomic)."""
+    try:
+        workspace = Path(
+            os.environ.get("JARVIS_WORKSPACE_PATH", "~/.openclaw/workspace")
+        ).expanduser()
+        memory_path = workspace / "memory" / "MEMORY.md"
+
+        now = datetime.now(_TORONTO_TZ)
+        time_str = now.strftime("%H:%M")
+        day_str = now.strftime("%A, %B %-d")
+
+        block_lines: list[str] = ["## Today", "", f"_Refreshed {time_str} EDT — {day_str}_", ""]
+
+        if calendar_block:
+            cal_entries = _parse_calendar_for_state(calendar_block)
+            if cal_entries:
+                block_lines.append("- **Calendar:** " + " · ".join(cal_entries[:5]))
+
+        if ellie_block:
+            ellie_text = ellie_block.detail.replace("👶 **Ellie:** ", "").rstrip(".")
+            block_lines.append(f"- **Ellie:** {ellie_text}")
+
+        if gmail_block:
+            threads = _parse_gmail_for_state(gmail_block)
+            inbox_val = " · ".join(threads[:2]) if threads else "clear"
+            block_lines.append(f"- **Inbox:** {inbox_val}")
+
+        if deadline_block:
+            due_items = _parse_deadlines_for_state(deadline_block)
+            if due_items:
+                block_lines.append("- **Due soon:** " + " · ".join(due_items))
+
+        block_lines.append("")
+        today_block = "\n".join(block_lines) + "\n"
+
+        if memory_path.exists():
+            existing = memory_path.read_text()
+            new_content = _replace_today_section(existing, today_block)
+        else:
+            new_content = today_block
+
+        tmp = memory_path.with_suffix(".tmp")
+        tmp.write_text(new_content)
+        os.replace(tmp, memory_path)
+
+    except Exception as e:  # noqa: BLE001
+        print(f"[briefing] warning: failed to write live state: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -910,21 +1029,26 @@ def run() -> list[str]:
     # Single weather fetch — shared with the Ellie dress block (no duplicate HTTP call)
     weather_data = _fetch_wttr_data()
 
-    # Gather body blocks
-    blocks: list[BriefBlock] = []
-    for fn in (
-        _get_calendar,
-        _get_deadlines,
-        _get_gmail_priority,
-        _get_dev_crew_standup,
-    ):
-        block = fn()
-        if block:
-            blocks.append(block)
+    # Gather body blocks — capture named references for live-state write
+    calendar_block = _get_calendar()
+    deadline_block = _get_deadlines()
+    gmail_block = _get_gmail_priority()
+    dev_block = _get_dev_crew_standup()
+    weather_block = _get_weather(weather_data)
+    ellie_block = _get_ellie_dress(weather_data, today)
 
-    for block in (_get_weather(weather_data), _get_ellie_dress(weather_data, today)):
-        if block:
-            blocks.append(block)
+    blocks = [
+        b
+        for b in [
+            calendar_block,
+            deadline_block,
+            gmail_block,
+            dev_block,
+            weather_block,
+            ellie_block,
+        ]
+        if b
+    ]
 
     # msg1 — composed brief
     msg1 = (
@@ -940,6 +1064,8 @@ def run() -> list[str]:
     # msg3 — reads coda (separate section, profile-gated)
     reads_block = _get_reads_coda(client, profile)
     msg3 = reads_block.detail if reads_block else ""
+
+    _write_live_state(calendar_block, gmail_block, deadline_block, weather_block, ellie_block)
 
     return [m for m in [msg1, msg2, msg3] if m]
 
