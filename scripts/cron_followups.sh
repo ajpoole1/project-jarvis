@@ -28,6 +28,13 @@ if [ -f "$HOME/.jarvis.env" ]; then
     done < "$HOME/.jarvis.env"
 fi
 
+# Auto-deploy: fast-forward runtime checkout to main on each tick.
+if git pull --ff-only origin main >> "$PROJECT/logs/deploy.log" 2>&1; then
+    : # already up-to-date or pulled cleanly — silent
+else
+    echo "⚠️ Auto-deploy: git pull --ff-only failed — runtime may be stale. Check logs/deploy.log."
+fi
+
 # Reap expired window_until watches — no output unless something lapsed
 python3 "$PROJECT/skills/followups/skill.py" reap 2>>"$PROJECT/logs/cron.log"
 

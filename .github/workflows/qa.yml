@@ -48,6 +48,24 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
+      - name: Notify QA started
+        env:
+          DISCORD_DEVLOOP_WEBHOOK: ${{ secrets.DISCORD_DEVLOOP_WEBHOOK }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          ITEM_ID: ${{ inputs.item_id }}
+        run: |
+          WEBHOOK="${DISCORD_DEVLOOP_WEBHOOK}"
+          [ -z "$WEBHOOK" ] && exit 0
+          ITEM="${ITEM_ID:-}"
+          [ -n "$ITEM" ] && LABEL=" ($ITEM)" || LABEL=""
+          MSG="🔍 Tom is reviewing PR #${PR_NUMBER}${LABEL}."
+          python3 -c "
+          import json, urllib.request
+          data = json.dumps({'content': '$MSG'}).encode()
+          req = urllib.request.Request('$WEBHOOK', data=data, headers={'Content-Type': 'application/json'})
+          urllib.request.urlopen(req)
+          " 2>/dev/null || echo "Warning: QA-started notification failed" >&2
+
       - name: Compute diff
         id: diff
         run: |
@@ -476,7 +494,7 @@ jobs:
           if [ "$ARTIFACT_TYPE" = "spec" ]; then
             MSG="[SPEC — advisory] ✅ Tom QA PASS — PR #$PR ($ITEM) — spec-only diff, advisory notes only."
           elif [ "$VERDICT" = "PASS" ]; then
-            MSG="✅ Tom QA PASS — PR #$PR ($ITEM) — no blocking issues. Awaiting operator review."
+            MSG="✅ Tom QA PASS — PR #$PR ($ITEM) — no blocking issues. Ready to merge, sir."
           elif [ "$VERDICT" = "SKIP" ]; then
             MSG="⏭️ Tom QA SKIP — PR #$PR ($ITEM) — trivial diff, no review needed."
           elif [ "$VERDICT" = "FAIL" ]; then
