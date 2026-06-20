@@ -115,7 +115,7 @@ jobs:
           python3 - <<'PYEOF'
           import json, os, re, sys, time, requests
           sys.path.insert(0, "scripts/dev-loop")
-          from tom_qa_helpers import count_changed_lines, make_skip_findings, parse_min_diff_lines
+          from tom_qa_helpers import count_changed_lines, make_skip_findings, parse_min_diff_lines, is_spec_only_diff
 
           # Read untrusted inputs from the environment, never by templating GitHub
           # Actions expressions into the script source. The diff can contain triple-quotes,
@@ -160,6 +160,9 @@ jobs:
                   f.write("blocking_count=0\n")
               print(f"Trivial diff ({changed_lines} changed lines < threshold {min_diff_lines}) — QA skipped.")
               sys.exit(0)
+
+          # Artifact-type detection: spec-only PRs are downgraded to advisory-only (no FAIL).
+          artifact_type = "spec" if is_spec_only_diff(diff) else "code"
 
           api_key = os.environ["QA_MODEL_API_KEY"]
 
@@ -211,7 +214,13 @@ jobs:
           - Cap findings: at most 8 items per array; if more exist, include the most critical and add a single architecture_note summarising what was omitted
           """
 
-          user_content = f"""## Spec (item: {item_id})
+          spec_instruction = (
+              "Artifact type: spec (planning/knowledge document — NOT production code)\n"
+              "Review for clarity and completeness only. Do not raise FAIL findings.\n"
+              "All findings must use category \"advisory\". Output verdict must be \"pass\".\n\n"
+          ) if artifact_type == "spec" else ""
+
+          user_content = f"""{spec_instruction}## Spec (item: {item_id})
           {spec if spec and spec != 'none' else '(no spec provided — review against repo conventions)'}
 
           ## Repo conventions (CLAUDE.md excerpt)
@@ -349,9 +358,14 @@ jobs:
           blocking_defects = [x for x in findings["defects"] if x.get("severity") == "blocking"]
           has_blocking = bool(blocking_conformance or blocking_defects)
 
+          # Spec-only diffs are always PASS — findings are advisory only, not merge-blockers.
+          if artifact_type == "spec":
+              has_blocking = False
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
             f.write(f"verdict={'FAIL' if has_blocking else 'PASS'}\n")
             f.write(f"blocking_count={len(blocking_conformance) + len(blocking_defects)}\n")
+            f.write(f"artifact_type={artifact_type}\n")
 
           print(f"Verdict: {'FAIL' if has_blocking else 'PASS'} — {len(blocking_defects)} blocking defect(s), {len(blocking_conformance)} blocking conformance deviation(s)")
           PYEOF
@@ -446,6 +460,7 @@ jobs:
           DISCORD_DEVLOOP_WEBHOOK: ${{ secrets.DISCORD_DEVLOOP_WEBHOOK }}
           VERDICT: ${{ steps.qa.outputs.verdict || 'ERROR' }}
           BLOCKING: ${{ steps.qa.outputs.blocking_count || '?' }}
+          ARTIFACT_TYPE: ${{ steps.qa.outputs.artifact_type || 'code' }}
         run: |
           WEBHOOK="${DISCORD_DEVLOOP_WEBHOOK}"
           [ -z "$WEBHOOK" ] && exit 0
@@ -457,7 +472,10 @@ jobs:
           REPO="${{ github.repository }}"
           RUN_URL="https://github.com/$REPO/actions/runs/${{ github.run_id }}"
 
-          if [ "$VERDICT" = "PASS" ]; then
+          ARTIFACT_TYPE="${ARTIFACT_TYPE:-code}"
+          if [ "$ARTIFACT_TYPE" = "spec" ]; then
+            MSG="[SPEC — advisory] ✅ Tom QA PASS — PR #$PR ($ITEM) — spec-only diff, advisory notes only."
+          elif [ "$VERDICT" = "PASS" ]; then
             MSG="✅ Tom QA PASS — PR #$PR ($ITEM) — no blocking issues. Awaiting operator review."
           elif [ "$VERDICT" = "SKIP" ]; then
             MSG="⏭️ Tom QA SKIP — PR #$PR ($ITEM) — trivial diff, no review needed."
