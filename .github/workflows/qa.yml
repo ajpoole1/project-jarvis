@@ -59,15 +59,14 @@ jobs:
           ITEM="${ITEM_ID:-}"
           [ -n "$ITEM" ] && LABEL=" ($ITEM)" || LABEL=""
           QA_MSG="🔍 Tom is reviewing PR #${PR_NUMBER}${LABEL}."
-          QA_MSG="$QA_MSG" DISCORD_WEBHOOK="$WEBHOOK" python3 - <<'PYEOF'
-import json, os, urllib.request
-msg = os.environ["QA_MSG"]
-webhook = os.environ["DISCORD_WEBHOOK"]
-data = json.dumps({"content": msg}).encode()
-req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})
-urllib.request.urlopen(req)
-PYEOF
-          [ $? -ne 0 ] && echo "Warning: QA-started notification failed" >&2 || true
+          QA_MSG="$QA_MSG" DISCORD_WEBHOOK="$WEBHOOK" python3 -c '
+          import json, os, urllib.request
+          msg = os.environ["QA_MSG"]
+          webhook = os.environ["DISCORD_WEBHOOK"]
+          data = json.dumps({"content": msg}).encode()
+          req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})
+          urllib.request.urlopen(req)
+          ' 2>/dev/null || echo "Warning: QA-started notification failed" >&2
 
       - name: Compute diff
         id: diff
@@ -506,15 +505,14 @@ PYEOF
             MSG="⚠️ Tom QA ERROR — PR #$PR ($ITEM) — Tom could not run. Merge is blocked. See: $RUN_URL"
           fi
 
-          DISCORD_MSG="$MSG" DISCORD_WEBHOOK="$WEBHOOK" python3 - <<'PYEOF'
-import json, os, urllib.request
-msg = os.environ["DISCORD_MSG"]
-webhook = os.environ["DISCORD_WEBHOOK"]
-data = json.dumps({"content": msg}).encode()
-req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})
-urllib.request.urlopen(req)
-PYEOF
-          [ $? -ne 0 ] && echo "Warning: Discord notification failed" >&2 || true
+          DISCORD_MSG="$MSG" DISCORD_WEBHOOK="$WEBHOOK" python3 -c '
+          import json, os, urllib.request
+          msg = os.environ["DISCORD_MSG"]
+          webhook = os.environ["DISCORD_WEBHOOK"]
+          data = json.dumps({"content": msg}).encode()
+          req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})
+          urllib.request.urlopen(req)
+          ' 2>/dev/null || echo "Warning: Discord notification failed" >&2
 
       - name: Fail on blocking issues or Tom error
         if: always()
