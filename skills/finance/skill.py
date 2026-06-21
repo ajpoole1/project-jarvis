@@ -1052,6 +1052,88 @@ def cmd_tag(conn, txn_id: str, owner: str, category: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Commands: rule add / list / remove
+# ---------------------------------------------------------------------------
+
+_VALID_OWNERS = {"personal", "altaforma"}
+
+
+def cmd_rule_add(conn, pattern: str, owner: str, category: str | None = None) -> str:
+    if not pattern.strip():
+        return "Error: pattern must be non-empty."
+    if owner not in _VALID_OWNERS:
+        return f"Error: owner must be 'personal' or 'altaforma', got '{owner}'."
+    today = date.today().isoformat()
+    cur = conn.execute(
+        "INSERT INTO rules (pattern, owner, category, created) VALUES (?, ?, ?, ?)",
+        (pattern, owner, category, today),
+    )
+    conn.commit()
+    rule_id = cur.lastrowid
+    applied = _apply_rules_all(conn)
+    target = f"{owner} / {category}" if category else owner
+    return f'Rule added (id={rule_id}): "{pattern}" → {target}. Applied to {applied} existing transaction(s).'
+
+
+def cmd_rule_list(conn) -> str:
+    rows = conn.execute(
+        "SELECT id, pattern, owner, category, created FROM rules ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return "No rules defined."
+    col_widths = {
+        "id": max(2, max(len(str(r["id"])) for r in rows)),
+        "pattern": max(7, max(len(r["pattern"]) for r in rows)),
+        "owner": max(5, max(len(r["owner"]) for r in rows)),
+        "category": max(8, max(len(r["category"] or "") for r in rows)),
+        "created": 10,
+    }
+
+    def _pad(val, width):
+        return str(val or "").ljust(width)
+
+    header = (
+        f"{'id'.ljust(col_widths['id'])}  "
+        f"{'pattern'.ljust(col_widths['pattern'])}  "
+        f"{'owner'.ljust(col_widths['owner'])}  "
+        f"{'category'.ljust(col_widths['category'])}  "
+        f"created"
+    )
+    sep = (
+        "  ".join("-" * col_widths[k] for k in ("id", "pattern", "owner", "category"))
+        + "  ----------"
+    )
+    lines = [header, sep]
+    for r in rows:
+        lines.append(
+            f"{_pad(r['id'], col_widths['id'])}  "
+            f"{_pad(r['pattern'], col_widths['pattern'])}  "
+            f"{_pad(r['owner'], col_widths['owner'])}  "
+            f"{_pad(r['category'], col_widths['category'])}  "
+            f"{r['created'] or ''}"
+        )
+    return "\n".join(lines)
+
+
+def cmd_rule_remove(conn, rule_id: int) -> str:
+    row = conn.execute(
+        "SELECT id, pattern, owner, category FROM rules WHERE id = ?", (rule_id,)
+    ).fetchone()
+    if not row:
+        return f"Rule {rule_id} not found."
+    conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+    conn.commit()
+    if row["category"]:
+        target = f"{row['owner']}/{row['category']}"
+    else:
+        target = row["owner"]
+    return (
+        f'Rule {rule_id} removed ("{row["pattern"]}" {target}). '
+        f"Run finance apply-rules to re-categorize if needed."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Command: scrape
 # ---------------------------------------------------------------------------
 
@@ -1212,6 +1294,19 @@ def main() -> None:
     p_tag.add_argument("owner", choices=["personal", "altaforma"])
     p_tag.add_argument("--category", default=None, metavar="CAT")
 
+    p_rule = sub.add_parser("rule", help="Manage classification rules")
+    rule_sub = p_rule.add_subparsers(dest="rule_cmd", required=True)
+
+    p_rule_add = rule_sub.add_parser("add", help="Add a new LIKE classification rule")
+    p_rule_add.add_argument("pattern", help="SQL LIKE pattern (e.g. %%DIGITALOCEAN%%)")
+    p_rule_add.add_argument("owner", choices=["personal", "altaforma"])
+    p_rule_add.add_argument("--category", default=None, metavar="CAT")
+
+    rule_sub.add_parser("list", help="List all classification rules")
+
+    p_rule_remove = rule_sub.add_parser("remove", help="Remove a rule by id")
+    p_rule_remove.add_argument("id", type=int)
+
     p_scrape = sub.add_parser("scrape", help="Scrape transactions from bank via Playwright")
     p_scrape.add_argument("--bank", required=True, choices=["rbc", "td"], help="Bank to scrape")
     p_scrape.add_argument("--days", type=int, default=30, metavar="N", help="Days of history")
@@ -1280,6 +1375,14 @@ def main() -> None:
 
         elif args.cmd == "tag":
             print(cmd_tag(conn, args.txn_id, args.owner, args.category))
+
+        elif args.cmd == "rule":
+            if args.rule_cmd == "add":
+                print(cmd_rule_add(conn, args.pattern, args.owner, args.category))
+            elif args.rule_cmd == "list":
+                print(cmd_rule_list(conn))
+            elif args.rule_cmd == "remove":
+                print(cmd_rule_remove(conn, args.id))
 
         elif args.cmd == "scrape":
             print(

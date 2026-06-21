@@ -695,3 +695,102 @@ def test_cmd_bills_due_no_bills(populated_db):
 def test_cmd_recurring_no_data(populated_db):
     result = _skill.cmd_recurring(populated_db)
     assert "No recurring" in result
+
+
+# ---------------------------------------------------------------------------
+# rule add / list / remove
+# ---------------------------------------------------------------------------
+
+
+def test_rule_add_with_category(populated_db):
+    result = _skill.cmd_rule_add(
+        populated_db, "%DIGITALOCEAN%", "altaforma", category="infrastructure"
+    )
+    assert "Rule added" in result
+    assert "id=" in result
+    assert "%DIGITALOCEAN%" in result
+    assert "altaforma" in result
+    assert "infrastructure" in result
+    assert "Applied to" in result
+    row = populated_db.execute("SELECT * FROM rules WHERE pattern = '%DIGITALOCEAN%'").fetchone()
+    assert row is not None
+    assert row["owner"] == "altaforma"
+    assert row["category"] == "infrastructure"
+
+
+def test_rule_add_without_category(populated_db):
+    result = _skill.cmd_rule_add(populated_db, "%SHOPIFY%", "altaforma")
+    assert "Rule added" in result
+    assert "Applied to" in result
+    row = populated_db.execute("SELECT * FROM rules WHERE pattern = '%SHOPIFY%'").fetchone()
+    assert row is not None
+    assert row["category"] is None
+
+
+def test_rule_add_applies_to_existing(db):
+    upsert_transaction(
+        db,
+        _sample_txn({"id": "r1", "description": "DIGITALOCEAN INVOICE", "owner": "personal"}),
+    )
+    upsert_transaction(
+        db,
+        _sample_txn({"id": "r2", "description": "METRO GROCERIES", "owner": "personal"}),
+    )
+    result = _skill.cmd_rule_add(db, "%DIGITALOCEAN%", "altaforma", category="hosting")
+    assert "Applied to" in result
+    assert "existing transaction(s)." in result
+    row = db.execute("SELECT owner, category FROM transactions WHERE id = 'r1'").fetchone()
+    assert row["owner"] == "altaforma"
+    assert row["category"] == "hosting"
+
+
+def test_rule_list_shows_rows(db):
+    _skill.cmd_rule_add(db, "%SHOPIFY%", "altaforma", category="saas")
+    result = _skill.cmd_rule_list(db)
+    assert "%SHOPIFY%" in result
+    assert "altaforma" in result
+    assert "saas" in result
+
+
+def test_rule_list_empty(db):
+    db.execute("DELETE FROM rules")
+    db.commit()
+    result = _skill.cmd_rule_list(db)
+    assert result == "No rules defined."
+
+
+def test_rule_remove_deletes_row(db):
+    _skill.cmd_rule_add(db, "%DIGITALOCEAN%", "altaforma", category="infrastructure")
+    row = db.execute("SELECT id FROM rules WHERE pattern = '%DIGITALOCEAN%'").fetchone()
+    rule_id = row["id"]
+    result = _skill.cmd_rule_remove(db, rule_id)
+    assert f"Rule {rule_id} removed" in result
+    assert "%DIGITALOCEAN%" in result
+    assert "altaforma" in result
+    assert "infrastructure" in result
+    assert "apply-rules" in result
+    remaining = db.execute("SELECT id FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    assert remaining is None
+
+
+def test_rule_remove_nonexistent(db):
+    result = _skill.cmd_rule_remove(db, 999)
+    assert result == "Rule 999 not found."
+
+
+def test_rule_add_empty_pattern(db):
+    count_before = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    result = _skill.cmd_rule_add(db, "", "personal")
+    assert "Error" in result
+    assert "non-empty" in result
+    count_after = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    assert count_after == count_before
+
+
+def test_rule_add_invalid_owner(db):
+    count_before = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    result = _skill.cmd_rule_add(db, "%AMAZON%", "business")
+    assert "Error" in result
+    assert "personal" in result or "altaforma" in result
+    count_after = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    assert count_after == count_before
