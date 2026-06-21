@@ -502,32 +502,32 @@ jobs:
             MSG="⏭️ Tom QA SKIP — PR #$PR ($ITEM) — trivial diff, no review needed."
           elif [ "$VERDICT" = "FAIL" ]; then
             MSG=$(PR="$PR" ITEM="$ITEM" python3 - <<'PYFAIL'
-import json, os
-findings_raw = os.environ.get("FINDINGS", "")
-pr = os.environ.get("PR", "?")
-item = os.environ.get("ITEM", "")
-blocking = os.environ.get("BLOCKING", "?")
-item_label = f" ({item})" if item and item != "none" else ""
-lines = [f"\U0001f6ab Tom QA FAIL — PR #{pr}{item_label} — {blocking} blocking issue(s). Summon HM with these findings to fix:"]
-try:
-    findings = json.loads(findings_raw)
-    blocking_c = [x for x in findings.get("spec_conformance", []) if x.get("severity") == "blocking"]
-    blocking_d = [x for x in findings.get("defects", []) if x.get("severity") == "blocking"]
-    for x in blocking_c:
-        lines.append(f"  • [conformance] {x.get('deviation', str(x))[:120]}")
-    for x in blocking_d:
-        loc = x.get("location", "")
-        desc = x.get("description", str(x))[:120]
-        entry = f"[{x.get('type', 'defect')}] {loc}: {desc}" if loc else f"[{x.get('type', 'defect')}] {desc}"
-        lines.append(f"  • {entry}")
-except Exception:
-    pass
-msg = "\n".join(lines)
-if len(msg) > 1900:
-    msg = msg[:1900] + "\n  … (truncated)"
-print(msg)
-PYFAIL
-)
+          import json, os
+          findings_raw = os.environ.get("FINDINGS", "")
+          pr = os.environ.get("PR", "?")
+          item = os.environ.get("ITEM", "")
+          blocking = os.environ.get("BLOCKING", "?")
+          item_label = f" ({item})" if item and item != "none" else ""
+          lines = [f"\U0001f6ab Tom QA FAIL — PR #{pr}{item_label} — {blocking} blocking issue(s). Summon HM with these findings to fix:"]
+          try:
+              findings = json.loads(findings_raw)
+              blocking_c = [x for x in findings.get("spec_conformance", []) if x.get("severity") == "blocking"]
+              blocking_d = [x for x in findings.get("defects", []) if x.get("severity") == "blocking"]
+              for x in blocking_c:
+                  lines.append(f"  • [conformance] {x.get('deviation', str(x))[:120]}")
+              for x in blocking_d:
+                  loc = x.get("location", "")
+                  desc = x.get("description", str(x))[:120]
+                  entry = f"[{x.get('type', 'defect')}] {loc}: {desc}" if loc else f"[{x.get('type', 'defect')}] {desc}"
+                  lines.append(f"  • {entry}")
+          except Exception:
+              pass
+          msg = "\n".join(lines)
+          if len(msg) > 1900:
+              msg = msg[:1900] + "\n  … (truncated)"
+          print(msg)
+          PYFAIL
+          )
           else
             MSG="⚠️ Tom QA ERROR — PR #$PR ($ITEM) — Tom could not run. Merge is blocked. See: $RUN_URL"
           fi
