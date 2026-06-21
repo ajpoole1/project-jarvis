@@ -1515,6 +1515,7 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
                 {
                     "msg_id": s.msg_id,
                     "sender": s.sender,
+                    "sender_email": s.sender_email,
                     "subject": s.subject,
                     "action": s.action,
                     "tag": s.tag,
@@ -1552,7 +1553,20 @@ def cmd_digest() -> str:
             lines.append(f"  • {item['subject'][:60]}")
         if len(items) > 8:
             lines.append(f"  _…and {len(items) - 8} more_")
-    lines.append("\nSay **Jarvis, gmail stage** to review and execute cleanup.")
+    lines.append("\nActions executed automatically.")
+    service = get_gmail_service()
+    for item in queue:
+        try:
+            if item["action"] in ("trash", "unsubscribe"):
+                service.users().messages().trash(userId="me", id=item["msg_id"]).execute()
+            elif item["action"] == "archive":
+                service.users().messages().modify(
+                    userId="me", id=item["msg_id"], body={"removeLabelIds": ["INBOX"]}
+                ).execute()
+        except Exception:
+            pass
+        if item.get("sender_email"):
+            cache_rule(con, item["sender_email"], item["action"], confirmed=True)
     set_heartbeat_state(con, "digest_queue", "[]")
     return "\n".join(lines)
 

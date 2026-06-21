@@ -119,7 +119,8 @@ def test_cmd_digest_non_empty_returns_grouped_block():
         ],
     )
     with patch.object(skill, "init_db", return_value=con):
-        result = skill.cmd_digest()
+        with patch.object(skill, "get_gmail_service", return_value=MagicMock()):
+            result = skill.cmd_digest()
     assert "**Gmail digest**" in result
     assert "2 emails" in result
     assert "Delete me" in result
@@ -130,7 +131,8 @@ def test_cmd_digest_non_empty_clears_queue():
     con = _make_db()
     _seed_queue(con, [{"action": "trash", "subject": "Spam"}])
     with patch.object(skill, "init_db", return_value=con):
-        skill.cmd_digest()
+        with patch.object(skill, "get_gmail_service", return_value=MagicMock()):
+            skill.cmd_digest()
     assert _read_queue(con) == [], "non-empty digest must clear digest_queue"
 
 
@@ -244,3 +246,66 @@ def test_tier1_prompt_does_not_assign_other_directly():
         or "do not assign other directly" in prompt.lower()
         or "only by tier-2" in prompt.lower()
     )
+
+
+# ---------------------------------------------------------------------------
+# Spec 2026-0036 — digest executes actions inline
+# ---------------------------------------------------------------------------
+
+
+def _make_full_db():
+    """In-memory DB with heartbeat state + sender rules tables."""
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE gmail_heartbeat_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    con.execute(
+        """CREATE TABLE gmail_sender_rules (
+            sender_email TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            confirmed INTEGER NOT NULL DEFAULT 0,
+            last_applied TEXT
+        )"""
+    )
+    return con
+
+
+def test_cmd_digest_executes_trash_and_archive():
+    """cmd_digest must call trash() for trash items and modify() for archive items."""
+    con = _make_full_db()
+    _seed_queue(
+        con,
+        [
+            {
+                "msg_id": "msg-trash-1",
+                "sender": "Spammer",
+                "sender_email": "spam@example.com",
+                "subject": "Win a prize",
+                "action": "trash",
+                "tag": "promotions",
+            },
+            {
+                "msg_id": "msg-archive-2",
+                "sender": "Newsletter",
+                "sender_email": "news@example.com",
+                "subject": "Weekly digest",
+                "action": "archive",
+                "tag": "newsletters",
+            },
+        ],
+    )
+
+    mock_service = MagicMock()
+    mock_trash = mock_service.users().messages().trash
+    mock_modify = mock_service.users().messages().modify
+
+    with patch.object(skill, "init_db", return_value=con):
+        with patch.object(skill, "get_gmail_service", return_value=mock_service):
+            result = skill.cmd_digest()
+
+    mock_trash.assert_called_once_with(userId="me", id="msg-trash-1")
+    mock_trash.return_value.execute.assert_called_once()
+    mock_modify.assert_called_once_with(
+        userId="me", id="msg-archive-2", body={"removeLabelIds": ["INBOX"]}
+    )
+    mock_modify.return_value.execute.assert_called_once()
+    assert "Actions executed automatically." in result
+    assert _read_queue(con) == []
