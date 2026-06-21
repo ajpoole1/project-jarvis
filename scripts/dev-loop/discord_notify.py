@@ -38,7 +38,9 @@ def main() -> None:
         ]
         try:
             findings = json.loads(findings_raw)
-            blocking_c = [x for x in findings.get("spec_conformance", []) if x.get("severity") == "blocking"]
+            blocking_c = [
+                x for x in findings.get("spec_conformance", []) if x.get("severity") == "blocking"
+            ]
             blocking_d = [x for x in findings.get("defects", []) if x.get("severity") == "blocking"]
             for x in blocking_c:
                 lines.append(f"  • [conformance] {x.get('deviation', str(x))[:120]}")
