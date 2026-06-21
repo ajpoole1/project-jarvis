@@ -482,65 +482,56 @@ jobs:
           BLOCKING: ${{ steps.qa.outputs.blocking_count || '?' }}
           ARTIFACT_TYPE: ${{ steps.qa.outputs.artifact_type || 'code' }}
           FINDINGS: ${{ steps.qa.outputs.findings || '' }}
+          PR_NUM: ${{ inputs.pr_number }}
+          ITEM_ID: ${{ steps.spec.outputs.item_id }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          WEBHOOK="${DISCORD_DEVLOOP_WEBHOOK}"
-          [ -z "$WEBHOOK" ] && exit 0
-
-          ITEM="${{ steps.spec.outputs.item_id }}"
-          VERDICT="${VERDICT}"
-          BLOCKING="${BLOCKING}"
-          PR="${{ inputs.pr_number }}"
-          REPO="${{ github.repository }}"
-          RUN_URL="https://github.com/$REPO/actions/runs/${{ github.run_id }}"
-
-          ARTIFACT_TYPE="${ARTIFACT_TYPE:-code}"
-          if [ "$ARTIFACT_TYPE" = "spec" ]; then
-            MSG="[SPEC — advisory] ✅ Tom QA PASS — PR #$PR ($ITEM) — spec-only diff, advisory notes only."
-          elif [ "$VERDICT" = "PASS" ]; then
-            MSG="✅ Tom QA PASS — PR #$PR ($ITEM) — no blocking issues. Ready to merge, sir."
-          elif [ "$VERDICT" = "SKIP" ]; then
-            MSG="⏭️ Tom QA SKIP — PR #$PR ($ITEM) — trivial diff, no review needed."
-          elif [ "$VERDICT" = "FAIL" ]; then
-            MSG=$(PR="$PR" ITEM="$ITEM" python3 -c '
-          import json, os
-          findings_raw = os.environ.get("FINDINGS", "")
-          pr = os.environ.get("PR", "?")
-          item = os.environ.get("ITEM", "")
+          python3 - <<'PYEOF'
+          import json, os, sys, urllib.request
+          webhook = os.environ.get("DISCORD_DEVLOOP_WEBHOOK", "")
+          if not webhook:
+              sys.exit(0)
+          verdict = os.environ.get("VERDICT", "ERROR")
           blocking = os.environ.get("BLOCKING", "?")
-          item_label = " (" + item + ")" if item and item != "none" else ""
-          header = "\U0001f6ab Tom QA FAIL — PR #" + pr + item_label + " — " + blocking + " blocking issue(s). Summon HM with these findings to fix:"
-          lines = [header]
-          try:
-              findings = json.loads(findings_raw)
-              blocking_c = [x for x in findings.get("spec_conformance", []) if x.get("severity") == "blocking"]
-              blocking_d = [x for x in findings.get("defects", []) if x.get("severity") == "blocking"]
-              for x in blocking_c:
-                  lines.append("  • [conformance] " + x.get("deviation", str(x))[:120])
-              for x in blocking_d:
-                  loc = x.get("location", "")
-                  desc = x.get("description", str(x))[:120]
-                  t = x.get("type", "defect")
-                  entry = "[" + t + "] " + loc + ": " + desc if loc else "[" + t + "] " + desc
-                  lines.append("  • " + entry)
-          except Exception:
-              pass
-          msg = "\n".join(lines)
-          if len(msg) > 1900:
-              msg = msg[:1900] + "\n  … (truncated)"
-          print(msg)
-          ')
-          else
-            MSG="⚠️ Tom QA ERROR — PR #$PR ($ITEM) — Tom could not run. Merge is blocked. See: $RUN_URL"
-          fi
-
-          DISCORD_MSG="$MSG" DISCORD_WEBHOOK="$WEBHOOK" python3 -c '
-          import json, os, urllib.request
-          msg = os.environ["DISCORD_MSG"]
-          webhook = os.environ["DISCORD_WEBHOOK"]
+          artifact_type = os.environ.get("ARTIFACT_TYPE", "code")
+          findings_raw = os.environ.get("FINDINGS", "")
+          pr = os.environ.get("PR_NUM", "?")
+          item = os.environ.get("ITEM_ID", "")
+          run_url = os.environ.get("RUN_URL", "")
+          item_label = f" ({item})" if item and item != "none" else ""
+          if artifact_type == "spec":
+              msg = f"[SPEC — advisory] ✅ Tom QA PASS — PR #{pr}{item_label} — spec-only diff, advisory notes only."
+          elif verdict == "PASS":
+              msg = f"✅ Tom QA PASS — PR #{pr}{item_label} — no blocking issues. Ready to merge, sir."
+          elif verdict == "SKIP":
+              msg = f"⏭️ Tom QA SKIP — PR #{pr}{item_label} — trivial diff, no review needed."
+          elif verdict == "FAIL":
+              lines = [f"\U0001f6ab Tom QA FAIL — PR #{pr}{item_label} — {blocking} blocking issue(s). Summon HM with these findings to fix:"]
+              try:
+                  findings = json.loads(findings_raw)
+                  blocking_c = [x for x in findings.get('spec_conformance', []) if x.get('severity') == 'blocking']
+                  blocking_d = [x for x in findings.get('defects', []) if x.get('severity') == 'blocking']
+                  for x in blocking_c:
+                      lines.append(f"  • [conformance] {x.get('deviation', str(x))[:120]}")
+                  for x in blocking_d:
+                      loc = x.get('location', '')
+                      desc = x.get('description', str(x))[:120]
+                      t = x.get('type', 'defect')
+                      lines.append(f"  • [{t}] {loc + ': ' if loc else ''}{desc}")
+              except Exception:
+                  pass
+              msg = "\n".join(lines)
+              if len(msg) > 1900:
+                  msg = msg[:1900] + "\n  … (truncated)"
+          else:
+              msg = f"⚠️ Tom QA ERROR — PR #{pr}{item_label} — Tom could not run. Merge is blocked. See: {run_url}"
           data = json.dumps({"content": msg}).encode()
           req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})
-          urllib.request.urlopen(req)
-          ' 2>/dev/null || echo "Warning: Discord notification failed" >&2
+          try:
+              urllib.request.urlopen(req)
+          except Exception as e:
+              print(f"Warning: Discord notification failed: {e}", file=sys.stderr)
+          PYEOF
 
       - name: Fail on blocking issues or Tom error
         if: always()
