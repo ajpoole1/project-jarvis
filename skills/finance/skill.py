@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import calendar
 import os
 import re
+import statistics
 import sys
+from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -517,6 +520,14 @@ def cmd_liquid(conn) -> str:
 # ---------------------------------------------------------------------------
 
 
+# SQL exclusion clause matching _EXCLUDED_CATEGORIES (used in compare / coda queries).
+_EXCL_CATS_SQL = (
+    "'internal_transfer','loan_payment','investment_buy','investment_sell',"
+    "'investment_contribution','investment_fee','investment_grant','investment_rebate',"
+    "'inheritance_deposit','insurance_reimbursement'"
+)
+_EXCL_SQL = f"AND (category IS NULL OR category NOT IN ({_EXCL_CATS_SQL}))"
+
 # Categories excluded from spend/net/top by default.
 # investment_income is intentionally absent — dividends/interest are real cash flows.
 _TRANSFER_CATEGORIES = {"internal_transfer", "loan_payment"}
@@ -653,92 +664,84 @@ def cmd_net(conn, period_start: str, period_end: str, include_transfers: bool = 
 # ---------------------------------------------------------------------------
 
 
-def cmd_compare(conn, period_start: str, period_end: str, baseline_months: int = 3) -> str:
-    """Compare spend for a period against the trailing N-month median per category.
+def cmd_compare(
+    conn,
+    period_start: str,
+    period_end: str,
+    baseline_months: int = 3,
+    week_mode: bool = False,
+) -> str:
+    """Compare spend for a period against the trailing N-period median per category.
 
-    Baseline: the most recent N complete calendar months before period_start that
-    each have at least MIN_TXNS transactions (sparse months excluded).
-    Verdict per category:
-      normal   — within ±20% of median
-      high     — more than 20% above
-      low      — more than 20% below (only shown if noteworthy)
-      new      — no baseline history for this category
+    --month mode: trailing N complete calendar months (default 3).
+    --week mode:  trailing N complete calendar weeks (default 8).
+    Sort: absolute delta descending.
+    Verdict: normal (±20%), high (>20%), low (<20%), new (no history).
     """
-    MIN_TXNS_PER_MONTH = 5
+    MIN_TXNS = 2 if week_mode else 5
     HIGH_THRESHOLD = 1.20
     LOW_THRESHOLD = 0.80
 
-    # Find complete months before period_start with enough data
-    from datetime import date as _date
+    ps = date.fromisoformat(period_start)
+    baseline: list[tuple[str, str]] = []
 
-    ps = _date.fromisoformat(period_start)
-    # Walk back month by month to collect baseline months
-    baseline: list[tuple[str, str]] = []  # (month_start, month_end)
-    y, m = ps.year, ps.month
-    while len(baseline) < baseline_months * 2:  # search up to 2× to skip sparse
-        m -= 1
-        if m == 0:
-            m = 12
-            y -= 1
-        ms = f"{y:04d}-{m:02d}-01"
-        import calendar
-
-        last_day = calendar.monthrange(y, m)[1]
-        me = f"{y:04d}-{m:02d}-{last_day:02d}"
-        # Count qualifying txns in this month
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM transactions "
-            "WHERE date >= ? AND date <= ? AND amount < 0 "
-            "AND (category IS NULL OR category NOT IN "
-            "('internal_transfer','loan_payment','investment_buy','investment_sell',"
-            "'investment_contribution','investment_fee','investment_grant','investment_rebate',"
-            "'inheritance_deposit','insurance_reimbursement'))",
-            (ms, me),
-        ).fetchone()[0]
-        if cnt >= MIN_TXNS_PER_MONTH:
-            baseline.append((ms, me))
-        if len(baseline) >= baseline_months:
-            break
+    if week_mode:
+        week_monday = ps - timedelta(days=ps.weekday())
+        for i in range(1, baseline_months + 1):
+            wk_start = week_monday - timedelta(weeks=i)
+            wk_end = wk_start + timedelta(days=6)
+            cnt = conn.execute(
+                f"SELECT COUNT(*) FROM transactions "
+                f"WHERE date >= ? AND date <= ? AND amount < 0 {_EXCL_SQL}",
+                (wk_start.isoformat(), wk_end.isoformat()),
+            ).fetchone()[0]
+            if cnt >= MIN_TXNS:
+                baseline.append((wk_start.isoformat(), wk_end.isoformat()))
+    else:
+        y, m = ps.year, ps.month
+        for _ in range(baseline_months * 4):  # search at most 4× months to find N qualifying
+            m -= 1
+            if m == 0:
+                m = 12
+                y -= 1
+            ms = f"{y:04d}-{m:02d}-01"
+            last_day = calendar.monthrange(y, m)[1]
+            me = f"{y:04d}-{m:02d}-{last_day:02d}"
+            cnt = conn.execute(
+                f"SELECT COUNT(*) FROM transactions "
+                f"WHERE date >= ? AND date <= ? AND amount < 0 {_EXCL_SQL}",
+                (ms, me),
+            ).fetchone()[0]
+            if cnt >= MIN_TXNS:
+                baseline.append((ms, me))
+                if len(baseline) >= baseline_months:
+                    break
 
     if not baseline:
         return "Not enough history for comparison — import more months first."
 
-    # Build per-category spend for each baseline month
-    import statistics
-    from collections import defaultdict
-
     monthly_by_cat: dict[str, list[float]] = defaultdict(list)
     for ms, me in baseline:
         rows = conn.execute(
-            "SELECT COALESCE(category,'Uncategorized') as cat, SUM(ABS(amount)) as total "
-            "FROM transactions "
-            "WHERE date >= ? AND date <= ? AND amount < 0 "
-            "AND (category IS NULL OR category NOT IN "
-            "('internal_transfer','loan_payment','investment_buy','investment_sell',"
-            "'investment_contribution','investment_fee','investment_grant','investment_rebate',"
-            "'inheritance_deposit','insurance_reimbursement')) "
-            "GROUP BY cat",
+            f"SELECT COALESCE(category,'Uncategorized') as cat, SUM(ABS(amount)) as total "
+            f"FROM transactions "
+            f"WHERE date >= ? AND date <= ? AND amount < 0 {_EXCL_SQL} "
+            f"GROUP BY cat",
             (ms, me),
         ).fetchall()
         seen_cats = set()
         for r in rows:
             monthly_by_cat[r["cat"]].append(r["total"])
             seen_cats.add(r["cat"])
-        # Categories absent in a month count as $0 for median
         for cat in monthly_by_cat:
             if cat not in seen_cats:
                 monthly_by_cat[cat].append(0.0)
 
-    # Current period spend by category
     current_rows = conn.execute(
-        "SELECT COALESCE(category,'Uncategorized') as cat, SUM(ABS(amount)) as total "
-        "FROM transactions "
-        "WHERE date >= ? AND date <= ? AND amount < 0 "
-        "AND (category IS NULL OR category NOT IN "
-        "('internal_transfer','loan_payment','investment_buy','investment_sell',"
-        "'investment_contribution','investment_fee','investment_grant','investment_rebate',"
-        "'inheritance_deposit','insurance_reimbursement')) "
-        "GROUP BY cat",
+        f"SELECT COALESCE(category,'Uncategorized') as cat, SUM(ABS(amount)) as total "
+        f"FROM transactions "
+        f"WHERE date >= ? AND date <= ? AND amount < 0 {_EXCL_SQL} "
+        f"GROUP BY cat",
         (period_start, period_end),
     ).fetchall()
     current = {r["cat"]: r["total"] for r in current_rows}
@@ -746,14 +749,30 @@ def cmd_compare(conn, period_start: str, period_end: str, baseline_months: int =
     if not current:
         return f"No spend data for {period_start} → {period_end}."
 
-    # Build comparison table — all categories that appear in current or baseline
-    all_cats = sorted(set(current) | set(monthly_by_cat), key=lambda c: -current.get(c, 0))
+    def _med(cat: str) -> float | None:
+        hist = monthly_by_cat.get(cat, [])
+        return statistics.median(hist) if hist else None
 
-    baseline_label = f"{baseline[-1][0][:7]}–{baseline[0][0][:7]}"
+    all_cats = sorted(
+        set(current) | set(monthly_by_cat),
+        key=lambda c: -abs(current.get(c, 0.0) - (_med(c) or 0.0)),
+    )
+
+    n_actual = len(baseline)
+    if week_mode:
+        baseline_label = f"{n_actual}-week median"
+        period_note = "" if n_actual >= baseline_months else f" (baseline: {n_actual} weeks)"
+    else:
+        baseline_label = f"{baseline[-1][0][:7]}–{baseline[0][0][:7]} median"
+        period_note = "" if n_actual >= baseline_months else f" (baseline: {n_actual} months)"
+
+    ps_dt = date.fromisoformat(period_start)
+    pe_dt = date.fromisoformat(period_end)
+    period_label = f"{ps_dt.strftime('%b')} {ps_dt.day}–{pe_dt.day}"
+    mode_label = "week" if week_mode else "month"
+
     lines = [
-        f"**Spend comparison: {period_start} → {period_end}**",
-        f"  Baseline: {len(baseline)}-month median ({baseline_label})",
-        "",
+        f"**Spend comparison ({mode_label})**",
         f"  {'Category':<22}  {'This period':>11}  {'Median':>9}  {'Δ':>7}  Verdict",
         f"  {'─'*70}",
     ]
@@ -782,7 +801,7 @@ def cmd_compare(conn, period_start: str, period_end: str, baseline_months: int =
                 verdict = "✓ normal"
 
         if curr == 0 and (median is None or median == 0):
-            continue  # skip completely absent categories
+            continue
 
         curr_str = f"${curr:>9,.0f}" if curr else "         —"
         lines.append(f"  {cat:<22}  {curr_str}  {median_str}  {delta_str}  {verdict}")
@@ -794,6 +813,8 @@ def cmd_compare(conn, period_start: str, period_end: str, baseline_months: int =
     lines += [
         f"  {'─'*70}",
         f"  {'Total':<22}  ${total_curr:>9,.0f}  ${total_median:>8,.0f}  {total_delta:>+6.0f}%",
+        "",
+        f"  Period: {period_label}{period_note} | Baseline: {baseline_label}",
     ]
 
     return "\n".join(lines)
@@ -1210,6 +1231,314 @@ def cmd_scrape(
 
 
 # ---------------------------------------------------------------------------
+# Command: runway
+# ---------------------------------------------------------------------------
+
+
+def cmd_runway(conn, include_inheritance: bool = False) -> str:
+    """Liquid / monthly obligations. monthly_obligations = recurring where cadence ~30d."""
+    accounts = get_accounts(conn)
+    bank_total = sum(a.get("balance_current") or 0.0 for a in accounts if a["type"] == "bank")
+    cc_total = sum(a.get("balance_current") or 0.0 for a in accounts if a["type"] == "credit")
+    liquid = bank_total - cc_total
+
+    if include_inheritance:
+        liquid += 1300.0
+
+    rows = conn.execute(
+        "SELECT merchant_norm, amount_median, category FROM recurring "
+        "WHERE cadence_days BETWEEN 25 AND 35",
+    ).fetchall()
+    qualified = [r for r in rows if (r["category"] or "") not in _EXCLUDED_CATEGORIES]
+
+    if not qualified:
+        return (
+            "No monthly recurring obligations detected. "
+            "Run `finance import` then `finance recurring` to build patterns."
+        )
+
+    monthly_total = sum(r["amount_median"] for r in qualified)
+    runway = liquid / monthly_total if monthly_total > 0 else float("inf")
+
+    inh_note = " (incl. $1,300 inheritance)" if include_inheritance else ""
+    lines = [
+        f"**Runway: {runway:.1f} months**",
+        f"  Liquid: ${liquid:,.2f}{inh_note}",
+        f"  Monthly obligations: ${monthly_total:,.2f}",
+        "",
+        "  Top obligations:",
+    ]
+    for r in sorted(qualified, key=lambda x: -x["amount_median"])[:5]:
+        lines.append(f"    {(r['merchant_norm'] or '?'):<32} ${r['amount_median']:>9,.2f}/mo")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Command: altaforma
+# ---------------------------------------------------------------------------
+
+
+def cmd_altaforma(conn, quarter: bool = False) -> str:
+    """Altaforma transaction summary grouped by category."""
+    today = date.today()
+    if quarter:
+        q = (today.month - 1) // 3 + 1
+        q_start_month = (q - 1) * 3 + 1
+        period_start = date(today.year, q_start_month, 1).isoformat()
+        period_label = f"Q{q} {today.year}"
+    else:
+        period_start = date(today.year, 1, 1).isoformat()
+        period_label = str(today.year)
+    period_end = today.isoformat()
+
+    rows = conn.execute(
+        "SELECT COALESCE(category, 'Uncategorized') as cat, SUM(amount) as total "
+        "FROM transactions "
+        "WHERE owner = 'altaforma' AND date >= ? AND date <= ? "
+        "GROUP BY cat ORDER BY total ASC",
+        (period_start, period_end),
+    ).fetchall()
+
+    if not rows:
+        return f"No Altaforma transactions for {period_label}."
+
+    spend_rows = [r for r in rows if r["total"] < 0]
+    income_rows = [r for r in rows if r["total"] >= 0]
+
+    lines = [f"**Altaforma — {period_label}**"]
+    for r in spend_rows:
+        lines.append(f"  {r['cat']:<28} ${abs(r['total']):>9,.2f}")
+
+    total_spend = sum(abs(r["total"]) for r in spend_rows)
+    total_income = sum(r["total"] for r in income_rows)
+
+    lines += [
+        f"  {'─' * 39}",
+        f"  {'Total spend':<28} ${total_spend:>9,.2f}",
+    ]
+    if income_rows:
+        total_net = total_income - total_spend
+        net_str = f"+${total_net:,.2f}" if total_net >= 0 else f"-${abs(total_net):,.2f}"
+        lines.append(f"  {'Revenue':<28} ${total_income:>9,.2f}")
+        lines.append(f"  {'Net':<28} {net_str:>10}")
+    else:
+        lines.append("  Revenue: none recorded — tag income transactions owner=altaforma")
+
+    lines.append(f"\n  Period: {period_start} → {period_end}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Command: subs-audit
+# ---------------------------------------------------------------------------
+
+
+def cmd_subs_audit(conn) -> str:
+    """Audit recurring subscriptions: NEW / MISSING / CHANGED / Stable."""
+    today = date.today()
+    today_str = today.isoformat()
+    cutoff_35 = (today - timedelta(days=35)).isoformat()
+    cutoff_60 = (today - timedelta(days=60)).isoformat()
+
+    rows = conn.execute("SELECT * FROM recurring ORDER BY merchant_norm").fetchall()
+
+    if not rows:
+        return (
+            "No recurring data. Run `finance import` then `finance recurring` to detect patterns."
+        )
+
+    new_items, missing_items, stable_items = [], [], []
+    for r in rows:
+        last_seen = r["last_seen"] or ""
+        next_expected = r["next_expected"] or ""
+        cadence = r["cadence_days"]
+        if last_seen >= cutoff_35 and (cadence is None or cadence > 60):
+            new_items.append(r)
+        elif next_expected and next_expected < today_str and last_seen and last_seen < cutoff_60:
+            missing_items.append(r)
+        else:
+            stable_items.append(r)
+
+    lines = []
+    if new_items:
+        lines.append(f"**NEW ({len(new_items)})**")
+        for r in new_items:
+            lines.append(f"  {(r['merchant_norm'] or '?'):<32} ${r['amount_median']:>9,.2f}")
+    else:
+        lines.append("**NEW (0)**")
+
+    if missing_items:
+        lines.append(f"**MISSING ({len(missing_items)})**")
+        for r in missing_items:
+            lines.append(f"  {(r['merchant_norm'] or '?'):<32}  last seen {r['last_seen']}")
+    else:
+        lines.append("**MISSING (0)**")
+
+    lines.append("**CHANGED (0)**  (insufficient prior-amount data)")
+    lines.append(f"**Stable: {len(stable_items)}**")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Briefing coda helpers (not CLI subcommands)
+# ---------------------------------------------------------------------------
+
+
+def finance_weekly_coda() -> str | None:
+    """2-3 line prose for Sunday briefing: top-3 week deltas + Altaforma spend.
+
+    Returns None if DB unavailable or no relevant data.
+    """
+    try:
+        if not DB_PATH.exists():
+            return None
+        conn = init_db(str(DB_PATH))
+        try:
+            week_start, week_end = _week_range()
+
+            curr_rows = conn.execute(
+                f"SELECT COALESCE(category,'Uncategorized') as cat, SUM(ABS(amount)) as total "
+                f"FROM transactions "
+                f"WHERE date >= ? AND date <= ? AND amount < 0 {_EXCL_SQL} "
+                f"GROUP BY cat",
+                (week_start, week_end),
+            ).fetchall()
+            current = {r["cat"]: r["total"] for r in curr_rows}
+
+            today_dt = date.fromisoformat(week_start)
+            week_monday = today_dt - timedelta(days=today_dt.weekday())
+            monthly_by_cat: dict[str, list[float]] = defaultdict(list)
+            for i in range(1, 9):
+                ws = (week_monday - timedelta(weeks=i)).isoformat()
+                we = (week_monday - timedelta(weeks=i) + timedelta(days=6)).isoformat()
+                rows = conn.execute(
+                    f"SELECT COALESCE(category,'Uncategorized') as cat, SUM(ABS(amount)) as total "
+                    f"FROM transactions "
+                    f"WHERE date >= ? AND date <= ? AND amount < 0 {_EXCL_SQL} "
+                    f"GROUP BY cat",
+                    (ws, we),
+                ).fetchall()
+                seen = {r["cat"] for r in rows}
+                for r in rows:
+                    monthly_by_cat[r["cat"]].append(r["total"])
+                for cat in monthly_by_cat:
+                    if cat not in seen:
+                        monthly_by_cat[cat].append(0.0)
+
+            deltas = []
+            for cat, curr_val in current.items():
+                hist = monthly_by_cat.get(cat, [])
+                med = statistics.median(hist) if hist else 0.0
+                delta = curr_val - med
+                if abs(delta) > 5:
+                    deltas.append((cat, curr_val, med, delta))
+            deltas.sort(key=lambda x: -abs(x[3]))
+
+            alta = (
+                conn.execute(
+                    "SELECT COALESCE(SUM(ABS(amount)), 0) FROM transactions "
+                    "WHERE owner='altaforma' AND amount < 0 AND date >= ? AND date <= ?",
+                    (week_start, week_end),
+                ).fetchone()[0]
+                or 0.0
+            )
+
+            parts = []
+            if deltas:
+                top3 = deltas[:3]
+                pieces = [f"{cat} {'▲' if d > 0 else '▼'}${abs(d):,.0f}" for cat, _, _, d in top3]
+                parts.append("Spend vs median: " + " · ".join(pieces))
+            elif current:
+                top_cats = sorted(current.items(), key=lambda x: -x[1])[:3]
+                parts.append("This week: " + " · ".join(f"{c} ${v:,.0f}" for c, v in top_cats))
+            if alta > 0:
+                parts.append(f"Altaforma this week: ${alta:,.2f}")
+
+            return "\n".join(parts) if parts else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def finance_monthly_coda() -> str | None:
+    """3 compact lines for 1st-of-month briefing: prior-month net, subs-audit, GST.
+
+    Returns None if DB unavailable.
+    """
+    try:
+        if not DB_PATH.exists():
+            return None
+        conn = init_db(str(DB_PATH))
+        try:
+            today = date.today()
+            first_this = today.replace(day=1)
+            pm_end = first_this - timedelta(days=1)
+            pm_start = pm_end.replace(day=1)
+
+            txns = conn.execute(
+                "SELECT amount, category FROM transactions WHERE date >= ? AND date <= ?",
+                (pm_start.isoformat(), pm_end.isoformat()),
+            ).fetchall()
+            income = sum(
+                t["amount"]
+                for t in txns
+                if t["amount"] > 0 and (t["category"] or "") not in _EXCLUDED_CATEGORIES
+            )
+            spend = sum(
+                abs(t["amount"])
+                for t in txns
+                if t["amount"] < 0 and (t["category"] or "") not in _EXCLUDED_CATEGORIES
+            )
+            net = income - spend
+            net_str = f"+${net:,.0f}" if net >= 0 else f"-${abs(net):,.0f}"
+            month_label = pm_end.strftime("%B")
+
+            today_str = today.isoformat()
+            cutoff_35 = (today - timedelta(days=35)).isoformat()
+            cutoff_60 = (today - timedelta(days=60)).isoformat()
+            rec_rows = conn.execute("SELECT * FROM recurring").fetchall()
+            n_new = sum(
+                1
+                for r in rec_rows
+                if (r["last_seen"] or "") >= cutoff_35
+                and (r["cadence_days"] is None or r["cadence_days"] > 60)
+            )
+            n_missing = sum(
+                1
+                for r in rec_rows
+                if (r["next_expected"] or "") < today_str and (r["last_seen"] or "") < cutoff_60
+            )
+            n_stable = len(rec_rows) - n_new - n_missing
+
+            q = (today.month - 1) // 3 + 1
+            q_start = date(today.year, (q - 1) * 3 + 1, 1).isoformat()
+            gst_row = conn.execute(
+                "SELECT COALESCE(SUM(ABS(amount)), 0) FROM transactions "
+                "WHERE date >= ? AND date <= ? AND category IN ('taxes','gst','hst','qst')",
+                (q_start, today_str),
+            ).fetchone()
+            gst_paid = gst_row[0] if gst_row else 0.0
+            gst_status = (
+                f"GST Q{q}: ${gst_paid:,.0f} paid" if gst_paid > 0 else f"GST Q{q}: none recorded"
+            )
+
+            return "\n".join(
+                [
+                    f"{month_label} net: {net_str} (in ${income:,.0f} / out ${spend:,.0f})",
+                    f"Subs: {n_new} new · {n_missing} missing · {n_stable} stable",
+                    gst_status,
+                ]
+            )
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1271,7 +1600,12 @@ def main() -> None:
     )
 
     p_compare = sub.add_parser("compare", help="This period vs trailing median per category")
-    p_compare.add_argument("--month", action="store_true", help="Compare current calendar month")
+    p_compare.add_argument(
+        "--month", action="store_true", help="Compare current calendar month (default)"
+    )
+    p_compare.add_argument(
+        "--week", action="store_true", help="Compare current calendar week (8-week median)"
+    )
     p_compare.add_argument("--from", dest="from_date", default=None, metavar="DATE")
     p_compare.add_argument("--to", dest="to_date", default=None, metavar="DATE")
     p_compare.add_argument(
@@ -1279,8 +1613,24 @@ def main() -> None:
         type=int,
         default=3,
         metavar="N",
-        help="Number of full months to use as baseline (default 3)",
+        help="Number of full periods to use as baseline (default 3 months / 8 weeks)",
     )
+
+    p_runway = sub.add_parser("runway", help="Liquid / monthly obligations in months")
+    p_runway.add_argument(
+        "--include-inheritance",
+        action="store_true",
+        help="Add $1,300/mo Ricky inheritance to liquid before dividing",
+    )
+
+    p_altaforma = sub.add_parser("altaforma", help="Altaforma spend/revenue by category")
+    p_alta_grp = p_altaforma.add_mutually_exclusive_group()
+    p_alta_grp.add_argument(
+        "--quarter", action="store_true", help="Current quarter (default: year)"
+    )
+    p_alta_grp.add_argument("--year", action="store_true", help="Current year (default)")
+
+    sub.add_parser("subs-audit", help="Subscription audit: NEW / MISSING / CHANGED / Stable")
 
     sub.add_parser("recurring", help="Table of recurring charges")
     sub.add_parser("debt", help="Debt stack — balances, monthly payments, projected payoff")
@@ -1355,10 +1705,28 @@ def main() -> None:
             print(cmd_net(conn, period_start, period_end, args.include_transfers))
 
         elif args.cmd == "compare":
-            period_start, period_end = _resolve_period(
-                args.month, False, args.from_date, args.to_date
-            )
-            print(cmd_compare(conn, period_start, period_end, args.baseline))
+            if args.week:
+                period_start, period_end = _week_range()
+                baseline_n = args.baseline if args.baseline != 3 else 8
+                print(
+                    cmd_compare(
+                        conn, period_start, period_end, baseline_months=baseline_n, week_mode=True
+                    )
+                )
+            else:
+                period_start, period_end = _resolve_period(
+                    args.month, False, args.from_date, args.to_date
+                )
+                print(cmd_compare(conn, period_start, period_end, args.baseline))
+
+        elif args.cmd == "runway":
+            print(cmd_runway(conn, include_inheritance=args.include_inheritance))
+
+        elif args.cmd == "altaforma":
+            print(cmd_altaforma(conn, quarter=args.quarter))
+
+        elif args.cmd == "subs-audit":
+            print(cmd_subs_audit(conn))
 
         elif args.cmd == "recurring":
             print(cmd_recurring(conn))
