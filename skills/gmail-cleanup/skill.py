@@ -34,6 +34,14 @@ DRY_RUN = os.environ.get("GMAIL_DRY_RUN", "true").lower() == "true"
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
+INBOX_LABELS = [
+    "INBOX",
+    "CATEGORY_UPDATES",
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_FORUMS",
+]
+
 ACTIONS = ("archive", "trash", "unsubscribe", "keep")
 TAGS = (
     "receipts",
@@ -611,20 +619,24 @@ def _is_priority(summary: EmailSummary) -> bool:
 
 
 def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
-    msg_ids = []
-    page_token = None
-    while len(msg_ids) < batch_size:
-        fetch = min(500, batch_size - len(msg_ids))
-        kwargs = {"userId": "me", "labelIds": ["INBOX"], "maxResults": fetch}
-        if page_token:
-            kwargs["pageToken"] = page_token
-        result = service.users().messages().list(**kwargs).execute()
-        msg_ids += [m["id"] for m in result.get("messages", [])]
-        page_token = result.get("nextPageToken")
-        if not page_token:
+    seen_ids: set[str] = set()
+    for label in INBOX_LABELS:
+        page_token = None
+        while len(seen_ids) < batch_size:
+            fetch = min(500, batch_size - len(seen_ids))
+            kwargs = {"userId": "me", "labelIds": [label], "maxResults": fetch}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            result = service.users().messages().list(**kwargs).execute()
+            for m in result.get("messages", []):
+                seen_ids.add(m["id"])
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        if len(seen_ids) >= batch_size:
             break
     messages = []
-    for msg_id in msg_ids:
+    for msg_id in list(seen_ids)[:batch_size]:
         msg = (
             service.users()
             .messages()
@@ -642,23 +654,28 @@ def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
 
 def fetch_new_messages(service, since_epoch: int | None, batch_size: int) -> list[dict]:
     """Fetch inbox messages newer than since_epoch (Unix seconds). No filter if None."""
-    query = "in:inbox"
+    label_clause = " ".join(
+        f"label:{lbl.lower().replace('_', '-')}" if lbl != "INBOX" else "in:inbox"
+        for lbl in INBOX_LABELS
+    )
+    query = f"{{{label_clause}}}"
     if since_epoch:
         query += f" after:{since_epoch}"
-    msg_ids = []
+    seen_ids: set[str] = set()
     page_token = None
-    while len(msg_ids) < batch_size:
-        fetch = min(500, batch_size - len(msg_ids))
+    while len(seen_ids) < batch_size:
+        fetch = min(500, batch_size - len(seen_ids))
         kwargs = {"userId": "me", "q": query, "maxResults": fetch}
         if page_token:
             kwargs["pageToken"] = page_token
         result = service.users().messages().list(**kwargs).execute()
-        msg_ids += [m["id"] for m in result.get("messages", [])]
+        for m in result.get("messages", []):
+            seen_ids.add(m["id"])
         page_token = result.get("nextPageToken")
         if not page_token:
             break
     messages = []
-    for msg_id in msg_ids:
+    for msg_id in list(seen_ids)[:batch_size]:
         msg = (
             service.users()
             .messages()
@@ -998,6 +1015,14 @@ def execute_actions(
     Invariant: 'none' is in the desired set only when no real tag applies;
     any real tag drives 'none' into removeLabelIds automatically.
     """
+    try:
+        suspended = con.execute(
+            "SELECT value FROM jarvis_kv WHERE key='gmail_actions_suspended'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        suspended = None
+    if suspended:
+        return "Gmail actions suspended. Clear the suspension before executing."
     all_jarvis_ids: set[str] = set(label_map.values()) if label_map else set()
     none_label_id: str = (label_map or {}).get("none", "")
 
@@ -1530,7 +1555,7 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
 
 
 def cmd_digest() -> str:
-    """Post the queued digest of non-priority actionable emails and clear the queue."""
+    """Post the queued digest of non-priority actionable emails."""
     con = init_db()
     queue_json = get_heartbeat_state(con, "digest_queue") or "[]"
     queue = json.loads(queue_json)
@@ -1553,21 +1578,7 @@ def cmd_digest() -> str:
             lines.append(f"  • {item['subject'][:60]}")
         if len(items) > 8:
             lines.append(f"  _…and {len(items) - 8} more_")
-    lines.append("\nActions executed automatically.")
-    service = get_gmail_service()
-    for item in queue:
-        try:
-            if item["action"] in ("trash", "unsubscribe"):
-                service.users().messages().trash(userId="me", id=item["msg_id"]).execute()
-            elif item["action"] == "archive":
-                service.users().messages().modify(
-                    userId="me", id=item["msg_id"], body={"removeLabelIds": ["INBOX"]}
-                ).execute()
-        except Exception:
-            pass
-        if item.get("sender_email"):
-            cache_rule(con, item["sender_email"], item["action"], confirmed=True)
-    set_heartbeat_state(con, "digest_queue", "[]")
+    lines.append("\nSay **Jarvis, gmail stage** to review and execute cleanup.")
     return "\n".join(lines)
 
 

@@ -127,15 +127,6 @@ def test_cmd_digest_non_empty_returns_grouped_block():
     assert "File me away" in result
 
 
-def test_cmd_digest_non_empty_clears_queue():
-    con = _make_db()
-    _seed_queue(con, [{"action": "trash", "subject": "Spam"}])
-    with patch.object(skill, "init_db", return_value=con):
-        with patch.object(skill, "get_gmail_service", return_value=MagicMock()):
-            skill.cmd_digest()
-    assert _read_queue(con) == [], "non-empty digest must clear digest_queue"
-
-
 # ---------------------------------------------------------------------------
 # Bug A — pending label_ids_json round-trip (DEV_NOTES #59a)
 # ---------------------------------------------------------------------------
@@ -249,63 +240,80 @@ def test_tier1_prompt_does_not_assign_other_directly():
 
 
 # ---------------------------------------------------------------------------
-# Spec 2026-0036 — digest executes actions inline
+# Spec 2026-0038 — cmd_digest is read-only; execute_actions suspended flag
 # ---------------------------------------------------------------------------
 
 
-def _make_full_db():
-    """In-memory DB with heartbeat state + sender rules tables."""
+def _make_kv_db():
+    """In-memory DB with jarvis_kv (suspended flag set) and gmail_sender_rules."""
     con = sqlite3.connect(":memory:")
-    con.execute("CREATE TABLE gmail_heartbeat_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    con.execute(
-        """CREATE TABLE gmail_sender_rules (
-            sender_email TEXT PRIMARY KEY,
-            action TEXT NOT NULL,
-            confirmed INTEGER NOT NULL DEFAULT 0,
-            last_applied TEXT
-        )"""
-    )
+    con.execute("CREATE TABLE jarvis_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    con.execute("""CREATE TABLE gmail_sender_rules (
+        sender_email TEXT PRIMARY KEY,
+        action TEXT NOT NULL,
+        confirmed INTEGER NOT NULL DEFAULT 0,
+        last_applied TEXT
+    )""")
+    con.execute("INSERT INTO jarvis_kv VALUES ('gmail_actions_suspended', '1')")
+    con.commit()
     return con
 
 
-def test_cmd_digest_executes_trash_and_archive():
-    """cmd_digest must call trash() for trash items and modify() for archive items."""
-    con = _make_full_db()
+def test_cmd_digest_does_not_execute():
+    """cmd_digest must make zero Gmail API write calls — it is read-only."""
+    con = _make_db()
     _seed_queue(
         con,
         [
             {
-                "msg_id": "msg-trash-1",
+                "msg_id": "msg-1",
                 "sender": "Spammer",
                 "sender_email": "spam@example.com",
                 "subject": "Win a prize",
                 "action": "trash",
-                "tag": "promotions",
-            },
-            {
-                "msg_id": "msg-archive-2",
-                "sender": "Newsletter",
-                "sender_email": "news@example.com",
-                "subject": "Weekly digest",
-                "action": "archive",
-                "tag": "newsletters",
-            },
+                "tag": "other",
+            }
         ],
     )
-
     mock_service = MagicMock()
-    mock_trash = mock_service.users().messages().trash
-    mock_modify = mock_service.users().messages().modify
-
     with patch.object(skill, "init_db", return_value=con):
         with patch.object(skill, "get_gmail_service", return_value=mock_service):
-            result = skill.cmd_digest()
+            skill.cmd_digest()
+    mock_service.users.assert_not_called()
 
-    mock_trash.assert_called_once_with(userId="me", id="msg-trash-1")
-    mock_trash.return_value.execute.assert_called_once()
-    mock_modify.assert_called_once_with(
-        userId="me", id="msg-archive-2", body={"removeLabelIds": ["INBOX"]}
+
+def test_cmd_digest_queue_not_cleared():
+    """cmd_digest must NOT clear digest_queue — it persists until gmail execute runs."""
+    con = _make_db()
+    items = [
+        {
+            "msg_id": "msg-2",
+            "sender": "Newsletter",
+            "sender_email": "news@example.com",
+            "subject": "Weekly digest",
+            "action": "archive",
+            "tag": "other",
+        }
+    ]
+    _seed_queue(con, items)
+    with patch.object(skill, "init_db", return_value=con):
+        skill.cmd_digest()
+    assert _read_queue(con) == items, "digest_queue must not be cleared by cmd_digest"
+
+
+def test_execute_actions_suspended():
+    """execute_actions must return early with no API writes when suspended flag is set."""
+    con = _make_kv_db()
+    mock_service = MagicMock()
+    summary = skill.EmailSummary(
+        msg_id="m1",
+        sender="S",
+        sender_email="s@e.com",
+        subject="Sub",
+        action="trash",
+        reason="test",
     )
-    mock_modify.return_value.execute.assert_called_once()
-    assert "Actions executed automatically." in result
-    assert _read_queue(con) == []
+    result = skill.execute_actions(mock_service, [summary], con)
+    assert result is not None
+    assert "suspended" in result.lower()
+    mock_service.users.assert_not_called()
