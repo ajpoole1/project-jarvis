@@ -794,3 +794,333 @@ def test_rule_add_invalid_owner(db):
     assert "personal" in result or "altaforma" in result
     count_after = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
     assert count_after == count_before
+
+
+# ---------------------------------------------------------------------------
+# P2 intelligence layer — compare, runway, altaforma, subs-audit, coda helpers
+# ---------------------------------------------------------------------------
+
+
+def _insert_month_spend(db, year: int, month: int, categories: dict[str, float]) -> None:
+    """Insert spend transactions for a given calendar month."""
+    day = 15
+    for i, (cat, amount) in enumerate(categories.items()):
+        upsert_transaction(
+            db,
+            {
+                "id": f"hist-{year}-{month:02d}-{i}",
+                "account_id": "acct-rbc-chequing",
+                "date": f"{year}-{month:02d}-{day:02d}",
+                "amount": -abs(amount),
+                "description": f"VENDOR {cat.upper()}",
+                "category": cat,
+                "currency": "CAD",
+                "owner": "personal",
+                "is_pending": 0,
+                "source": "csv_import",
+                "note": None,
+            },
+        )
+
+
+def test_compare_month(db):
+    """compare --month returns table with Period/Baseline footer."""
+    today = date.today()
+    # Seed 3 prior months with >=5 transactions each (MIN_TXNS=5)
+    for delta in range(1, 4):
+        m = today.month - delta
+        y = today.year
+        while m <= 0:
+            m += 12
+            y -= 1
+        _insert_month_spend(
+            db,
+            y,
+            m,
+            {
+                "groceries": 300.0,
+                "dining": 80.0,
+                "utilities": 120.0,
+                "transportation": 75.0,
+                "healthcare": 50.0,
+                "entertainment": 30.0,
+            },
+        )
+
+    # Current month spend
+    upsert_transaction(
+        db,
+        _sample_txn(
+            {
+                "id": "curr-groceries",
+                "date": today.replace(day=1).isoformat(),
+                "amount": -500.0,
+                "category": "groceries",
+            }
+        ),
+    )
+
+    start = today.replace(day=1).isoformat()
+    result = _skill.cmd_compare(db, start, today.isoformat(), baseline_months=3)
+    assert "Spend comparison (month)" in result
+    assert "groceries" in result
+    assert "Period:" in result
+    assert "Baseline:" in result
+
+
+def test_compare_week(db):
+    """compare --week returns week-mode table with week baseline label."""
+    today = date.today()
+    week_monday = today - timedelta(days=today.weekday())
+
+    # Seed 4 prior weeks with enough transactions
+    for i in range(1, 5):
+        ws = week_monday - timedelta(weeks=i)
+        for j in range(3):
+            upsert_transaction(
+                db,
+                {
+                    "id": f"wk-{i}-{j}",
+                    "account_id": "acct-rbc-chequing",
+                    "date": (ws + timedelta(days=j)).isoformat(),
+                    "amount": -50.0,
+                    "description": f"VENDOR GROCERIES WK{i}",
+                    "category": "groceries",
+                    "currency": "CAD",
+                    "owner": "personal",
+                    "is_pending": 0,
+                    "source": "csv_import",
+                    "note": None,
+                },
+            )
+
+    # Current week spend
+    upsert_transaction(
+        db,
+        _sample_txn(
+            {
+                "id": "curr-wk",
+                "date": week_monday.isoformat(),
+                "amount": -200.0,
+                "category": "groceries",
+            }
+        ),
+    )
+
+    result = _skill.cmd_compare(
+        db, week_monday.isoformat(), today.isoformat(), baseline_months=8, week_mode=True
+    )
+    assert "Spend comparison (week)" in result
+    assert "groceries" in result
+    assert "week median" in result
+
+
+def test_compare_no_history(db):
+    """compare with no baseline history returns guidance message."""
+    today = date.today()
+    start = today.replace(day=1).isoformat()
+    result = _skill.cmd_compare(db, start, today.isoformat())
+    assert "Not enough history" in result or "No spend data" in result
+
+
+def test_runway(db):
+    """runway returns headline with months and top obligations."""
+    # Seed account balances
+    upsert_account(db, _sample_account({"balance_current": 5000.0}))
+    # Seed a monthly recurring charge
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner, category) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("DESJARDINS MORTGAGE", 2140.00, 30, "2026-06-01", "2026-07-01", "personal", "mortgage"),
+    )
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner, category) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("HYDRO QUEBEC", 200.00, 30, "2026-06-01", "2026-07-01", "personal", "utilities"),
+    )
+    db.commit()
+
+    result = _skill.cmd_runway(db)
+    assert "Runway:" in result
+    assert "months" in result
+    assert "Liquid:" in result
+    assert "Monthly obligations:" in result
+    assert "DESJARDINS MORTGAGE" in result
+
+
+def test_runway_include_inheritance(db):
+    """--include-inheritance adds $1,300 to liquid."""
+    upsert_account(db, _sample_account({"balance_current": 2000.0}))
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner, category) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("NETFLIX", 18.00, 30, "2026-06-01", "2026-07-01", "personal", "subscriptions"),
+    )
+    db.commit()
+
+    base = _skill.cmd_runway(db, include_inheritance=False)
+    with_inh = _skill.cmd_runway(db, include_inheritance=True)
+    assert "$1,300 inheritance" in with_inh
+    # Runway with inheritance should be numerically higher
+    def _extract_runway(text: str) -> float:
+        for word in text.split():
+            word = word.rstrip("m")
+            try:
+                return float(word)
+            except ValueError:
+                pass
+        return 0.0
+
+    assert _extract_runway(with_inh) > _extract_runway(base)
+
+
+def test_altaforma(db):
+    """altaforma returns spend grouped by category with total."""
+    today = date.today()
+    upsert_transaction(
+        db,
+        {
+            "id": "alta-1",
+            "account_id": "acct-rbc-chequing",
+            "date": today.isoformat(),
+            "amount": -45.00,
+            "description": "DIGITALOCEAN",
+            "category": "hosting",
+            "currency": "CAD",
+            "owner": "altaforma",
+            "is_pending": 0,
+            "source": "csv_import",
+            "note": None,
+        },
+    )
+    upsert_transaction(
+        db,
+        {
+            "id": "alta-2",
+            "account_id": "acct-rbc-chequing",
+            "date": today.isoformat(),
+            "amount": -20.00,
+            "description": "ANTHROPIC",
+            "category": "subscriptions",
+            "currency": "CAD",
+            "owner": "altaforma",
+            "is_pending": 0,
+            "source": "csv_import",
+            "note": None,
+        },
+    )
+
+    result = _skill.cmd_altaforma(db, quarter=False)
+    assert "Altaforma" in result
+    assert "hosting" in result or "subscriptions" in result
+    assert "Total spend" in result
+    assert "Period:" in result
+
+
+def test_subs_audit_stable(db):
+    """subs_audit marks regular monthly recurring as stable."""
+    today = date.today()
+    last_month = (today - timedelta(days=30)).isoformat()
+    next_month = (today + timedelta(days=30)).isoformat()
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("NETFLIX", 17.99, 30, last_month, next_month, "personal"),
+    )
+    db.commit()
+
+    result = _skill.cmd_subs_audit(db)
+    assert "Stable: 1" in result
+    assert "NEW (0)" in result
+    assert "MISSING (0)" in result
+
+
+def test_subs_audit_new(db):
+    """subs_audit flags recently-seen item with no consistent cadence as NEW."""
+    today = date.today()
+    last_week = (today - timedelta(days=10)).isoformat()
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("NEW SERVICE", 9.99, None, last_week, None, "personal"),
+    )
+    db.commit()
+
+    result = _skill.cmd_subs_audit(db)
+    assert "NEW (1)" in result
+    assert "NEW SERVICE" in result
+
+
+def test_weekly_coda_returns_string(tmp_path, monkeypatch):
+    """finance_weekly_coda() returns a string when there is altaforma spend this week."""
+    db_file = tmp_path / "finance.db"
+    monkeypatch.setattr(_skill, "DB_PATH", db_file)
+    conn = init_db(str(db_file))
+
+    today = date.today()
+    week_monday = today - timedelta(days=today.weekday())
+    conn.execute(
+        """INSERT INTO transactions
+           (id, account_id, date, amount, description, category, currency, owner, is_pending, source, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "alta-wk-1",
+            "acct-test",
+            week_monday.isoformat(),
+            -75.0,
+            "DIGITALOCEAN",
+            "hosting",
+            "CAD",
+            "altaforma",
+            0,
+            "csv_import",
+            None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    result = _skill.finance_weekly_coda()
+    assert result is not None
+    assert isinstance(result, str)
+    assert len(result) > 0
+
+
+def test_monthly_coda_returns_string(tmp_path, monkeypatch):
+    """finance_monthly_coda() returns a 3-line string with prior-month net."""
+    db_file = tmp_path / "finance.db"
+    monkeypatch.setattr(_skill, "DB_PATH", db_file)
+    conn = init_db(str(db_file))
+
+    today = date.today()
+    pm_end = today.replace(day=1) - timedelta(days=1)
+
+    conn.execute(
+        """INSERT INTO transactions
+           (id, account_id, date, amount, description, category, currency, owner, is_pending, source, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "pm-txn-1",
+            "acct-test",
+            pm_end.isoformat(),
+            -200.0,
+            "METRO",
+            "groceries",
+            "CAD",
+            "personal",
+            0,
+            "csv_import",
+            None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    result = _skill.finance_monthly_coda()
+    assert result is not None
+    assert isinstance(result, str)
+    lines = result.splitlines()
+    assert len(lines) == 3
+    assert "net:" in lines[0]
+    assert "Subs:" in lines[1]
+    assert "GST" in lines[2]
