@@ -134,6 +134,11 @@ CALENDAR_SUBJECT_KEYWORDS = frozenset(
 )
 
 PRIORITY_TAGS = frozenset({"family"})
+# Tags whose "keep" mail is retained but pulled out of the inbox (keep-but-archive):
+# archival records the user rarely acts on. Critical/actionable mail
+# (financial, security, health, family, anything priority or uncertain) is never
+# auto-archived — see _apply_keep_archive_policy.
+KEEP_ARCHIVE_TAGS = frozenset({"receipts", "bills", "job-search"})
 SECURITY_KEYWORDS = frozenset(
     {
         "security alert",
@@ -618,6 +623,35 @@ def _is_priority(summary: EmailSummary) -> bool:
     return False
 
 
+def _apply_keep_archive_policy(summaries: list[EmailSummary]) -> None:
+    """Keep-but-archive: 'keep' mail tagged as a retain-but-declutter category
+    (receipts/bills/job-search) is downgraded to 'archive' so it leaves the inbox
+    while staying retrievable in All Mail. The inbox — and therefore the digest —
+    then reflects only mail that still needs attention.
+
+    Safety: never archives mail the user has explicitly prioritized (priority-pattern
+    senders), anything still needing a calendar add (calendar_hint), or anything whose
+    subject carries a security/financial alert keyword. Financial/security/health/family
+    tags are outside KEEP_ARCHIVE_TAGS and so are never touched here in the first place.
+    """
+    for s in summaries:
+        if s.action != "keep" or s.tag not in KEEP_ARCHIVE_TAGS:
+            continue
+        sender_lower = s.sender_email.lower()
+        if sender_lower not in _SELF_EMAILS and any(
+            pat in sender_lower for pat in _PRIORITY_PATTERNS
+        ):
+            continue
+        if s.calendar_hint:
+            continue
+        subject_lower = s.subject.lower()
+        if any(kw in subject_lower for kw in SECURITY_KEYWORDS) or any(
+            kw in subject_lower for kw in FINANCIAL_KEYWORDS
+        ):
+            continue
+        s.action = "archive"
+
+
 def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
     seen_ids: set[str] = set()
     for label in INBOX_LABELS:
@@ -883,6 +917,7 @@ def classify_emails(emails: list[dict], con: sqlite3.Connection) -> list[EmailSu
             if not uncertain and email not in NEVER_CACHE_SENDERS:
                 cache_rule(con, email, action, confirmed=False)
 
+    _apply_keep_archive_policy(results)
     return results
 
 
