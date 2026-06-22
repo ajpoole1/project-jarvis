@@ -1015,6 +1015,14 @@ def execute_actions(
     Invariant: 'none' is in the desired set only when no real tag applies;
     any real tag drives 'none' into removeLabelIds automatically.
     """
+    try:
+        suspended = con.execute(
+            "SELECT value FROM jarvis_kv WHERE key='gmail_actions_suspended'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        suspended = None
+    if suspended:
+        return "Gmail actions suspended. Clear the suspension before executing."
     all_jarvis_ids: set[str] = set(label_map.values()) if label_map else set()
     none_label_id: str = (label_map or {}).get("none", "")
 
@@ -1547,7 +1555,7 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
 
 
 def cmd_digest() -> str:
-    """Post the queued digest of non-priority actionable emails and clear the queue."""
+    """Post the queued digest of non-priority actionable emails."""
     con = init_db()
     queue_json = get_heartbeat_state(con, "digest_queue") or "[]"
     queue = json.loads(queue_json)
@@ -1570,21 +1578,7 @@ def cmd_digest() -> str:
             lines.append(f"  • {item['subject'][:60]}")
         if len(items) > 8:
             lines.append(f"  _…and {len(items) - 8} more_")
-    lines.append("\nActions executed automatically.")
-    service = get_gmail_service()
-    for item in queue:
-        try:
-            if item["action"] in ("trash", "unsubscribe"):
-                service.users().messages().trash(userId="me", id=item["msg_id"]).execute()
-            elif item["action"] == "archive":
-                service.users().messages().modify(
-                    userId="me", id=item["msg_id"], body={"removeLabelIds": ["INBOX"]}
-                ).execute()
-        except Exception:
-            pass
-        if item.get("sender_email"):
-            cache_rule(con, item["sender_email"], item["action"], confirmed=True)
-    set_heartbeat_state(con, "digest_queue", "[]")
+    lines.append("\nSay **Jarvis, gmail stage** to review and execute cleanup.")
     return "\n".join(lines)
 
 
