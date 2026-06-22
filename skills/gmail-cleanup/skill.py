@@ -1510,11 +1510,6 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
             s.watch_label = f"flagged #{fid}"
 
     priority = [s for s in summaries if _is_priority(s) or s.watch_label]
-    digest_items = [
-        s
-        for s in summaries
-        if not _is_priority(s) and not s.watch_label and not s.uncertain and s.action != "keep"
-    ]
 
     output_parts = []
 
@@ -1532,53 +1527,42 @@ def cmd_heartbeat(batch_size: int = 50) -> str:
         lines.append("\nSay **Jarvis, gmail stage** to run full cleanup.")
         output_parts.append("\n".join(lines))
 
-    if digest_items:
-        existing_json = get_heartbeat_state(con, "digest_queue") or "[]"
-        queue = json.loads(existing_json)
-        for s in digest_items:
-            queue.append(
-                {
-                    "msg_id": s.msg_id,
-                    "sender": s.sender,
-                    "sender_email": s.sender_email,
-                    "subject": s.subject,
-                    "action": s.action,
-                    "tag": s.tag,
-                }
-            )
-        set_heartbeat_state(con, "digest_queue", json.dumps(queue))
-        output_parts.append(
-            f"DIGEST ADDED: {len(digest_items)} emails queued ({len(queue)} total pending)."
-        )
-
     return "\n\n".join(output_parts) if output_parts else "SILENT"
 
 
 def cmd_digest() -> str:
-    """Post the queued digest of non-priority actionable emails."""
+    """Full inbox status report. Shows all emails with proposed actions. Read-only."""
+    service = get_gmail_service()
     con = init_db()
-    queue_json = get_heartbeat_state(con, "digest_queue") or "[]"
-    queue = json.loads(queue_json)
+    messages = fetch_inbox_messages(service, DEFAULT_BATCH_SIZE)
 
-    if not queue:
-        return "📭 Gmail: inbox clean — nothing to action."
+    if not messages:
+        return "📭 Gmail: inbox empty."
+
+    summaries = classify_emails(messages, con)
+    save_pending(con, summaries)
 
     grouped: dict[str, list] = {a: [] for a in ACTIONS}
-    for item in queue:
-        grouped[item["action"]].append(item)
+    for s in summaries:
+        grouped[s.action].append(s)
 
-    total = len(queue)
-    lines = [f"**Gmail digest** ({total} emails to clean up)\n"]
-    for action in ("trash", "unsubscribe", "archive"):
+    total = len(summaries)
+    lines = [f"**Gmail digest** ({total} emails in inbox)\n"]
+
+    for action in ("trash", "unsubscribe", "archive", "keep"):
         items = grouped[action]
         if not items:
             continue
-        lines.append(f"**{action.upper()} ({len(items)})**")
+        label = "KEEP" if action == "keep" else action.upper()
+        lines.append(f"**{label} ({len(items)})**")
         for item in items[:8]:
-            lines.append(f"  • {item['subject'][:60]}")
+            lines.append(f"  • {item.sender[:30]} — {item.subject[:50]}")
         if len(items) > 8:
             lines.append(f"  _…and {len(items) - 8} more_")
-    lines.append("\nSay **Jarvis, gmail stage** to review and execute cleanup.")
+
+    lines.append(
+        "\nSay **Jarvis, gmail execute** to apply, or **adjust <sender> <action>** to change individual items."
+    )
     return "\n".join(lines)
 
 
