@@ -34,6 +34,14 @@ DRY_RUN = os.environ.get("GMAIL_DRY_RUN", "true").lower() == "true"
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
+INBOX_LABELS = [
+    "INBOX",
+    "CATEGORY_UPDATES",
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_FORUMS",
+]
+
 ACTIONS = ("archive", "trash", "unsubscribe", "keep")
 TAGS = (
     "receipts",
@@ -611,20 +619,24 @@ def _is_priority(summary: EmailSummary) -> bool:
 
 
 def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
-    msg_ids = []
-    page_token = None
-    while len(msg_ids) < batch_size:
-        fetch = min(500, batch_size - len(msg_ids))
-        kwargs = {"userId": "me", "labelIds": ["INBOX"], "maxResults": fetch}
-        if page_token:
-            kwargs["pageToken"] = page_token
-        result = service.users().messages().list(**kwargs).execute()
-        msg_ids += [m["id"] for m in result.get("messages", [])]
-        page_token = result.get("nextPageToken")
-        if not page_token:
+    seen_ids: set[str] = set()
+    for label in INBOX_LABELS:
+        page_token = None
+        while len(seen_ids) < batch_size:
+            fetch = min(500, batch_size - len(seen_ids))
+            kwargs = {"userId": "me", "labelIds": [label], "maxResults": fetch}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            result = service.users().messages().list(**kwargs).execute()
+            for m in result.get("messages", []):
+                seen_ids.add(m["id"])
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        if len(seen_ids) >= batch_size:
             break
     messages = []
-    for msg_id in msg_ids:
+    for msg_id in list(seen_ids)[:batch_size]:
         msg = (
             service.users()
             .messages()
@@ -642,23 +654,28 @@ def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
 
 def fetch_new_messages(service, since_epoch: int | None, batch_size: int) -> list[dict]:
     """Fetch inbox messages newer than since_epoch (Unix seconds). No filter if None."""
-    query = "in:inbox"
+    label_clause = " ".join(
+        f"label:{lbl.lower().replace('_', '-')}" if lbl != "INBOX" else "in:inbox"
+        for lbl in INBOX_LABELS
+    )
+    query = f"{{{label_clause}}}"
     if since_epoch:
         query += f" after:{since_epoch}"
-    msg_ids = []
+    seen_ids: set[str] = set()
     page_token = None
-    while len(msg_ids) < batch_size:
-        fetch = min(500, batch_size - len(msg_ids))
+    while len(seen_ids) < batch_size:
+        fetch = min(500, batch_size - len(seen_ids))
         kwargs = {"userId": "me", "q": query, "maxResults": fetch}
         if page_token:
             kwargs["pageToken"] = page_token
         result = service.users().messages().list(**kwargs).execute()
-        msg_ids += [m["id"] for m in result.get("messages", [])]
+        for m in result.get("messages", []):
+            seen_ids.add(m["id"])
         page_token = result.get("nextPageToken")
         if not page_token:
             break
     messages = []
-    for msg_id in msg_ids:
+    for msg_id in list(seen_ids)[:batch_size]:
         msg = (
             service.users()
             .messages()
