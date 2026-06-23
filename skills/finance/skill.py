@@ -328,6 +328,156 @@ def cmd_import_holdings(conn, file_path: str, as_of: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Command: ingest (dropbox sweep)
+# ---------------------------------------------------------------------------
+
+FINANCE_INBOX_DIR = Path("/mnt/c/Users/aaron/jarvis-finance/inbox")
+_DISCORD_SCRIPT = Path(__file__).parents[2] / "scripts" / "discord_post.py"
+
+# TD files carry no account number — we require a filename hint to map them.
+# Filename prefix (stem prefix before first non-digit non-letter char) → account_id.
+_TD_FILENAME_MAP: dict[str, str] = {
+    "td-chq-5116": "td-chq-5116",
+    "td-visa-1225": "td-visa-1225",
+    "td-cc-1225": "td-cc-1225",
+}
+
+
+def _ingest_post_discord(message: str) -> None:
+    import subprocess
+
+    try:
+        subprocess.run(
+            ["python3", str(_DISCORD_SCRIPT)],
+            input=message,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _td_account_from_filename(stem: str) -> str | None:
+    stem_lower = stem.lower()
+    for prefix, aid in _TD_FILENAME_MAP.items():
+        if stem_lower.startswith(prefix):
+            return aid
+    return None
+
+
+def cmd_ingest(conn, post_discord: bool = True) -> str:
+    """Sweep the finance inbox, import CSVs, archive successes, quarantine failures."""
+    from skills.finance.csv_import import detect_format
+
+    inbox = FINANCE_INBOX_DIR
+    if not inbox.exists():
+        return f"Inbox not found: {inbox}"
+
+    archive_dir = inbox / "archive"
+    failed_dir = inbox / "failed"
+    archive_dir.mkdir(exist_ok=True)
+    failed_dir.mkdir(exist_ok=True)
+
+    csv_files = sorted(inbox.glob("*.csv"))
+    if not csv_files:
+        return "Finance inbox empty — nothing to import."
+
+    results: list[str] = []
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    for path in csv_files:
+        fmt = detect_format(str(path))
+
+        # Unidentified — quarantine
+        if fmt == "generic":
+            dest = failed_dir / path.name
+            path.rename(dest)
+            msg = (
+                f"Finance inbox: dropped a file I can't identify — {path.name!r}. "
+                f"Which bank/account? (move back to inbox when resolved)"
+            )
+            if post_discord:
+                _ingest_post_discord(msg)
+            results.append(f"FAILED {path.name} — unrecognized format")
+            continue
+
+        # TD files require account_id — infer from filename if possible
+        account_id: str | None = None
+        if fmt in ("td_cc", "td_bank"):
+            account_id = _td_account_from_filename(path.stem)
+            if account_id is None:
+                dest = failed_dir / path.name
+                path.rename(dest)
+                hint = "td-chq-5116" if fmt == "td_bank" else "td-visa-1225"
+                msg = (
+                    f"Finance inbox: TD file {path.name!r} has no account number in the file. "
+                    f"Rename to start with the account ID (e.g. {hint!r}) and re-drop."
+                )
+                if post_discord:
+                    _ingest_post_discord(msg)
+                results.append(f"FAILED {path.name} — TD file needs account ID in filename")
+                continue
+
+        # Parse and import
+        try:
+            txns = parse_csv(str(path), account_id)
+            balances = parse_csv_balances(str(path), account_id)
+        except Exception as exc:
+            dest = failed_dir / path.name
+            path.rename(dest)
+            results.append(f"FAILED {path.name} — parse error: {exc}")
+            continue
+
+        inserted = skipped = 0
+        new_ids: list[str] = []
+        seen_accounts: set[str] = set()
+        for txn in txns:
+            txn.setdefault("owner", "personal")
+            aid = txn.get("account_id", "")
+            if aid and aid not in seen_accounts:
+                seen_accounts.add(aid)
+                upsert_account(conn, _account_meta_from_id(aid, "personal", balances.get(aid)))
+            if upsert_transaction(conn, txn):
+                inserted += 1
+                new_ids.append(txn["id"])
+            else:
+                skipped += 1
+
+        for aid, bal in balances.items():
+            if aid not in seen_accounts:
+                upsert_account(conn, _account_meta_from_id(aid, "personal", bal))
+
+        if new_ids:
+            apply_finance_rules(conn, new_ids)
+        recompute_balances(conn)
+
+        # Detect new recurring patterns if we imported anything
+        if inserted:
+            detect_recurring(conn)
+
+        # Archive the file
+        dest = archive_dir / f"{timestamp}-{path.name}"
+        path.rename(dest)
+
+        # Build Discord summary
+        account_names = (
+            ", ".join(_ACCOUNT_NAMES.get(aid, aid) for aid in sorted(seen_accounts))
+            or "unknown account"
+        )
+        summary = (
+            f"Finance import: {account_names} — "
+            f"{inserted} imported, {skipped} duplicate. "
+            f"File archived."
+        )
+        if post_discord:
+            _ingest_post_discord(summary)
+        results.append(f"OK {path.name}: {inserted} new, {skipped} dup — {account_names}")
+
+    return "\n".join(results) if results else "No CSV files processed."
+
+
+# ---------------------------------------------------------------------------
 # Command: accounts
 # ---------------------------------------------------------------------------
 
@@ -1400,6 +1550,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="finance", description="Personal CFO skill")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p_ingest = sub.add_parser("ingest", help="Sweep finance inbox, import CSVs, archive/quarantine")
+    p_ingest.add_argument(
+        "--no-discord", action="store_true", help="Suppress Discord summary posting"
+    )
+
     p_import = sub.add_parser("import", help="Import CSV transactions")
     p_import.add_argument("file", help="CSV file path")
     p_import.add_argument("--account", default=None, metavar="ID", help="Account ID to assign")
@@ -1548,7 +1703,10 @@ def main() -> None:
     conn = init_db(str(DB_PATH))
 
     try:
-        if args.cmd == "import":
+        if args.cmd == "ingest":
+            print(cmd_ingest(conn, post_discord=not args.no_discord))
+
+        elif args.cmd == "import":
             print(cmd_import(conn, args.file, args.account, args.owner))
 
         elif args.cmd == "import-holdings":

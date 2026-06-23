@@ -842,6 +842,117 @@ def test_anthropic_api_matches_altaforma(db):
 
 
 # ---------------------------------------------------------------------------
+# WS2: ingest (dropbox sweep)
+# ---------------------------------------------------------------------------
+
+
+def _write_rbc_csv(path) -> None:
+    """Write a minimal valid RBC CSV to path."""
+    path.write_text(
+        "Account Type,Account Number,Transaction Date,Cheque Number,Description 1,"
+        "Description 2,CAD$,USD$\n"
+        "Chequing,5118989,6/10/2026,,METRO GROCERIES,,-55.40,\n"
+        "Chequing,5118989,6/12/2026,,PAYROLL DEPOSIT,,+2800.00,\n",
+        encoding="utf-8-sig",
+    )
+
+
+def test_ingest_happy_path_rbc(tmp_path, monkeypatch):
+    """RBC CSV in inbox → imported, archived, no file left in inbox."""
+    inbox = tmp_path / "inbox"
+    archive = inbox / "archive"
+    inbox.mkdir()
+
+    _write_rbc_csv(inbox / "rbc-chequing-june.csv")
+
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+
+    result = _skill.cmd_ingest(conn, post_discord=False)
+
+    assert "OK" in result
+    assert "rbc-chequing-june.csv" in result
+    assert not (inbox / "rbc-chequing-june.csv").exists()
+    archived = list(archive.glob("*rbc-chequing-june.csv"))
+    assert len(archived) == 1
+    conn.close()
+
+
+def test_ingest_unidentified_goes_to_failed(tmp_path, monkeypatch):
+    """Non-CSV-format file → moved to failed/, not imported."""
+    inbox = tmp_path / "inbox"
+    failed = inbox / "failed"
+    inbox.mkdir()
+
+    garbage = inbox / "mystery.csv"
+    garbage.write_text("this,is,not,a,bank,export\nrow1,row2,row3,row4,row5,row6\n")
+
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+
+    result = _skill.cmd_ingest(conn, post_discord=False)
+
+    assert "FAILED" in result
+    assert (failed / "mystery.csv").exists()
+    assert not garbage.exists()
+    conn.close()
+
+
+def test_ingest_td_without_account_in_filename(tmp_path, monkeypatch):
+    """TD file without account ID in filename → quarantined to failed/."""
+    inbox = tmp_path / "inbox"
+    failed = inbox / "failed"
+    inbox.mkdir()
+
+    # A valid TD bank file (5-col, YYYY-MM-DD)
+    td_file = inbox / "statement-june.csv"
+    td_file.write_text(
+        "2026-06-10,PAYROLL DEPOSIT,+2800.00,,5000.00\n" "2026-06-12,TIM HORTONS,-4.75,,4995.25\n"
+    )
+
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+
+    result = _skill.cmd_ingest(conn, post_discord=False)
+
+    assert "FAILED" in result
+    assert (failed / "statement-june.csv").exists()
+    conn.close()
+
+
+def test_ingest_empty_inbox(tmp_path, monkeypatch):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+    result = _skill.cmd_ingest(conn, post_discord=False)
+    assert "empty" in result.lower()
+    conn.close()
+
+
+def test_ingest_idempotent(tmp_path, monkeypatch):
+    """Running ingest twice on the same file only imports once (dedup)."""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _write_rbc_csv(inbox / "rbc-chequing-june.csv")
+
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+
+    _skill.cmd_ingest(conn, post_discord=False)
+
+    # Second drop: same file re-appears in inbox
+    _write_rbc_csv(inbox / "rbc-chequing-june.csv")
+    result2 = _skill.cmd_ingest(conn, post_discord=False)
+
+    # Should report all as duplicates, not new inserts
+    assert "OK" in result2
+    row_count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    assert row_count == 2  # only original 2 rows exist
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # P2 intelligence layer — compare, runway, altaforma, subs-audit, coda helpers
 # ---------------------------------------------------------------------------
 
