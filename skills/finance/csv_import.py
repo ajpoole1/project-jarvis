@@ -1,15 +1,23 @@
-"""CSV importer for RBC, MBNA, and Rogers credit card statements.
+"""CSV importer for RBC, TD, MBNA, Rogers, Desjardins, and Wealthsimple statements.
 
-Dedup key: SHA256(date + str(amount) + description) so the same transaction
-imported twice produces the same id and is silently skipped by upsert_transaction.
+Dedup key: SHA256(date + str(amount) + description) — same row imported twice
+produces the same id and is silently skipped by upsert_transaction.
 
 Amount sign convention (matches db.py):
-  negative  = money out (purchases, fees)
-  positive  = money in (payments, refunds, credits)
+  negative  = money out (purchases, fees, payments leaving bank)
+  positive  = money in (salary, CC payment received, refunds)
 
-RBC CSV: CAD$ column already uses our sign convention (negative = spend).
-MBNA CSV: purchases are positive in the export → we negate them.
-Rogers CSV: separate Credit/Debit columns → amount = credit - debit.
+Format notes:
+  RBC: CAD$ column uses our sign convention (negative = spend) already.
+  MBNA: purchases positive in export → negated here.
+  Rogers: Credit/Debit columns → amount = credit - debit.
+  TD CC: charge/payment columns → amount = payment - charge.
+  TD Chequing: debit/credit columns → amount = credit - debit.
+  Desjardins: PCA (chequing) and LN1 (mortgage) rows handled separately.
+  Wealthsimple: non-CAD rows skipped; account ID derived from filename code.
+
+detect_format(path) returns one of:
+  'rbc', 'mbna', 'rogers', 'td_cc', 'td_bank', 'desjardins', 'wealthsimple', 'generic'
 """
 
 from __future__ import annotations
