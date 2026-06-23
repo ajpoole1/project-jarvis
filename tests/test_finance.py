@@ -669,6 +669,104 @@ def test_cmd_tag_not_found(populated_db):
     assert "not found" in result.lower()
 
 
+# ---------------------------------------------------------------------------
+# WS3: tag --rule / --confirm-rule / --discard-rule
+# ---------------------------------------------------------------------------
+
+
+def _seed_tag_txns(db):
+    """Insert several transactions with the same merchant prefix for rule-proposal tests.
+
+    Uses realistic Netflix descriptions: stable prefix + varying date suffix so the
+    derived pattern (NETFLIX.COM%) matches all 4 rows.
+    """
+    from skills.finance.db import upsert_transaction
+
+    for i in range(4):
+        upsert_transaction(
+            db,
+            {
+                "id": f"ws3-{i}",
+                "account_id": "rbc-04330-5118989",
+                "date": f"2026-0{i + 1}-15",
+                "amount": -(30.0 + i),
+                "description": f"NETFLIX.COM #2026-0{i + 1}-15",
+                "category": None,
+                "owner": "personal",
+            },
+        )
+
+
+def test_cmd_tag_propose_rule_writes_proposal(db):
+    _seed_tag_txns(db)
+    result = _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions", propose_rule=True)
+    assert "Rule proposal" in result
+    assert "NETFLIX.COM" in result
+    assert "4" in result  # 4 matching transactions
+    assert "--confirm-rule" in result
+    row = db.execute("SELECT * FROM tag_proposals").fetchone()
+    assert row is not None
+    assert "NETFLIX" in row["match_merchant"]
+    assert row["category"] == "subscriptions"
+    assert row["match_count"] == 4
+
+
+def test_cmd_tag_propose_rule_tags_the_one_transaction(db):
+    _seed_tag_txns(db)
+    _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions", propose_rule=True)
+    row = db.execute("SELECT category, owner FROM transactions WHERE id = 'ws3-0'").fetchone()
+    assert row["category"] == "subscriptions"
+    assert row["owner"] == "personal"
+
+
+def test_cmd_tag_confirm_writes_rule_and_back_applies(db):
+    _seed_tag_txns(db)
+    _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions", propose_rule=True)
+    prop = db.execute("SELECT id FROM tag_proposals").fetchone()
+    result = _skill.cmd_tag_confirm(db, prop["id"])
+    assert "Rule written" in result
+    assert "subscriptions" in result
+    # All 4 transactions should now be categorised
+    rows = db.execute("SELECT category FROM transactions WHERE id LIKE 'ws3-%'").fetchall()
+    assert all(r["category"] == "subscriptions" for r in rows)
+    # Proposal should be deleted
+    leftover = db.execute("SELECT * FROM tag_proposals WHERE id = ?", (prop["id"],)).fetchone()
+    assert leftover is None
+
+
+def test_cmd_tag_confirm_not_found(db):
+    result = _skill.cmd_tag_confirm(db, 9999)
+    assert "not found" in result.lower()
+
+
+def test_cmd_tag_discard_removes_proposal(db):
+    _seed_tag_txns(db)
+    _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions", propose_rule=True)
+    prop = db.execute("SELECT id FROM tag_proposals").fetchone()
+    result = _skill.cmd_tag_discard(db, prop["id"])
+    assert "discarded" in result.lower()
+    leftover = db.execute("SELECT * FROM tag_proposals WHERE id = ?", (prop["id"],)).fetchone()
+    assert leftover is None
+    # No proposal-derived rule should have been written (seed rule for NETFLIX% is pre-existing)
+    rules = db.execute(
+        "SELECT * FROM finance_rules WHERE match_merchant = 'NETFLIX.COM%'"
+    ).fetchall()
+    assert len(rules) == 0
+
+
+def test_cmd_tag_discard_not_found(db):
+    result = _skill.cmd_tag_discard(db, 9999)
+    assert "not found" in result.lower()
+
+
+def test_cmd_tag_without_rule_flag_no_proposal(db):
+    _seed_tag_txns(db)
+    result = _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions")
+    assert "Rule proposal" not in result
+    count = db.execute("SELECT COUNT(*) FROM tag_proposals").fetchone()[0]
+    assert count == 0
+
+
 def test_cmd_bills_due_no_bills(populated_db):
     result = _skill.cmd_bills_due(populated_db, days=7)
     assert "No bills due" in result

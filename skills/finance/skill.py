@@ -17,7 +17,9 @@ Commands:
   runway [--include-inheritance]
   altaforma [--quarter]
   subs-audit
-  tag <txn_id> <personal|altaforma> [--category CAT]
+  tag <txn_id> <personal|altaforma> [--category CAT] [--rule]
+  tag --confirm-rule <id>
+  tag --discard-rule <id>
   rule set --merchant PAT [--descriptor D] [--recurrence TYPE]
           [--amount-min N --amount-max N] --category CAT [--owner OWN] [--transfer]
   rule list [--merchant PAT]
@@ -56,6 +58,7 @@ from skills.finance.db import (  # noqa: E402
     _normalize_merchant,
     apply_finance_rules,
     apply_finance_rules_all,
+    confirm_tag_rule,
     delete_finance_rule,
     detect_recurring,
     get_accounts,
@@ -63,6 +66,7 @@ from skills.finance.db import (  # noqa: E402
     get_recurring,
     get_transactions,
     init_db,
+    propose_tag_rule,
     recompute_balances,
     set_balance_anchor,
     upsert_account,
@@ -1096,7 +1100,38 @@ def cmd_bills_due(conn, days: int = 7) -> str:
 # ---------------------------------------------------------------------------
 
 
-def cmd_tag(conn, txn_id: str, owner: str, category: str | None = None) -> str:
+def _derive_merchant_pattern(description: str) -> str:
+    """Turn a raw transaction description into a LIKE pattern for generalisation.
+
+    Strategy: strip trailing noise tokens (date-stamps, reference numbers,
+    card suffixes) and wrap the stable prefix with a trailing wildcard.
+    """
+    # Upper-case for consistency with finance_rules conventions
+    desc = description.upper().strip()
+    # Strip common noise suffixes: dates like #2026-06-01, ref codes, card numbers
+    desc = re.sub(r"\s+#?\d{4}-\d{2}-\d{2}.*$", "", desc)
+    desc = re.sub(r"\s+REF\s*\d+.*$", "", desc)
+    desc = re.sub(r"\s+\d{4}$", "", desc)
+    desc = desc.strip()
+    if not desc:
+        return description.upper() + "%"
+    return desc + "%"
+
+
+def cmd_tag(
+    conn,
+    txn_id: str,
+    owner: str,
+    category: str | None = None,
+    propose_rule: bool = False,
+) -> str:
+    """Tag a single transaction; optionally propose a generalising rule.
+
+    With propose_rule=True: after tagging the one transaction, derive a LIKE
+    pattern from its description, count historical matches, and write a
+    tag_proposals row. Returns a staged proposal the user must confirm with
+    `finance tag --confirm-rule <id>`.
+    """
     row = conn.execute(
         "SELECT id, date, amount, description FROM transactions WHERE id = ?",
         (txn_id,),
@@ -1127,10 +1162,62 @@ def cmd_tag(conn, txn_id: str, owner: str, category: str | None = None) -> str:
     conn.commit()
 
     cat_str = f", category={category}" if category else ""
-    return (
+    tag_line = (
         f"✓ [{tid[:8]}] {row['date']}  {_fmt_amount(row['amount'])}  "
         f"{row['description']} → owner={owner}{cat_str}"
     )
+
+    if not propose_rule:
+        return tag_line
+
+    # --- Generalising rule proposal ---
+    pattern = _derive_merchant_pattern(row["description"])
+    import fnmatch
+
+    like_pattern = pattern.replace("%", "*").replace("_", "?")
+    all_txns = conn.execute(
+        "SELECT id, date, amount, description, owner, category FROM transactions ORDER BY date DESC"
+    ).fetchall()
+    matching = [
+        dict(t) for t in all_txns if fnmatch.fnmatch((t["description"] or "").upper(), like_pattern)
+    ]
+    sample = matching[:5]
+    prop_id = propose_tag_rule(conn, pattern, category, owner, len(matching), sample)
+
+    sample_lines = "\n".join(
+        f"  [{t['id'][:8]}] {t['date']}  {_fmt_amount(t['amount'])}  "
+        f"{t['description']}  [{t['category'] or '?'}→{category or owner}]"
+        for t in sample
+    )
+    return (
+        f"{tag_line}\n\n"
+        f"**Rule proposal #{prop_id}:** apply `{pattern}` → owner={owner}"
+        + (f", category={category}" if category else "")
+        + f"\n  Matches {len(matching)} historical transaction(s). Sample:\n{sample_lines}\n\n"
+        f"Confirm with: `finance tag --confirm-rule {prop_id}`\n"
+        f"Discard with: `finance tag --discard-rule {prop_id}`"
+    )
+
+
+def cmd_tag_confirm(conn, proposal_id: int) -> str:
+    """Apply a staged tag_proposals entry: write the rule and back-apply to all history."""
+    rule, updated = confirm_tag_rule(conn, proposal_id)
+    if rule is None:
+        return f"Proposal #{proposal_id} not found (already confirmed/discarded?)."
+    cat_str = f", category={rule['category']}" if rule.get("category") else ""
+    return (
+        f"✓ Rule written: `{rule['match_merchant']}` → owner={rule['owner']}{cat_str}\n"
+        f"  Back-applied to {updated} matching transaction(s)."
+    )
+
+
+def cmd_tag_discard(conn, proposal_id: int) -> str:
+    """Discard a staged tag proposal without writing a rule."""
+    cur = conn.execute("DELETE FROM tag_proposals WHERE id = ?", (proposal_id,))
+    conn.commit()
+    if cur.rowcount:
+        return f"Proposal #{proposal_id} discarded."
+    return f"Proposal #{proposal_id} not found."
 
 
 # ---------------------------------------------------------------------------
@@ -1643,10 +1730,29 @@ def main() -> None:
     p_bills = sub.add_parser("bills-due", help="Upcoming obligations vs chequing")
     p_bills.add_argument("--days", type=int, default=7, metavar="N")
 
-    p_tag = sub.add_parser("tag", help="Tag transaction owner/category")
-    p_tag.add_argument("txn_id")
-    p_tag.add_argument("owner", choices=["personal", "altaforma"])
+    p_tag = sub.add_parser("tag", help="Tag transaction owner/category; optionally propose a rule")
+    p_tag.add_argument("txn_id", nargs="?", default=None)
+    p_tag.add_argument("owner", nargs="?", choices=["personal", "altaforma"], default=None)
     p_tag.add_argument("--category", default=None, metavar="CAT")
+    p_tag.add_argument(
+        "--rule",
+        action="store_true",
+        help="After tagging, derive a generalising rule and propose it for confirmation",
+    )
+    p_tag.add_argument(
+        "--confirm-rule",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Confirm a previously proposed rule (writes rule + back-applies)",
+    )
+    p_tag.add_argument(
+        "--discard-rule",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Discard a previously proposed rule without writing it",
+    )
 
     p_rule = sub.add_parser("rule", help="Manage finance_rules decision layer")
     rule_sub = p_rule.add_subparsers(dest="rule_cmd", required=True)
@@ -1778,7 +1884,14 @@ def main() -> None:
             print(cmd_bills_due(conn, args.days))
 
         elif args.cmd == "tag":
-            print(cmd_tag(conn, args.txn_id, args.owner, args.category))
+            if args.confirm_rule is not None:
+                print(cmd_tag_confirm(conn, args.confirm_rule))
+            elif args.discard_rule is not None:
+                print(cmd_tag_discard(conn, args.discard_rule))
+            elif args.txn_id and args.owner:
+                print(cmd_tag(conn, args.txn_id, args.owner, args.category, args.rule))
+            else:
+                print("Usage: finance tag <txn_id> <owner> [--category CAT] [--rule]")
 
         elif args.cmd == "rule":
             if args.rule_cmd == "set":

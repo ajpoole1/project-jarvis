@@ -127,6 +127,18 @@ CREATE TABLE IF NOT EXISTS goals (
     account_id     TEXT REFERENCES accounts(id),
     notes          TEXT
 );
+
+-- Ephemeral staging table for tag --rule proposals awaiting user confirmation.
+-- Rows expire after the user confirms or declines; old rows are harmless.
+CREATE TABLE IF NOT EXISTS tag_proposals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_merchant TEXT NOT NULL,
+    category       TEXT,
+    owner          TEXT NOT NULL DEFAULT 'personal',
+    match_count    INTEGER NOT NULL,
+    sample_json    TEXT,
+    created_at     TEXT NOT NULL
+);
 """
 
 
@@ -603,6 +615,61 @@ def apply_finance_rules_all(conn: sqlite3.Connection) -> int:
                 break
     conn.commit()
     return updated
+
+
+# ---------------------------------------------------------------------------
+# tag_proposals — ephemeral staging for tag --rule / tag --confirm-rule
+# ---------------------------------------------------------------------------
+
+
+def propose_tag_rule(
+    conn: sqlite3.Connection,
+    match_merchant: str,
+    category: str | None,
+    owner: str,
+    match_count: int,
+    sample: list[dict],
+) -> int:
+    """Write a pending rule proposal. Returns the proposal id."""
+    import json
+    from datetime import UTC, datetime
+
+    cur = conn.execute(
+        "INSERT INTO tag_proposals (match_merchant, category, owner, match_count, sample_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            match_merchant,
+            category,
+            owner,
+            match_count,
+            json.dumps(sample),
+            datetime.now(UTC).isoformat(),
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def confirm_tag_rule(conn: sqlite3.Connection, proposal_id: int) -> tuple[dict | None, int]:
+    """Confirm a proposal: write the finance_rules row, back-apply, delete proposal.
+
+    Returns (rule_dict, rows_updated) or (None, 0) if proposal not found.
+    """
+    row = conn.execute("SELECT * FROM tag_proposals WHERE id = ?", (proposal_id,)).fetchone()
+    if not row:
+        return None, 0
+    rule = {
+        "match_merchant": row["match_merchant"],
+        "category": row["category"],
+        "owner": row["owner"],
+        "priority": 5,
+        "note": f"generalised from tag --confirm-rule {proposal_id}",
+    }
+    upsert_finance_rule(conn, rule)
+    updated = apply_finance_rules_all(conn)
+    conn.execute("DELETE FROM tag_proposals WHERE id = ?", (proposal_id,))
+    conn.commit()
+    return rule, updated
 
 
 # ---------------------------------------------------------------------------
