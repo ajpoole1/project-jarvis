@@ -13,7 +13,14 @@ import re
 import sqlite3
 import statistics
 from collections import defaultdict
-from datetime import UTC, date, timedelta
+from datetime import date, timedelta
+
+try:
+    from datetime import UTC  # Python 3.11+
+except ImportError:
+    from datetime import timezone
+
+    UTC = timezone.utc  # type: ignore[assignment]  # noqa: UP017
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -503,15 +510,20 @@ def upsert_finance_rule(conn: sqlite3.Connection, rule: dict) -> int:
 
 
 def get_finance_rules(conn: sqlite3.Connection, merchant_filter: str | None = None) -> list[dict]:
-    """Return finance_rules rows, optionally filtered by merchant substring."""
-    if merchant_filter:
-        rows = conn.execute(
-            "SELECT * FROM finance_rules WHERE match_merchant LIKE ? ORDER BY priority DESC, id",
-            (f"%{merchant_filter}%",),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM finance_rules ORDER BY priority DESC, id").fetchall()
-    return [dict(r) for r in rows]
+    """Return finance_rules rows as plain dicts, optionally filtered by merchant substring."""
+    orig_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        if merchant_filter:
+            rows = conn.execute(
+                "SELECT * FROM finance_rules WHERE match_merchant LIKE ? ORDER BY priority DESC, id",
+                (f"%{merchant_filter}%",),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM finance_rules ORDER BY priority DESC, id").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.row_factory = orig_factory
 
 
 def delete_finance_rule(conn: sqlite3.Connection, rule_id: int) -> bool:
@@ -593,7 +605,11 @@ def apply_finance_rules(conn: sqlite3.Connection, txn_ids: list[str]) -> int:
 
     updated = 0
     for txn in txns:
-        txn_dict = dict(txn)
+        txn_dict = (
+            dict(txn)
+            if isinstance(txn, sqlite3.Row)
+            else {"id": txn[0], "description": txn[1], "amount": txn[2]}
+        )
         for rule in rules:
             if _match_finance_rule(rule, txn_dict):
                 set_parts = []
@@ -622,7 +638,11 @@ def apply_finance_rules_all(conn: sqlite3.Connection) -> int:
 
     updated = 0
     for txn in txns:
-        txn_dict = dict(txn)
+        txn_dict = (
+            dict(txn)
+            if isinstance(txn, sqlite3.Row)
+            else {"id": txn[0], "description": txn[1], "amount": txn[2]}
+        )
         for rule in rules:
             if _match_finance_rule(rule, txn_dict):
                 set_parts = []

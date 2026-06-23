@@ -804,6 +804,30 @@ def test_apply_finance_rules_handles_more_than_999_ids(db):
     assert updated >= 0
 
 
+def test_apply_finance_rules_without_row_factory(tmp_path):
+    """apply_finance_rules must not crash with TypeError when row_factory is not set."""
+    import sqlite3 as _sqlite3
+
+    from skills.finance.db import _DDL, _migrate, _seed_transfer_rules, apply_finance_rules
+
+    conn = _sqlite3.connect(str(tmp_path / "raw.db"))
+    # No row_factory — rows are plain tuples
+    conn.executescript(_DDL)
+    _migrate(conn)
+    conn.commit()
+    _seed_transfer_rules(conn)
+    conn.execute(
+        "INSERT INTO transactions (id, account_id, date, amount, description, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("raw-t1", None, "2026-01-15", -25.0, "IGA SUPERMARCHE", "personal"),
+    )
+    conn.commit()
+    # Must not raise TypeError: cannot convert 'tuple' object items to dict
+    updated = apply_finance_rules(conn, ["raw-t1"])
+    assert updated >= 0
+    conn.close()
+
+
 def test_upsert_finance_rule_is_transfer_none_does_not_crash(db):
     """upsert_finance_rule must handle is_transfer=None without TypeError."""
     from skills.finance.db import upsert_finance_rule
