@@ -1,15 +1,23 @@
-"""CSV importer for RBC, MBNA, and Rogers credit card statements.
+"""CSV importer for RBC, TD, MBNA, Rogers, Desjardins, and Wealthsimple statements.
 
-Dedup key: SHA256(date + str(amount) + description) so the same transaction
-imported twice produces the same id and is silently skipped by upsert_transaction.
+Dedup key: SHA256(date + str(amount) + description) — same row imported twice
+produces the same id and is silently skipped by upsert_transaction.
 
 Amount sign convention (matches db.py):
-  negative  = money out (purchases, fees)
-  positive  = money in (payments, refunds, credits)
+  negative  = money out (purchases, fees, payments leaving bank)
+  positive  = money in (salary, CC payment received, refunds)
 
-RBC CSV: CAD$ column already uses our sign convention (negative = spend).
-MBNA CSV: purchases are positive in the export → we negate them.
-Rogers CSV: separate Credit/Debit columns → amount = credit - debit.
+Format notes:
+  RBC: CAD$ column uses our sign convention (negative = spend) already.
+  MBNA: purchases positive in export → negated here.
+  Rogers: Credit/Debit columns → amount = credit - debit.
+  TD CC: charge/payment columns → amount = payment - charge.
+  TD Chequing: debit/credit columns → amount = credit - debit.
+  Desjardins: PCA (chequing) and LN1 (mortgage) rows handled separately.
+  Wealthsimple: non-CAD rows skipped; account ID derived from filename code.
+
+detect_format(path) returns one of:
+  'rbc', 'mbna', 'rogers', 'td_cc', 'td_bank', 'desjardins', 'wealthsimple', 'generic'
 """
 
 from __future__ import annotations
@@ -119,7 +127,8 @@ def parse_holdings_balances(positions: list[dict]) -> dict[str, float]:
 
 
 def detect_format(path: str) -> str:
-    """Return format string based on CSV header row."""
+    """Detect CSV institution format. Returns one of: rbc, td_cc, td_bank,
+    desjardins, wealthsimple, mbna, mbna_new, rogers, generic."""
     with Path(path).open(newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         first_row = []
@@ -173,9 +182,18 @@ def detect_format(path: str) -> str:
 def parse_csv(path: str, account_id: str | None = None) -> list[dict]:
     """Parse CSV file → list of transaction dicts ready for upsert_transaction.
 
-    For RBC files, account_id is derived from the Account Number column if not
-    provided explicitly. For TD CC files, account_id must be supplied via
-    --account flag since the file has no account number.
+    Supported formats (auto-detected):
+      rbc         — RBC chequing/savings/credit (account_id derived from file)
+      td_cc       — TD credit card (MM/DD/YYYY, no header; account_id required)
+      td_bank     — TD chequing/savings (YYYY-MM-DD, no header; account_id required)
+      desjardins  — Desjardins chequing (PCA) or loan (LN1); 14-col no-header format
+      wealthsimple — Wealthsimple cash/invest CSV export
+      mbna / mbna_new — MBNA credit card (two export variants)
+      rogers      — Rogers credit card
+
+    TD files carry no account number — account_id must be supplied via --account.
+    Desjardins detection relies on col[2] being PCA or LN1; other account types
+    fall through to generic and will not parse correctly.
     """
     fmt = detect_format(path)
     if fmt == "rbc":

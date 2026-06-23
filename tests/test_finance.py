@@ -1,12 +1,10 @@
-"""Unit tests for finance skill P1.
+"""Unit tests for finance skill.
 
 All tests use fixture data — no live API calls, no ~/.jarvis.env required.
-WEALTHICA_CLIENT_ID is intentionally absent so wealthica.py uses mock mode.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -22,11 +20,6 @@ _FINANCE_DIR = _REPO_ROOT / "skills" / "finance"
 for _p in (str(_REPO_ROOT), str(_FINANCE_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-
-# Remove any live Wealthica credentials so all tests use mock mode
-os.environ.pop("WEALTHICA_CLIENT_ID", None)
-os.environ.pop("WEALTHICA_SECRET", None)
-os.environ.pop("WEALTHICA_USER", None)
 
 from skills.finance.alerts import (  # noqa: E402
     _check_bill_shortfall,
@@ -676,15 +669,102 @@ def test_cmd_tag_not_found(populated_db):
     assert "not found" in result.lower()
 
 
-def test_cmd_sync_mock_mode(tmp_path, monkeypatch):
-    """sync with no credentials uses mock Wealthica data."""
-    db_file = tmp_path / "finance.db"
-    monkeypatch.setattr(_skill, "DB_PATH", db_file)
-    conn = init_db(str(db_file))
-    result = _skill.cmd_sync(conn)
-    assert "Synced" in result
-    assert "mock mode" in result
-    conn.close()
+# ---------------------------------------------------------------------------
+# WS3: tag --rule / --confirm-rule / --discard-rule
+# ---------------------------------------------------------------------------
+
+
+def _seed_tag_txns(db):
+    """Insert several transactions with the same merchant prefix for rule-proposal tests.
+
+    Uses realistic Netflix descriptions: stable prefix + varying date suffix so the
+    derived pattern (NETFLIX.COM%) matches all 4 rows.
+    """
+    from skills.finance.db import upsert_transaction
+
+    for i in range(4):
+        upsert_transaction(
+            db,
+            {
+                "id": f"ws3-{i}",
+                "account_id": "rbc-04330-5118989",
+                "date": f"2026-0{i + 1}-15",
+                "amount": -(30.0 + i),
+                "description": f"NETFLIX.COM #2026-0{i + 1}-15",
+                "category": None,
+                "owner": "personal",
+            },
+        )
+
+
+def test_cmd_tag_propose_rule_writes_proposal(db):
+    _seed_tag_txns(db)
+    result = _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions", propose_rule=True)
+    assert "Rule proposal" in result
+    assert "NETFLIX.COM" in result
+    assert "4" in result  # 4 matching transactions
+    assert "--confirm-rule" in result
+    row = db.execute("SELECT * FROM tag_proposals").fetchone()
+    assert row is not None
+    assert "NETFLIX" in row["match_merchant"]
+    assert row["category"] == "subscriptions"
+    assert row["match_count"] == 4
+
+
+def test_cmd_tag_propose_rule_tags_the_one_transaction(db):
+    _seed_tag_txns(db)
+    _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions", propose_rule=True)
+    row = db.execute("SELECT category, owner FROM transactions WHERE id = 'ws3-0'").fetchone()
+    assert row["category"] == "subscriptions"
+    assert row["owner"] == "personal"
+
+
+def test_cmd_tag_confirm_writes_rule_and_back_applies(db):
+    _seed_tag_txns(db)
+    _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions", propose_rule=True)
+    prop = db.execute("SELECT id FROM tag_proposals").fetchone()
+    result = _skill.cmd_tag_confirm(db, prop["id"])
+    assert "Rule written" in result
+    assert "subscriptions" in result
+    # All 4 transactions should now be categorised
+    rows = db.execute("SELECT category FROM transactions WHERE id LIKE 'ws3-%'").fetchall()
+    assert all(r["category"] == "subscriptions" for r in rows)
+    # Proposal should be deleted
+    leftover = db.execute("SELECT * FROM tag_proposals WHERE id = ?", (prop["id"],)).fetchone()
+    assert leftover is None
+
+
+def test_cmd_tag_confirm_not_found(db):
+    result = _skill.cmd_tag_confirm(db, 9999)
+    assert "not found" in result.lower()
+
+
+def test_cmd_tag_discard_removes_proposal(db):
+    _seed_tag_txns(db)
+    _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions", propose_rule=True)
+    prop = db.execute("SELECT id FROM tag_proposals").fetchone()
+    result = _skill.cmd_tag_discard(db, prop["id"])
+    assert "discarded" in result.lower()
+    leftover = db.execute("SELECT * FROM tag_proposals WHERE id = ?", (prop["id"],)).fetchone()
+    assert leftover is None
+    # No proposal-derived rule should have been written (seed rule for NETFLIX% is pre-existing)
+    rules = db.execute(
+        "SELECT * FROM finance_rules WHERE match_merchant = 'NETFLIX.COM%'"
+    ).fetchall()
+    assert len(rules) == 0
+
+
+def test_cmd_tag_discard_not_found(db):
+    result = _skill.cmd_tag_discard(db, 9999)
+    assert "not found" in result.lower()
+
+
+def test_cmd_tag_without_rule_flag_no_proposal(db):
+    _seed_tag_txns(db)
+    result = _skill.cmd_tag(db, "ws3-0", "personal", category="subscriptions")
+    assert "Rule proposal" not in result
+    count = db.execute("SELECT COUNT(*) FROM tag_proposals").fetchone()[0]
+    assert count == 0
 
 
 def test_cmd_bills_due_no_bills(populated_db):
@@ -698,36 +778,144 @@ def test_cmd_recurring_no_data(populated_db):
 
 
 # ---------------------------------------------------------------------------
+# Tom QA regression tests (blocking bugs from PR #74 review)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_finance_rules_handles_more_than_999_ids(db):
+    """apply_finance_rules must not raise sqlite3.OperationalError for >999 txn_ids."""
+    from skills.finance.db import apply_finance_rules
+
+    for i in range(1001):
+        upsert_transaction(
+            db,
+            {
+                "id": f"bulk-{i:04d}",
+                "account_id": "rbc-04330-5118989",
+                "date": "2026-01-15",
+                "amount": -10.0,
+                "description": "IGA SUPERMARCHE",
+                "category": None,
+                "owner": "personal",
+            },
+        )
+    # Should complete without error; IGA% seed rule will match all rows
+    updated = apply_finance_rules(db, [f"bulk-{i:04d}" for i in range(1001)])
+    assert updated >= 0
+
+
+def test_apply_finance_rules_without_row_factory(tmp_path):
+    """apply_finance_rules must not crash with TypeError when row_factory is not set."""
+    import sqlite3 as _sqlite3
+
+    from skills.finance.db import _DDL, _migrate, _seed_transfer_rules, apply_finance_rules
+
+    conn = _sqlite3.connect(str(tmp_path / "raw.db"))
+    # No row_factory — rows are plain tuples
+    conn.executescript(_DDL)
+    _migrate(conn)
+    conn.commit()
+    _seed_transfer_rules(conn)
+    conn.execute(
+        "INSERT INTO transactions (id, account_id, date, amount, description, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("raw-t1", None, "2026-01-15", -25.0, "IGA SUPERMARCHE", "personal"),
+    )
+    conn.commit()
+    # Must not raise TypeError: cannot convert 'tuple' object items to dict
+    updated = apply_finance_rules(conn, ["raw-t1"])
+    assert updated >= 0
+    conn.close()
+
+
+def test_upsert_finance_rule_is_transfer_none_does_not_crash(db):
+    """upsert_finance_rule must handle is_transfer=None without TypeError."""
+    from skills.finance.db import upsert_finance_rule
+
+    rule_id = upsert_finance_rule(
+        db,
+        {
+            "match_merchant": "%TEST_NONE%",
+            "category": "test",
+            "owner": "personal",
+            "is_transfer": None,
+        },
+    )
+    assert isinstance(rule_id, int)
+    row = db.execute("SELECT is_transfer FROM finance_rules WHERE id = ?", (rule_id,)).fetchone()
+    assert row["is_transfer"] == 0
+
+
+def test_migrate_works_without_row_factory(tmp_path):
+    """_migrate must not crash when called on a connection without row_factory set."""
+    import sqlite3 as _sqlite3
+
+    from skills.finance.db import _DDL, _migrate
+
+    db_file = str(tmp_path / "raw.db")
+    conn = _sqlite3.connect(db_file)
+    # Do NOT set row_factory — raw tuple rows
+    conn.executescript(_DDL)
+    # Seed a legacy rules row to trigger the migration path
+    conn.execute(
+        "INSERT INTO rules (pattern, owner, category, created) VALUES (?, ?, ?, ?)",
+        ("%RAW_TEST%", "personal", "groceries", "2026-01-01"),
+    )
+    conn.commit()
+    # Must not raise TypeError
+    _migrate(conn)
+    conn.commit()
+    migrated = conn.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
+    assert migrated == 1
+    conn.close()
+
+
+def test_match_finance_rule_bracket_in_description(db):
+    """_match_finance_rule must match [POS] literally, not as a glob character class."""
+    from skills.finance.db import _match_finance_rule
+
+    rule = {"match_merchant": "%[POS]%", "owner": "personal", "category": "pos_purchase"}
+    txn_match = {"description": "INTERAC [POS] SOME STORE", "amount": -25.0}
+    txn_no_match = {"description": "INTERAC SOME STORE", "amount": -25.0}
+    assert _match_finance_rule(rule, txn_match) is True
+    assert _match_finance_rule(rule, txn_no_match) is False
+
+
+# ---------------------------------------------------------------------------
 # rule add / list / remove
 # ---------------------------------------------------------------------------
 
 
-def test_rule_add_with_category(populated_db):
-    result = _skill.cmd_rule_add(
-        populated_db, "%DIGITALOCEAN%", "altaforma", category="infrastructure"
+def test_rule_set_with_category(populated_db):
+    result = _skill.cmd_rule_set(
+        populated_db, "%DIGITALOCEAN%", category="infrastructure", owner="altaforma"
     )
-    assert "Rule added" in result
+    assert "Rule set" in result
     assert "id=" in result
     assert "%DIGITALOCEAN%" in result
     assert "altaforma" in result
     assert "infrastructure" in result
     assert "Applied to" in result
-    row = populated_db.execute("SELECT * FROM rules WHERE pattern = '%DIGITALOCEAN%'").fetchone()
+    row = populated_db.execute(
+        "SELECT * FROM finance_rules WHERE match_merchant = '%DIGITALOCEAN%'"
+    ).fetchone()
     assert row is not None
     assert row["owner"] == "altaforma"
     assert row["category"] == "infrastructure"
 
 
-def test_rule_add_without_category(populated_db):
-    result = _skill.cmd_rule_add(populated_db, "%SHOPIFY%", "altaforma")
-    assert "Rule added" in result
+def test_rule_set_without_category(populated_db):
+    result = _skill.cmd_rule_set(populated_db, "%SHOPIFY%", owner="altaforma")
+    assert "Rule set" in result
     assert "Applied to" in result
-    row = populated_db.execute("SELECT * FROM rules WHERE pattern = '%SHOPIFY%'").fetchone()
+    row = populated_db.execute(
+        "SELECT * FROM finance_rules WHERE match_merchant = '%SHOPIFY%'"
+    ).fetchone()
     assert row is not None
     assert row["category"] is None
 
 
-def test_rule_add_applies_to_existing(db):
+def test_rule_set_applies_to_existing(db):
     upsert_transaction(
         db,
         _sample_txn({"id": "r1", "description": "DIGITALOCEAN INVOICE", "owner": "personal"}),
@@ -736,16 +924,15 @@ def test_rule_add_applies_to_existing(db):
         db,
         _sample_txn({"id": "r2", "description": "METRO GROCERIES", "owner": "personal"}),
     )
-    result = _skill.cmd_rule_add(db, "%DIGITALOCEAN%", "altaforma", category="hosting")
+    result = _skill.cmd_rule_set(db, "%DIGITALOCEAN%", owner="altaforma", category="hosting")
     assert "Applied to" in result
-    assert "existing transaction(s)." in result
     row = db.execute("SELECT owner, category FROM transactions WHERE id = 'r1'").fetchone()
     assert row["owner"] == "altaforma"
     assert row["category"] == "hosting"
 
 
 def test_rule_list_shows_rows(db):
-    _skill.cmd_rule_add(db, "%SHOPIFY%", "altaforma", category="saas")
+    _skill.cmd_rule_set(db, "%SHOPIFY%", owner="altaforma", category="saas")
     result = _skill.cmd_rule_list(db)
     assert "%SHOPIFY%" in result
     assert "altaforma" in result
@@ -753,47 +940,218 @@ def test_rule_list_shows_rows(db):
 
 
 def test_rule_list_empty(db):
-    db.execute("DELETE FROM rules")
+    db.execute("DELETE FROM finance_rules")
     db.commit()
     result = _skill.cmd_rule_list(db)
-    assert result == "No rules defined."
+    assert "No finance rules" in result
 
 
-def test_rule_remove_deletes_row(db):
-    _skill.cmd_rule_add(db, "%DIGITALOCEAN%", "altaforma", category="infrastructure")
-    row = db.execute("SELECT id FROM rules WHERE pattern = '%DIGITALOCEAN%'").fetchone()
+def test_rule_rm_deletes_row(db):
+    _skill.cmd_rule_set(db, "%DIGITALOCEAN%", owner="altaforma", category="infrastructure")
+    row = db.execute(
+        "SELECT id FROM finance_rules WHERE match_merchant = '%DIGITALOCEAN%'"
+    ).fetchone()
     rule_id = row["id"]
-    result = _skill.cmd_rule_remove(db, rule_id)
+    result = _skill.cmd_rule_rm(db, rule_id)
     assert f"Rule {rule_id} removed" in result
     assert "%DIGITALOCEAN%" in result
-    assert "altaforma" in result
-    assert "infrastructure" in result
-    assert "apply-rules" in result
-    remaining = db.execute("SELECT id FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    remaining = db.execute("SELECT id FROM finance_rules WHERE id = ?", (rule_id,)).fetchone()
     assert remaining is None
 
 
-def test_rule_remove_nonexistent(db):
-    result = _skill.cmd_rule_remove(db, 999)
-    assert result == "Rule 999 not found."
+def test_rule_rm_nonexistent(db):
+    result = _skill.cmd_rule_rm(db, 999)
+    assert "not found" in result
 
 
-def test_rule_add_empty_pattern(db):
-    count_before = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
-    result = _skill.cmd_rule_add(db, "", "personal")
+def test_rule_set_empty_merchant(db):
+    count_before = db.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
+    result = _skill.cmd_rule_set(db, "")
     assert "Error" in result
     assert "non-empty" in result
-    count_after = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    count_after = db.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
     assert count_after == count_before
 
 
-def test_rule_add_invalid_owner(db):
-    count_before = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
-    result = _skill.cmd_rule_add(db, "%AMAZON%", "business")
+def test_rule_set_invalid_owner(db):
+    count_before = db.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
+    result = _skill.cmd_rule_set(db, "%AMAZON%", owner="business")
     assert "Error" in result
     assert "personal" in result or "altaforma" in result
-    count_after = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    count_after = db.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
     assert count_after == count_before
+
+
+# ---------------------------------------------------------------------------
+# finance_rules — mixed-merchant FX-drift proof (Anthropic Max sub vs API usage)
+# ---------------------------------------------------------------------------
+# Seeded rules (from _seed_transfer_rules):
+#   priority=20: ANTHROPIC%CLAUDE% + recurrence=fixed_monthly → personal/subscriptions
+#   priority=10: ANTHROPIC%            + recurrence=variable   → altaforma/subscriptions
+#
+# The key invariant: the sub rule matches on descriptor+recurrence, NOT amount.
+# Two cycles with different converted CAD amounts must both hit personal/subscriptions.
+
+
+def test_anthropic_sub_matches_personal_across_fx_cycles(db):
+    """Claude Max sub (fixed_monthly) → personal regardless of converted CAD amount."""
+    # Cycle 1: USD/CAD = 1.36 → $140 × 1.36 = ~$190.40
+    t1 = _sample_txn(
+        {
+            "id": "ant-sub-1",
+            "description": "ANTHROPIC CLAUDE AI SUBSCRIPTION",
+            "amount": -190.40,
+        }
+    )
+    # Cycle 2: USD/CAD = 1.42 → $140 × 1.42 = ~$198.80
+    t2 = _sample_txn(
+        {
+            "id": "ant-sub-2",
+            "description": "ANTHROPIC CLAUDE AI SUBSCRIPTION",
+            "amount": -198.80,
+        }
+    )
+    upsert_transaction(db, t1)
+    upsert_transaction(db, t2)
+    from skills.finance.db import apply_finance_rules
+
+    apply_finance_rules(db, ["ant-sub-1", "ant-sub-2"])
+    rows = db.execute(
+        "SELECT id, owner, category FROM transactions WHERE id IN ('ant-sub-1', 'ant-sub-2')"
+        " ORDER BY id"
+    ).fetchall()
+    assert rows[0]["owner"] == "personal"
+    assert rows[1]["owner"] == "personal"
+    assert rows[0]["category"] == "subscriptions"
+
+
+def test_anthropic_api_matches_altaforma(db):
+    """Anthropic API usage (no 'CLAUDE' in description) → altaforma."""
+    t = _sample_txn(
+        {
+            "id": "ant-api-1",
+            "description": "ANTHROPIC USAGE BILLING",
+            "amount": -47.83,
+        }
+    )
+    upsert_transaction(db, t)
+    from skills.finance.db import apply_finance_rules
+
+    apply_finance_rules(db, ["ant-api-1"])
+    row = db.execute("SELECT owner, category FROM transactions WHERE id = 'ant-api-1'").fetchone()
+    assert row["owner"] == "altaforma"
+    assert row["category"] == "subscriptions"
+
+
+# ---------------------------------------------------------------------------
+# WS2: ingest (dropbox sweep)
+# ---------------------------------------------------------------------------
+
+
+def _write_rbc_csv(path) -> None:
+    """Write a minimal valid RBC CSV to path."""
+    path.write_text(
+        "Account Type,Account Number,Transaction Date,Cheque Number,Description 1,"
+        "Description 2,CAD$,USD$\n"
+        "Chequing,5118989,6/10/2026,,METRO GROCERIES,,-55.40,\n"
+        "Chequing,5118989,6/12/2026,,PAYROLL DEPOSIT,,+2800.00,\n",
+        encoding="utf-8-sig",
+    )
+
+
+def test_ingest_happy_path_rbc(tmp_path, monkeypatch):
+    """RBC CSV in inbox → imported, archived, no file left in inbox."""
+    inbox = tmp_path / "inbox"
+    archive = inbox / "archive"
+    inbox.mkdir()
+
+    _write_rbc_csv(inbox / "rbc-chequing-june.csv")
+
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+
+    result = _skill.cmd_ingest(conn, post_discord=False)
+
+    assert "OK" in result
+    assert "rbc-chequing-june.csv" in result
+    assert not (inbox / "rbc-chequing-june.csv").exists()
+    archived = list(archive.glob("*rbc-chequing-june.csv"))
+    assert len(archived) == 1
+    conn.close()
+
+
+def test_ingest_unidentified_goes_to_failed(tmp_path, monkeypatch):
+    """Non-CSV-format file → moved to failed/, not imported."""
+    inbox = tmp_path / "inbox"
+    failed = inbox / "failed"
+    inbox.mkdir()
+
+    garbage = inbox / "mystery.csv"
+    garbage.write_text("this,is,not,a,bank,export\nrow1,row2,row3,row4,row5,row6\n")
+
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+
+    result = _skill.cmd_ingest(conn, post_discord=False)
+
+    assert "FAILED" in result
+    assert (failed / "mystery.csv").exists()
+    assert not garbage.exists()
+    conn.close()
+
+
+def test_ingest_td_without_account_in_filename(tmp_path, monkeypatch):
+    """TD file without account ID in filename → quarantined to failed/."""
+    inbox = tmp_path / "inbox"
+    failed = inbox / "failed"
+    inbox.mkdir()
+
+    # A valid TD bank file (5-col, YYYY-MM-DD)
+    td_file = inbox / "statement-june.csv"
+    td_file.write_text(
+        "2026-06-10,PAYROLL DEPOSIT,+2800.00,,5000.00\n" "2026-06-12,TIM HORTONS,-4.75,,4995.25\n"
+    )
+
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+
+    result = _skill.cmd_ingest(conn, post_discord=False)
+
+    assert "FAILED" in result
+    assert (failed / "statement-june.csv").exists()
+    conn.close()
+
+
+def test_ingest_empty_inbox(tmp_path, monkeypatch):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+    result = _skill.cmd_ingest(conn, post_discord=False)
+    assert "empty" in result.lower()
+    conn.close()
+
+
+def test_ingest_idempotent(tmp_path, monkeypatch):
+    """Running ingest twice on the same file only imports once (dedup)."""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _write_rbc_csv(inbox / "rbc-chequing-june.csv")
+
+    conn = init_db(str(tmp_path / "finance.db"))
+    monkeypatch.setattr(_skill, "FINANCE_INBOX_DIR", inbox)
+
+    _skill.cmd_ingest(conn, post_discord=False)
+
+    # Second drop: same file re-appears in inbox
+    _write_rbc_csv(inbox / "rbc-chequing-june.csv")
+    result2 = _skill.cmd_ingest(conn, post_discord=False)
+
+    # Should report all as duplicates, not new inserts
+    assert "OK" in result2
+    row_count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    assert row_count == 2  # only original 2 rows exist
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1125,3 +1483,231 @@ def test_monthly_coda_returns_string(tmp_path, monkeypatch):
     assert "net:" in lines[0]
     assert "Subs:" in lines[1]
     assert "GST" in lines[2]
+
+
+# ---------------------------------------------------------------------------
+# WS4: salience block
+# ---------------------------------------------------------------------------
+
+
+from skills.finance.salience import (  # noqa: E402
+    _cashflow_projection,
+    _category_anomalies,
+    _duplicate_charges,
+    _large_charge_forecast,
+    _subscription_drift,
+    compute_salience_block,
+)
+
+
+def _seed_salience_db(db):
+    """Seed a DB with enough data to exercise all 5 salience signals."""
+    today = date.today()
+
+    # Account with a known balance
+    upsert_account(
+        db,
+        {
+            "id": "sal-chq",
+            "institution": "RBC",
+            "name": "Chequing",
+            "type": "bank",
+            "currency": "CAD",
+            "balance_current": 3000.0,
+            "owner": "personal",
+            "source": "csv_import",
+            "last_synced": None,
+        },
+    )
+
+    # 3 months of income + spend for cashflow / anomaly signals.
+    # Use the 15th of each prior calendar month so these rows fall in the baseline window
+    # (not in the current-month window queried by _category_anomalies).
+    def _prior_month_15(n_months_ago: int) -> str:
+        y, m = today.year, today.month
+        for _ in range(n_months_ago):
+            m -= 1
+            if m == 0:
+                m, y = 12, y - 1
+        return f"{y:04d}-{m:02d}-15"
+
+    for months_ago in range(1, 4):
+        day = _prior_month_15(months_ago)
+        upsert_transaction(
+            db,
+            {
+                "id": f"sal-income-{months_ago}",
+                "account_id": "sal-chq",
+                "date": day,
+                "amount": 5000.0,
+                "description": "PAYROLL DEPOSIT",
+                "category": "income",
+                "owner": "personal",
+            },
+        )
+        # 5 grocery transactions per prior month so the month qualifies as a baseline period
+        for j in range(5):
+            upsert_transaction(
+                db,
+                {
+                    "id": f"sal-groceries-{months_ago}-{j}",
+                    "account_id": "sal-chq",
+                    "date": day,
+                    "amount": -60.0,
+                    "description": "IGA SUPERMARCHE",
+                    "category": "groceries",
+                    "owner": "personal",
+                },
+            )
+
+    # This month: anomalously high groceries (baseline ≈ $300/mo; this month $800 = >160% above)
+    upsert_transaction(
+        db,
+        {
+            "id": "sal-groceries-high",
+            "account_id": "sal-chq",
+            "date": today.isoformat(),
+            "amount": -800.0,
+            "description": "IGA SUPERMARCHE",
+            "category": "groceries",
+            "owner": "personal",
+        },
+    )
+
+    # Duplicate charge pair
+    upsert_transaction(
+        db,
+        {
+            "id": "sal-dup-a",
+            "account_id": "sal-chq",
+            "date": (today - timedelta(days=1)).isoformat(),
+            "amount": -49.99,
+            "description": "AMAZON PRIME",
+            "category": "subscriptions",
+            "owner": "personal",
+        },
+    )
+    upsert_transaction(
+        db,
+        {
+            "id": "sal-dup-b",
+            "account_id": "sal-chq",
+            "date": today.isoformat(),
+            "amount": -49.99,
+            "description": "AMAZON PRIME",
+            "category": "subscriptions",
+            "owner": "personal",
+        },
+    )
+
+    # Recurring monthly obligation
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "DESJARDINS MORTGAGE",
+            3202.0,
+            30,
+            (today - timedelta(days=10)).isoformat(),
+            (today + timedelta(days=20)).isoformat(),
+            "personal",
+        ),
+    )
+
+    # Irregular large charge due soon (quarterly/annual)
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "INSURANCE ANNUAL",
+            750.0,
+            365,
+            (today - timedelta(days=300)).isoformat(),
+            (today + timedelta(days=45)).isoformat(),
+            "personal",
+        ),
+    )
+
+    # New subscription (no cadence, seen recently)
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "BRAND NEW SERVICE",
+            9.99,
+            None,
+            (today - timedelta(days=5)).isoformat(),
+            None,
+            "personal",
+        ),
+    )
+    db.commit()
+
+
+def test_cashflow_projection_returns_dict(db):
+    _seed_salience_db(db)
+    result = _cashflow_projection(db)
+    assert "monthly_income_est" in result
+    assert "monthly_obligations_est" in result
+    assert "monthly_net_est" in result
+    assert result["monthly_income_est"] > 0
+    assert result["monthly_obligations_est"] > 0
+
+
+def test_large_charge_forecast_finds_annual(db):
+    _seed_salience_db(db)
+    result = _large_charge_forecast(db, horizon_days=60)
+    assert len(result) == 1
+    assert result[0]["merchant"] == "INSURANCE ANNUAL"
+    assert result[0]["amount"] == 750.0
+    assert result[0]["days_away"] <= 60
+
+
+def test_category_anomalies_flags_high_groceries(db):
+    _seed_salience_db(db)
+    anomalies = _category_anomalies(db)
+    cats = [a["category"] for a in anomalies]
+    assert "groceries" in cats
+    groc = next(a for a in anomalies if a["category"] == "groceries")
+    assert groc["delta_pct"] > 20
+
+
+def test_subscription_drift_flags_new(db):
+    _seed_salience_db(db)
+    result = _subscription_drift(db)
+    assert isinstance(result["new"], list)
+    assert any(item["merchant"] == "BRAND NEW SERVICE" for item in result["new"])
+    assert result["alert"] is True
+
+
+def test_duplicate_charges_finds_amazon_prime(db):
+    _seed_salience_db(db)
+    dups = _duplicate_charges(db)
+    assert len(dups) >= 1
+    assert any(d["description"] == "AMAZON PRIME" for d in dups)
+
+
+def test_compute_salience_block_returns_all_keys(db):
+    _seed_salience_db(db)
+    block = compute_salience_block(db)
+    assert "cashflow_projection" in block
+    assert "large_charge_forecast" in block
+    assert "category_anomalies" in block
+    assert "subscription_drift" in block
+    assert "duplicate_charges" in block
+
+
+def test_compute_salience_block_empty_db(db):
+    block = compute_salience_block(db)
+    assert block["cashflow_projection"] is not None
+    assert block["large_charge_forecast"] == []
+    assert block["category_anomalies"] == []
+    assert block["duplicate_charges"] == []
+
+
+def test_finance_brief_includes_salience_key(tmp_path):
+    """finance_brief() dict always includes salience_block key."""
+    from skills.finance.brief import finance_brief
+
+    result = finance_brief(db_path=str(tmp_path / "finance.db"))
+    assert "salience_block" in result

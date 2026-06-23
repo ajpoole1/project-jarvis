@@ -1,24 +1,35 @@
-"""Finance skill — personal CFO backed by Wealthica + SQLite.
+"""Finance skill — stdlib-only personal CFO backed by SQLite + CSV import.
 
-Commands (P1):
-  sync [--since DATE] [--full]
+Commands:
   import <file> [--account ID] [--owner personal|altaforma]
+  import-holdings <file> [--as-of DATE]
+  ingest                      sweep the dropbox inbox folder
   accounts
   liquid
   spend [--month|--week|--from DATE --to DATE] [--owner personal|altaforma]
   top [N] [--period]
   search <term>
   net [--month|--from DATE --to DATE]
+  compare [--month|--week] [--baseline N]
   recurring
   bills-due [--days N]
-  tag <txn_id> <personal|altaforma> [--category CAT]
-  scrape --bank <rbc|td> [--days 30] [--first-auth] [--dry-run]
+  debt
+  runway [--include-inheritance]
+  altaforma [--quarter]
+  subs-audit
+  tag <txn_id> <personal|altaforma> [--category CAT] [--rule]
+  tag --confirm-rule <id>
+  tag --discard-rule <id>
+  rule set --merchant PAT [--descriptor D] [--recurrence TYPE]
+          [--amount-min N --amount-max N] --category CAT [--owner OWN] [--transfer]
+  rule list [--merchant PAT]
+  rule rm <id>
+  apply-rules
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import calendar
 import os
 import re
@@ -36,7 +47,6 @@ _REPO_ROOT = Path(__file__).parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skills.finance.alerts import check_alerts  # noqa: E402
 from skills.finance.csv_import import (  # noqa: E402
     _rbc_payment_canonical,
     parse_csv,
@@ -46,20 +56,24 @@ from skills.finance.csv_import import (  # noqa: E402
 )
 from skills.finance.db import (  # noqa: E402
     _normalize_merchant,
+    apply_finance_rules,
+    apply_finance_rules_all,
+    confirm_tag_rule,
+    delete_finance_rule,
     detect_recurring,
     get_accounts,
+    get_finance_rules,
     get_recurring,
     get_transactions,
     init_db,
+    propose_tag_rule,
     recompute_balances,
     set_balance_anchor,
     upsert_account,
+    upsert_finance_rule,
     upsert_position,
     upsert_transaction,
 )
-from skills.finance.scraper_errors import ScraperError, SessionExpiredError  # noqa: E402
-from skills.finance.wealthica import get_institutions, get_token  # noqa: E402
-from skills.finance.wealthica import get_transactions as wealthica_get_transactions  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Env + paths
@@ -186,109 +200,6 @@ def _fmt_amount(amount: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Command: sync
-# ---------------------------------------------------------------------------
-
-
-def cmd_sync(conn, since: str | None = None, full: bool = False) -> str:
-    client_id = os.environ.get("WEALTHICA_CLIENT_ID")
-    secret = os.environ.get("WEALTHICA_SECRET")
-    user = os.environ.get("WEALTHICA_USER")
-
-    today = date.today().isoformat()
-
-    if full:
-        start_date = "2020-01-01"
-    elif since:
-        start_date = since
-    else:
-        last_row = conn.execute("SELECT value FROM sync_state WHERE key = 'last_sync'").fetchone()
-        if last_row:
-            start_date = last_row["value"][:10]
-        else:
-            start_date = (date.today() - timedelta(days=90)).isoformat()
-
-    # Token — cached or fresh
-    token: str | None = None
-    if client_id:
-        token_row = conn.execute("SELECT value FROM sync_state WHERE key = 'token'").fetchone()
-        expiry_row = conn.execute(
-            "SELECT value FROM sync_state WHERE key = 'token_expiry'"
-        ).fetchone()
-        now_iso = datetime.now(UTC).isoformat()
-        if token_row and expiry_row and expiry_row["value"] > now_iso:
-            token = token_row["value"]
-        else:
-            token = get_token(client_id, secret or "", user or "")
-            expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
-            conn.execute(
-                "INSERT OR REPLACE INTO sync_state (key, value, updated) VALUES ('token', ?, ?)",
-                (token, now_iso),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO sync_state (key, value, updated) VALUES ('token_expiry', ?, ?)",
-                (expiry, now_iso),
-            )
-            conn.commit()
-    # token=None → mock mode in wealthica module
-
-    # Sync accounts
-    institutions = get_institutions(token)
-    now_str = datetime.now(UTC).isoformat()
-    for inst in institutions:
-        upsert_account(
-            conn,
-            {
-                "id": inst.get("_id"),
-                "institution": inst.get("institution"),
-                "name": inst.get("name"),
-                "type": inst.get("type"),
-                "currency": inst.get("currency", "CAD"),
-                "balance_current": inst.get("balance", 0.0),
-                "source": "wealthica",
-                "last_synced": now_str,
-            },
-        )
-
-    # Sync transactions
-    txns = wealthica_get_transactions(token, start_date, today)
-    new_ids: list[str] = []
-    for txn in txns:
-        row = {
-            "id": txn.get("_id"),
-            "account_id": txn.get("account"),
-            "date": txn.get("date"),
-            "amount": txn.get("amount", 0.0),
-            "description": txn.get("description", ""),
-            "category": txn.get("category"),
-            "currency": txn.get("currency", "CAD"),
-            "is_pending": 1 if txn.get("pending") else 0,
-            "source": "wealthica",
-        }
-        if upsert_transaction(conn, row):
-            new_ids.append(row["id"])
-
-    if new_ids:
-        _apply_rules(conn, new_ids)
-
-    detect_recurring(conn)
-    alerts = check_alerts(conn, new_ids)
-
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_state (key, value, updated) VALUES ('last_sync', ?, ?)",
-        (now_str, now_str),
-    )
-    conn.commit()
-
-    mode = " [mock mode — set WEALTHICA_CLIENT_ID for live sync]" if not client_id else ""
-    alert_note = f"  {len(alerts)} alert(s) pending." if alerts else ""
-    return (
-        f"Synced {len(new_ids)} new transactions across {len(institutions)} accounts. "
-        f"Last sync: {now_str[:16].replace('T', ' ')} UTC.{mode}{alert_note}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # Command: import CSV
 # ---------------------------------------------------------------------------
 
@@ -357,6 +268,7 @@ def cmd_import(conn, file_path: str, account_id: str | None = None, owner: str =
     txns = parse_csv(str(path), account_id)
     balances = parse_csv_balances(str(path), account_id)
     inserted = skipped = 0
+    new_ids: list[str] = []
     seen_accounts: set[str] = set()
     for txn in txns:
         txn["owner"] = owner
@@ -366,6 +278,7 @@ def cmd_import(conn, file_path: str, account_id: str | None = None, owner: str =
             upsert_account(conn, _account_meta_from_id(aid, owner, balances.get(aid)))
         if upsert_transaction(conn, txn):
             inserted += 1
+            new_ids.append(txn["id"])
         else:
             skipped += 1
 
@@ -374,6 +287,8 @@ def cmd_import(conn, file_path: str, account_id: str | None = None, owner: str =
         if aid not in seen_accounts:
             upsert_account(conn, _account_meta_from_id(aid, owner, bal))
 
+    if new_ids:
+        apply_finance_rules(conn, new_ids)
     recompute_balances(conn)
     detect_recurring(conn)
 
@@ -414,6 +329,156 @@ def cmd_import_holdings(conn, file_path: str, as_of: str | None = None) -> str:
         name = _ACCOUNT_NAMES.get(aid, aid)
         lines.append(f"  {name}: ${total:,.2f} CAD")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Command: ingest (dropbox sweep)
+# ---------------------------------------------------------------------------
+
+FINANCE_INBOX_DIR = Path("/mnt/c/Users/aaron/jarvis-finance/inbox")
+_DISCORD_SCRIPT = Path(__file__).parents[2] / "scripts" / "discord_post.py"
+
+# TD files carry no account number — we require a filename hint to map them.
+# Filename prefix (stem prefix before first non-digit non-letter char) → account_id.
+_TD_FILENAME_MAP: dict[str, str] = {
+    "td-chq-5116": "td-chq-5116",
+    "td-visa-1225": "td-visa-1225",
+    "td-cc-1225": "td-cc-1225",
+}
+
+
+def _ingest_post_discord(message: str) -> None:
+    import subprocess
+
+    try:
+        subprocess.run(
+            ["python3", str(_DISCORD_SCRIPT)],
+            input=message,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _td_account_from_filename(stem: str) -> str | None:
+    stem_lower = stem.lower()
+    for prefix, aid in _TD_FILENAME_MAP.items():
+        if stem_lower.startswith(prefix):
+            return aid
+    return None
+
+
+def cmd_ingest(conn, post_discord: bool = True) -> str:
+    """Sweep the finance inbox, import CSVs, archive successes, quarantine failures."""
+    from skills.finance.csv_import import detect_format
+
+    inbox = FINANCE_INBOX_DIR
+    if not inbox.exists():
+        return f"Inbox not found: {inbox}"
+
+    archive_dir = inbox / "archive"
+    failed_dir = inbox / "failed"
+    archive_dir.mkdir(exist_ok=True)
+    failed_dir.mkdir(exist_ok=True)
+
+    csv_files = sorted(inbox.glob("*.csv"))
+    if not csv_files:
+        return "Finance inbox empty — nothing to import."
+
+    results: list[str] = []
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    for path in csv_files:
+        fmt = detect_format(str(path))
+
+        # Unidentified — quarantine
+        if fmt == "generic":
+            dest = failed_dir / path.name
+            path.rename(dest)
+            msg = (
+                f"Finance inbox: dropped a file I can't identify — {path.name!r}. "
+                f"Which bank/account? (move back to inbox when resolved)"
+            )
+            if post_discord:
+                _ingest_post_discord(msg)
+            results.append(f"FAILED {path.name} — unrecognized format")
+            continue
+
+        # TD files require account_id — infer from filename if possible
+        account_id: str | None = None
+        if fmt in ("td_cc", "td_bank"):
+            account_id = _td_account_from_filename(path.stem)
+            if account_id is None:
+                dest = failed_dir / path.name
+                path.rename(dest)
+                hint = "td-chq-5116" if fmt == "td_bank" else "td-visa-1225"
+                msg = (
+                    f"Finance inbox: TD file {path.name!r} has no account number in the file. "
+                    f"Rename to start with the account ID (e.g. {hint!r}) and re-drop."
+                )
+                if post_discord:
+                    _ingest_post_discord(msg)
+                results.append(f"FAILED {path.name} — TD file needs account ID in filename")
+                continue
+
+        # Parse and import
+        try:
+            txns = parse_csv(str(path), account_id)
+            balances = parse_csv_balances(str(path), account_id)
+        except Exception as exc:
+            dest = failed_dir / path.name
+            path.rename(dest)
+            results.append(f"FAILED {path.name} — parse error: {exc}")
+            continue
+
+        inserted = skipped = 0
+        new_ids: list[str] = []
+        seen_accounts: set[str] = set()
+        for txn in txns:
+            txn.setdefault("owner", "personal")
+            aid = txn.get("account_id", "")
+            if aid and aid not in seen_accounts:
+                seen_accounts.add(aid)
+                upsert_account(conn, _account_meta_from_id(aid, "personal", balances.get(aid)))
+            if upsert_transaction(conn, txn):
+                inserted += 1
+                new_ids.append(txn["id"])
+            else:
+                skipped += 1
+
+        for aid, bal in balances.items():
+            if aid not in seen_accounts:
+                upsert_account(conn, _account_meta_from_id(aid, "personal", bal))
+
+        if new_ids:
+            apply_finance_rules(conn, new_ids)
+        recompute_balances(conn)
+
+        # Detect new recurring patterns if we imported anything
+        if inserted:
+            detect_recurring(conn)
+
+        # Archive the file
+        dest = archive_dir / f"{timestamp}-{path.name}"
+        path.rename(dest)
+
+        # Build Discord summary
+        account_names = (
+            ", ".join(_ACCOUNT_NAMES.get(aid, aid) for aid in sorted(seen_accounts))
+            or "unknown account"
+        )
+        summary = (
+            f"Finance import: {account_names} — "
+            f"{inserted} imported, {skipped} duplicate. "
+            f"File archived."
+        )
+        if post_discord:
+            _ingest_post_discord(summary)
+        results.append(f"OK {path.name}: {inserted} new, {skipped} dup — {account_names}")
+
+    return "\n".join(results) if results else "No CSV files processed."
 
 
 # ---------------------------------------------------------------------------
@@ -1035,7 +1100,38 @@ def cmd_bills_due(conn, days: int = 7) -> str:
 # ---------------------------------------------------------------------------
 
 
-def cmd_tag(conn, txn_id: str, owner: str, category: str | None = None) -> str:
+def _derive_merchant_pattern(description: str) -> str:
+    """Turn a raw transaction description into a LIKE pattern for generalisation.
+
+    Strategy: strip trailing noise tokens (date-stamps, reference numbers,
+    card suffixes) and wrap the stable prefix with a trailing wildcard.
+    """
+    # Upper-case for consistency with finance_rules conventions
+    desc = description.upper().strip()
+    # Strip common noise suffixes: dates like #2026-06-01, ref codes, card numbers
+    desc = re.sub(r"\s+#?\d{4}-\d{2}-\d{2}.*$", "", desc)
+    desc = re.sub(r"\s+REF\s*\d+.*$", "", desc)
+    desc = re.sub(r"\s+\d{4}$", "", desc)
+    desc = desc.strip()
+    if not desc:
+        return description.upper() + "%"
+    return desc + "%"
+
+
+def cmd_tag(
+    conn,
+    txn_id: str,
+    owner: str,
+    category: str | None = None,
+    propose_rule: bool = False,
+) -> str:
+    """Tag a single transaction; optionally propose a generalising rule.
+
+    With propose_rule=True: after tagging the one transaction, derive a LIKE
+    pattern from its description, count historical matches, and write a
+    tag_proposals row. Returns a staged proposal the user must confirm with
+    `finance tag --confirm-rule <id>`.
+    """
     row = conn.execute(
         "SELECT id, date, amount, description FROM transactions WHERE id = ?",
         (txn_id,),
@@ -1066,167 +1162,161 @@ def cmd_tag(conn, txn_id: str, owner: str, category: str | None = None) -> str:
     conn.commit()
 
     cat_str = f", category={category}" if category else ""
-    return (
+    tag_line = (
         f"✓ [{tid[:8]}] {row['date']}  {_fmt_amount(row['amount'])}  "
         f"{row['description']} → owner={owner}{cat_str}"
     )
 
+    if not propose_rule:
+        return tag_line
+
+    # --- Generalising rule proposal ---
+    pattern = _derive_merchant_pattern(row["description"])
+    import fnmatch
+
+    like_pattern = pattern.replace("%", "*").replace("_", "?")
+    all_txns = conn.execute(
+        "SELECT id, date, amount, description, owner, category FROM transactions ORDER BY date DESC"
+    ).fetchall()
+    matching = [
+        dict(t) for t in all_txns if fnmatch.fnmatch((t["description"] or "").upper(), like_pattern)
+    ]
+    sample = matching[:5]
+    prop_id = propose_tag_rule(conn, pattern, category, owner, len(matching), sample)
+
+    sample_lines = "\n".join(
+        f"  [{t['id'][:8]}] {t['date']}  {_fmt_amount(t['amount'])}  "
+        f"{t['description']}  [{t['category'] or '?'}→{category or owner}]"
+        for t in sample
+    )
+    return (
+        f"{tag_line}\n\n"
+        f"**Rule proposal #{prop_id}:** apply `{pattern}` → owner={owner}"
+        + (f", category={category}" if category else "")
+        + f"\n  Matches {len(matching)} historical transaction(s). Sample:\n{sample_lines}\n\n"
+        f"Confirm with: `finance tag --confirm-rule {prop_id}`\n"
+        f"Discard with: `finance tag --discard-rule {prop_id}`"
+    )
+
+
+def cmd_tag_confirm(conn, proposal_id: int) -> str:
+    """Apply a staged tag_proposals entry: write the rule and back-apply to all history."""
+    rule, updated = confirm_tag_rule(conn, proposal_id)
+    if rule is None:
+        return f"Proposal #{proposal_id} not found (already confirmed/discarded?)."
+    cat_str = f", category={rule['category']}" if rule.get("category") else ""
+    return (
+        f"✓ Rule written: `{rule['match_merchant']}` → owner={rule['owner']}{cat_str}\n"
+        f"  Back-applied to {updated} matching transaction(s)."
+    )
+
+
+def cmd_tag_discard(conn, proposal_id: int) -> str:
+    """Discard a staged tag proposal without writing a rule."""
+    cur = conn.execute("DELETE FROM tag_proposals WHERE id = ?", (proposal_id,))
+    conn.commit()
+    if cur.rowcount:
+        return f"Proposal #{proposal_id} discarded."
+    return f"Proposal #{proposal_id} not found."
+
 
 # ---------------------------------------------------------------------------
-# Commands: rule add / list / remove
+# Commands: rule set / list / rm  (finance_rules data layer)
 # ---------------------------------------------------------------------------
 
 _VALID_OWNERS = {"personal", "altaforma"}
+_VALID_RECURRENCES = {"fixed_monthly", "variable", "weekly", "biweekly", "quarterly", "annual"}
 
 
-def cmd_rule_add(conn, pattern: str, owner: str, category: str | None = None) -> str:
-    if not pattern.strip():
-        return "Error: pattern must be non-empty."
+def cmd_rule_set(
+    conn,
+    merchant: str,
+    category: str | None = None,
+    owner: str = "personal",
+    descriptor: str | None = None,
+    recurrence: str | None = None,
+    amount_min: float | None = None,
+    amount_max: float | None = None,
+    is_transfer: bool = False,
+    priority: int = 0,
+    note: str | None = None,
+) -> str:
+    if not merchant.strip():
+        return "Error: --merchant must be non-empty."
     if owner not in _VALID_OWNERS:
         return f"Error: owner must be 'personal' or 'altaforma', got '{owner}'."
-    today = date.today().isoformat()
-    cur = conn.execute(
-        "INSERT INTO rules (pattern, owner, category, created) VALUES (?, ?, ?, ?)",
-        (pattern, owner, category, today),
+    if recurrence and recurrence not in _VALID_RECURRENCES:
+        return f"Error: --recurrence must be one of {sorted(_VALID_RECURRENCES)}."
+    if (amount_min is None) != (amount_max is None):
+        return "Error: --amount-min and --amount-max must be supplied together."
+
+    rule_id = upsert_finance_rule(
+        conn,
+        {
+            "match_merchant": merchant,
+            "match_descriptor": descriptor,
+            "match_recurrence": recurrence,
+            "match_amount_min": amount_min,
+            "match_amount_max": amount_max,
+            "category": category,
+            "owner": owner,
+            "is_transfer": is_transfer,
+            "priority": priority,
+            "note": note,
+        },
     )
-    conn.commit()
-    rule_id = cur.lastrowid
-    applied = _apply_rules_all(conn)
-    target = f"{owner} / {category}" if category else owner
-    return f'Rule added (id={rule_id}): "{pattern}" → {target}. Applied to {applied} existing transaction(s).'
+    applied = apply_finance_rules_all(conn)
+    parts = [f'Rule set (id={rule_id}): "{merchant}"']
+    if descriptor:
+        parts.append(f"descriptor={descriptor!r}")
+    if recurrence:
+        parts.append(f"recurrence={recurrence}")
+    if amount_min is not None:
+        parts.append(f"amount=${amount_min:.0f}–${amount_max:.0f}")
+    parts.append(f"→ {owner}")
+    if category:
+        parts.append(f"/ {category}")
+    parts.append(f"  Applied to {applied} transaction(s).")
+    return " ".join(parts)
 
 
-def cmd_rule_list(conn) -> str:
-    rows = conn.execute(
-        "SELECT id, pattern, owner, category, created FROM rules ORDER BY id"
-    ).fetchall()
+def cmd_rule_list(conn, merchant_filter: str | None = None) -> str:
+    rows = get_finance_rules(conn, merchant_filter)
     if not rows:
-        return "No rules defined."
-    col_widths = {
-        "id": max(2, max(len(str(r["id"])) for r in rows)),
-        "pattern": max(7, max(len(r["pattern"]) for r in rows)),
-        "owner": max(5, max(len(r["owner"]) for r in rows)),
-        "category": max(8, max(len(r["category"] or "") for r in rows)),
-        "created": 10,
-    }
+        return "No finance rules defined."
 
-    def _pad(val, width):
-        return str(val or "").ljust(width)
-
-    header = (
-        f"{'id'.ljust(col_widths['id'])}  "
-        f"{'pattern'.ljust(col_widths['pattern'])}  "
-        f"{'owner'.ljust(col_widths['owner'])}  "
-        f"{'category'.ljust(col_widths['category'])}  "
-        f"created"
-    )
-    sep = (
-        "  ".join("-" * col_widths[k] for k in ("id", "pattern", "owner", "category"))
-        + "  ----------"
-    )
-    lines = [header, sep]
+    lines = [
+        f"  {'id':>3}  {'merchant':<32}  {'desc':<16}  {'recur':<13}  "
+        f"{'amt range':>14}  {'cat':<18}  {'owner':<10}  pri  note",
+        "  " + "─" * 130,
+    ]
     for r in rows:
+        amt = ""
+        if r.get("match_amount_min") is not None:
+            amt = f"${r['match_amount_min']:.0f}–${r['match_amount_max']:.0f}"
         lines.append(
-            f"{_pad(r['id'], col_widths['id'])}  "
-            f"{_pad(r['pattern'], col_widths['pattern'])}  "
-            f"{_pad(r['owner'], col_widths['owner'])}  "
-            f"{_pad(r['category'], col_widths['category'])}  "
-            f"{r['created'] or ''}"
+            f"  {r['id']:>3}  {(r['match_merchant'] or ''):<32}  "
+            f"{(r['match_descriptor'] or ''):<16}  "
+            f"{(r['match_recurrence'] or ''):<13}  "
+            f"{amt:>14}  "
+            f"{(r['category'] or ''):<18}  "
+            f"{(r['owner'] or ''):<10}  "
+            f"{r['priority']:>3}  "
+            f"{(r['note'] or '')}"
         )
     return "\n".join(lines)
 
 
-def cmd_rule_remove(conn, rule_id: int) -> str:
-    row = conn.execute(
-        "SELECT id, pattern, owner, category FROM rules WHERE id = ?", (rule_id,)
-    ).fetchone()
-    if not row:
+def cmd_rule_rm(conn, rule_id: int) -> str:
+    rows = get_finance_rules(conn)
+    target = next((r for r in rows if r["id"] == rule_id), None)
+    if not target:
         return f"Rule {rule_id} not found."
-    conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
-    conn.commit()
-    if row["category"]:
-        target = f"{row['owner']}/{row['category']}"
-    else:
-        target = row["owner"]
+    delete_finance_rule(conn, rule_id)
     return (
-        f'Rule {rule_id} removed ("{row["pattern"]}" {target}). '
+        f'Rule {rule_id} removed ("{target["match_merchant"]}" → '
+        f'{target["owner"]}/{target["category"]}). '
         f"Run finance apply-rules to re-categorize if needed."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Command: scrape
-# ---------------------------------------------------------------------------
-
-
-def cmd_scrape(
-    conn,
-    bank: str,
-    days: int = 30,
-    first_auth: bool = False,
-    dry_run: bool = False,
-) -> str:
-    if bank == "rbc":
-        from skills.finance import scraper_rbc  # lazy import — playwright optional
-
-        async def _run():
-            return await scraper_rbc.fetch_transactions(days=days, force_headful=first_auth)
-
-        try:
-            txns = asyncio.run(_run())
-        except SessionExpiredError as exc:
-            return str(exc)
-        except ScraperError as exc:
-            return f"Scrape failed: {exc}"
-    elif bank == "td":
-        from skills.finance import scraper_td
-
-        async def _run_td():
-            return await scraper_td.fetch_transactions(days=days)
-
-        try:
-            asyncio.run(_run_td())
-        except NotImplementedError as exc:
-            return str(exc)
-        return "TD scraper not yet implemented."
-    else:
-        return f"Unknown bank: {bank}. Supported: rbc, td"
-
-    if dry_run:
-        lines = [f"[dry-run] {len(txns)} transactions from {bank.upper()}:"]
-        for t in txns[:20]:
-            lines.append(
-                f"  {t['date']}  {_fmt_amount(t['amount'])}  {t['description']}  [{t['account']}]"
-            )
-        if len(txns) > 20:
-            lines.append(f"  … {len(txns) - 20} more")
-        return "\n".join(lines)
-
-    inserted = skipped = 0
-    for txn in txns:
-        row = {
-            "id": txn["id"],
-            "account_id": txn.get("account_id", f"{bank}-unknown"),
-            "date": txn["date"],
-            "amount": txn["amount"],
-            "description": txn["description"],
-            "category": txn.get("category"),
-            "currency": txn.get("currency", "CAD"),
-            "owner": "personal",
-            "is_pending": txn.get("is_pending", 0),
-            "source": txn.get("source", f"scraper_{bank}"),
-            "note": None,
-        }
-        if upsert_transaction(conn, row):
-            inserted += 1
-        else:
-            skipped += 1
-
-    next_bank = "td" if bank == "rbc" else ""
-    next_hint = f"  Next: finance scrape --bank {next_bank}" if next_bank else ""
-    return (
-        f"Scraped {len(txns)} transactions from {bank.upper()} "
-        f"({inserted} new, {skipped} already in DB).{next_hint}"
     )
 
 
@@ -1547,9 +1637,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="finance", description="Personal CFO skill")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_sync = sub.add_parser("sync", help="Sync from Wealthica")
-    p_sync.add_argument("--since", default=None, metavar="DATE", help="Start date (YYYY-MM-DD)")
-    p_sync.add_argument("--full", action="store_true", help="Full history sync from 2020-01-01")
+    p_ingest = sub.add_parser("ingest", help="Sweep finance inbox, import CSVs, archive/quarantine")
+    p_ingest.add_argument(
+        "--no-discord", action="store_true", help="Suppress Discord summary posting"
+    )
 
     p_import = sub.add_parser("import", help="Import CSV transactions")
     p_import.add_argument("file", help="CSV file path")
@@ -1639,36 +1730,87 @@ def main() -> None:
     p_bills = sub.add_parser("bills-due", help="Upcoming obligations vs chequing")
     p_bills.add_argument("--days", type=int, default=7, metavar="N")
 
-    p_tag = sub.add_parser("tag", help="Tag transaction owner/category")
-    p_tag.add_argument("txn_id")
-    p_tag.add_argument("owner", choices=["personal", "altaforma"])
+    p_tag = sub.add_parser("tag", help="Tag transaction owner/category; optionally propose a rule")
+    p_tag.add_argument("txn_id", nargs="?", default=None)
+    p_tag.add_argument("owner", nargs="?", choices=["personal", "altaforma"], default=None)
     p_tag.add_argument("--category", default=None, metavar="CAT")
+    p_tag.add_argument(
+        "--rule",
+        action="store_true",
+        help="After tagging, derive a generalising rule and propose it for confirmation",
+    )
+    p_tag.add_argument(
+        "--confirm-rule",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Confirm a previously proposed rule (writes rule + back-applies)",
+    )
+    p_tag.add_argument(
+        "--discard-rule",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Discard a previously proposed rule without writing it",
+    )
 
-    p_rule = sub.add_parser("rule", help="Manage classification rules")
+    p_rule = sub.add_parser("rule", help="Manage finance_rules decision layer")
     rule_sub = p_rule.add_subparsers(dest="rule_cmd", required=True)
 
-    p_rule_add = rule_sub.add_parser("add", help="Add a new LIKE classification rule")
-    p_rule_add.add_argument("pattern", help="SQL LIKE pattern (e.g. %%DIGITALOCEAN%%)")
-    p_rule_add.add_argument("owner", choices=["personal", "altaforma"])
-    p_rule_add.add_argument("--category", default=None, metavar="CAT")
+    p_rule_set = rule_sub.add_parser("set", help="Add/update a finance rule")
+    p_rule_set.add_argument(
+        "--merchant", required=True, metavar="PAT", help="SQL LIKE pattern (e.g. %%ANTHROPIC%%)"
+    )
+    p_rule_set.add_argument("--category", default=None, metavar="CAT")
+    p_rule_set.add_argument("--owner", choices=["personal", "altaforma"], default="personal")
+    p_rule_set.add_argument(
+        "--descriptor",
+        default=None,
+        metavar="D",
+        help="Substring that must appear in description (optional)",
+    )
+    p_rule_set.add_argument(
+        "--recurrence",
+        choices=list(_VALID_RECURRENCES),
+        default=None,
+        help="Recurrence type for sub-vs-usage disambiguation",
+    )
+    p_rule_set.add_argument(
+        "--amount-min",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Minimum abs(amount) — must pair with --amount-max",
+    )
+    p_rule_set.add_argument(
+        "--amount-max",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Maximum abs(amount) — must pair with --amount-min",
+    )
+    p_rule_set.add_argument(
+        "--transfer", action="store_true", help="Mark as internal transfer (excluded from spend)"
+    )
+    p_rule_set.add_argument(
+        "--priority", type=int, default=0, help="Match priority — higher wins (default 0)"
+    )
+    p_rule_set.add_argument("--note", default=None, metavar="NOTE", help="Human-readable note")
 
-    rule_sub.add_parser("list", help="List all classification rules")
+    p_rule_list = rule_sub.add_parser("list", help="List finance rules")
+    p_rule_list.add_argument(
+        "--merchant", default=None, metavar="PAT", help="Filter by merchant substring"
+    )
 
-    p_rule_remove = rule_sub.add_parser("remove", help="Remove a rule by id")
-    p_rule_remove.add_argument("id", type=int)
-
-    p_scrape = sub.add_parser("scrape", help="Scrape transactions from bank via Playwright")
-    p_scrape.add_argument("--bank", required=True, choices=["rbc", "td"], help="Bank to scrape")
-    p_scrape.add_argument("--days", type=int, default=30, metavar="N", help="Days of history")
-    p_scrape.add_argument("--first-auth", action="store_true", help="Force headful login + MFA")
-    p_scrape.add_argument("--dry-run", action="store_true", help="Print instead of importing")
+    p_rule_rm = rule_sub.add_parser("rm", help="Remove a rule by id")
+    p_rule_rm.add_argument("id", type=int)
 
     args = parser.parse_args()
     conn = init_db(str(DB_PATH))
 
     try:
-        if args.cmd == "sync":
-            print(cmd_sync(conn, args.since, args.full))
+        if args.cmd == "ingest":
+            print(cmd_ingest(conn, post_discord=not args.no_discord))
 
         elif args.cmd == "import":
             print(cmd_import(conn, args.file, args.account, args.owner))
@@ -1735,33 +1877,43 @@ def main() -> None:
             print(cmd_debt(conn))
 
         elif args.cmd == "apply-rules":
-            n = _apply_rules_all(conn)
+            n = apply_finance_rules_all(conn)
             print(f"Applied rules to all transactions — {n} row(s) updated.")
 
         elif args.cmd == "bills-due":
             print(cmd_bills_due(conn, args.days))
 
         elif args.cmd == "tag":
-            print(cmd_tag(conn, args.txn_id, args.owner, args.category))
+            if args.confirm_rule is not None:
+                print(cmd_tag_confirm(conn, args.confirm_rule))
+            elif args.discard_rule is not None:
+                print(cmd_tag_discard(conn, args.discard_rule))
+            elif args.txn_id and args.owner:
+                print(cmd_tag(conn, args.txn_id, args.owner, args.category, args.rule))
+            else:
+                print("Usage: finance tag <txn_id> <owner> [--category CAT] [--rule]")
 
         elif args.cmd == "rule":
-            if args.rule_cmd == "add":
-                print(cmd_rule_add(conn, args.pattern, args.owner, args.category))
-            elif args.rule_cmd == "list":
-                print(cmd_rule_list(conn))
-            elif args.rule_cmd == "remove":
-                print(cmd_rule_remove(conn, args.id))
-
-        elif args.cmd == "scrape":
-            print(
-                cmd_scrape(
-                    conn,
-                    bank=args.bank,
-                    days=args.days,
-                    first_auth=args.first_auth,
-                    dry_run=args.dry_run,
+            if args.rule_cmd == "set":
+                print(
+                    cmd_rule_set(
+                        conn,
+                        merchant=args.merchant,
+                        category=args.category,
+                        owner=args.owner,
+                        descriptor=args.descriptor,
+                        recurrence=args.recurrence,
+                        amount_min=args.amount_min,
+                        amount_max=args.amount_max,
+                        is_transfer=args.transfer,
+                        priority=args.priority,
+                        note=args.note,
+                    )
                 )
-            )
+            elif args.rule_cmd == "list":
+                print(cmd_rule_list(conn, getattr(args, "merchant", None)))
+            elif args.rule_cmd == "rm":
+                print(cmd_rule_rm(conn, args.id))
 
     finally:
         conn.close()

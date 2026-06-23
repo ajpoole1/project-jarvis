@@ -1,4 +1,0 @@
-# Wealthica API calls use urllib.request (stdlib)
-# Playwright is required for the scraper subcommand only
-# Install: pip install playwright && playwright install chromium
-playwright>=1.44
