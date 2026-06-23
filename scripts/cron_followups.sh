@@ -28,6 +28,10 @@ if [ -f "$HOME/.jarvis.env" ]; then
     done < "$HOME/.jarvis.env"
 fi
 
+# Update LIVE_STATE.md in openclaw workspace (date/time + outstanding staged writes)
+# Bootstrap-extra-files loads this at every agent bootstrap — no instruction-layer dep.
+python3 "$HOME/.openclaw/workspace/scripts/session_start.py" 2>>"$PROJECT/logs/cron.log"
+
 # Reap expired window_until watches — no output unless something lapsed
 python3 "$PROJECT/skills/followups/skill.py" reap 2>>"$PROJECT/logs/cron.log"
 

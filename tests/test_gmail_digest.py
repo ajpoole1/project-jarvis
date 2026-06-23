@@ -226,9 +226,11 @@ def test_execute_actions_suspended():
 # ---------------------------------------------------------------------------
 
 
-def test_cmd_digest_includes_keep_items():
-    """Digest must show keep-classified emails under KEEP."""
+def test_cmd_digest_includes_act_items():
+    """Digest must show act-tier emails under ACT — inbox (replaces legacy KEEP section)."""
     summary = _make_summary("m1", "Alice", "keep")
+    summary.tier = "act"
+    summary.disposition = "inbox"
     with (
         patch.object(skill, "get_gmail_service", return_value=MagicMock()),
         patch.object(skill, "init_db", return_value=MagicMock()),
@@ -237,7 +239,7 @@ def test_cmd_digest_includes_keep_items():
         patch.object(skill, "save_pending"),
     ):
         result = skill.cmd_digest()
-    assert "KEEP" in result
+    assert "ACT" in result
     assert "Alice" in result
 
 
@@ -266,13 +268,18 @@ def test_cmd_digest_calls_save_pending():
     mock_save.assert_called_once()
 
 
-def test_cmd_digest_all_action_buckets():
-    """Digest output must include all non-empty action buckets."""
-    summaries = [
-        _make_summary("m1", "Spammer", "trash"),
-        _make_summary("m2", "Newsletter", "archive"),
-        _make_summary("m3", "Alice", "keep"),
-    ]
+def test_cmd_digest_all_tier_buckets():
+    """Digest output includes all non-empty tier buckets (ACT/AWARE/ARCHIVE)."""
+    act_s = _make_summary("m1", "Alice", "keep")
+    act_s.tier = "act"
+    act_s.disposition = "inbox"
+    aware_s = _make_summary("m2", "Newsletter", "archive")
+    aware_s.tier = "aware"
+    aware_s.disposition = "file"
+    archive_s = _make_summary("m3", "Spammer", "archive")
+    archive_s.tier = "archive"
+    archive_s.disposition = "quarantine"
+    summaries = [act_s, aware_s, archive_s]
     with (
         patch.object(skill, "get_gmail_service", return_value=MagicMock()),
         patch.object(skill, "init_db", return_value=MagicMock()),
@@ -283,9 +290,9 @@ def test_cmd_digest_all_action_buckets():
         patch.object(skill, "save_pending"),
     ):
         result = skill.cmd_digest()
-    assert "TRASH" in result
+    assert "ACT" in result
+    assert "AWARE" in result
     assert "ARCHIVE" in result
-    assert "KEEP" in result
 
 
 def test_cmd_heartbeat_no_digest_queue_writes():

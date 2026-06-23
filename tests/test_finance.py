@@ -961,6 +961,7 @@ def test_runway_include_inheritance(db):
     base = _skill.cmd_runway(db, include_inheritance=False)
     with_inh = _skill.cmd_runway(db, include_inheritance=True)
     assert "$1,300 inheritance" in with_inh
+
     # Runway with inheritance should be numerically higher
     def _extract_runway(text: str) -> float:
         for word in text.split():

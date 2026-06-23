@@ -101,6 +101,7 @@ def _scan_knowledge_root(root, label):
             continue
         slug = fm.get("slug", re.sub(r"[^a-z0-9-]", "-", name.lower()))
         relationship = fm.get("relationship") or fm.get("tier", "")
+        pronouns = fm.get("pronouns", "")
         h2 = _first_h2(text)
         tbds = _open_items(text)
         domain = parts[0] if len(parts) > 1 else label
@@ -108,10 +109,12 @@ def _scan_knowledge_root(root, label):
             "name": name,
             "slug": slug,
             "relationship": relationship,
+            "pronouns": pronouns,
             "domain": domain,
             "h2": h2,
             "tbds": tbds,
             "label": label,
+            "path": str(md_file),
         }
 
 
@@ -202,6 +205,22 @@ def build():
             lines.append(" ".join(parts))
 
     lines.append("")
+
+    # Machine-readable people lookup table for the reflex matcher (WS2).
+    # One line per person: slug | canonical name | relationship | pronouns | card path
+    # pronouns defaults to "they/them" when not set in frontmatter — add a `pronouns:`
+    # field to each people card to get accurate values.
+    people = [e for e in entities if e["domain"] == "people"]
+    if people:
+        lines += ["", "## People Index", ""]
+        lines.append("_slug | canonical name | relationship | pronouns | card path_")
+        lines.append("")
+        for p in people:
+            pronouns = p["pronouns"] or "they/them"
+            lines.append(
+                f"- `{p['slug']}` | {p['name']} | {p['relationship']} | {pronouns} | {p['path']}"
+            )
+        lines.append("")
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -1,138 +1,168 @@
 # gmail-cleanup
 
-Classifies inbox emails using Claude Haiku and stages actions for explicit user approval before executing. Nothing is deleted or archived without a confirm step.
+Intent-keyed Gmail classifier. Sorts inbox into three salience tiers (Act/Aware/Archive), applies a reversible four-rung disposition ladder, and never executes without an explicit confirm step. All behaviour is controlled by data in `jarvis.db` — no code changes needed to tune decisions.
 
-## What it does
+## Model (2026-0041)
 
-1. Fetches inbox emails (incremental in heartbeat mode — only since last check)
-2. Checks SQLite for confirmed sender rules — bypasses Haiku for known senders
-3. Passes email snippet to Haiku for uncached senders — subject + body preview
-4. Classifies unknown senders with Claude Haiku: `archive / trash / unsubscribe / keep`
-5. Sets `uncertain: true` when Haiku can't confidently decide — flags to Discord instead of guessing
-6. Sets `calendar_hint: true` when an email contains appointment/booking info not yet on calendar
-7. Optionally injects upcoming Google Calendar events so appointment emails already saved are archived
-8. Saves staged actions to `gmail_pending_actions` SQLite table — **nothing executes yet**
-9. Returns a formatted report to Discord
-10. Waits for explicit `execute` command before touching any email
+### Three salience tiers
 
-## Stage-then-approve flow
+| Tier | Meaning | Default surface |
+|---|---|---|
+| **Act** | Needs AJ — open loop | Inbox (immediate ping or silent, per `gmail_ping_rules`) |
+| **Aware** | Not urgent, not noise — worth knowing | Named line in daily ledger only |
+| **Archive** | Pure noise | Silently filed or removed; count in ledger |
 
+### Four-rung disposition ladder
+
+| Disposition | What happens | Reversible? |
+|---|---|---|
+| `inbox` | Stays in INBOX, `jarvis/<tag>` label applied | Yes (via drag/delete) |
+| `file` | Removed from INBOX, `jarvis/<tag>` applied | Yes (in All Mail) |
+| `quarantine` | Removed from INBOX, `jarvis/quarantine` applied | **Yes** — AJ drags back to trigger correction |
+| `trash_direct` | Gmail trash immediately | No — **AJ-authored only**, never an autonomous guess |
+
+### Autonomy gating
+
+Autonomous moves (no staging prompt) require **all** of:
+- `confidence >= gmail_config.autonomy_threshold` (default 0.85)
+- `disposition ∈ {file, quarantine}` (reversible only)
+- `needs_aj = false`
+- `uncertain = false`
+
+Below threshold → staged for AJ approval. Raise threshold as trust grows:
 ```
-stage → [review / adjust] → execute
-                          └→ cancel (guaranteed no-op)
+gmail config set autonomy_threshold 0.90
 ```
 
-The two-step flow is enforced at the **skill level**, not just by agent instructions.
+### Classification is intent-keyed, not sender-keyed
+
+Per message, Haiku answers: *what type is this?* Type→tier/disposition/needs_aj/ping rules live in `gmail_type_rules`. Sender is a *signal* (plus explicit overrides in `gmail_senders`). No hardcoded senders, tiers, or thresholds in code.
+
+The worked example: **Petit Parchemin (daycare app)**
+
+| Message | Type key | Tier | Disposition | Ping? |
+|---|---|---|---|---|
+| Daily journal de bord | `daycare_routine` | archive | trash_direct | no |
+| Monthly bulletin | `bulletin` | aware | file | no |
+| Staff message / incident | `daycare_message` | act | inbox | yes |
+
+One sender → three different dispositions. Impossible with a sender-keyed cache.
 
 ## Commands
 
-### Scheduled (run by cron via `scripts/` — do not call manually)
+### Scheduled (dispatched by heartbeat — do not call manually)
 
-| Command | Description |
-|---|---|
-| `python skill.py heartbeat` | Incremental check since `last_checked`. Outputs `SILENT`, `IMMEDIATE: ...`, or `DIGEST ADDED: ...`. First run initialises timestamp only. |
-| `python skill.py digest` | Posts queued non-priority emails as a rollup and clears the queue. |
+| Command | Schedule | Description |
+|---|---|---|
+| `python skill.py heartbeat` | every 10 min | Incremental check since `last_checked`. Posts `SILENT`, `IMMEDIATE`, or reconciliation alerts. |
+| `python skill.py ledger` | daily@12:00 | Named Aware-tier items + autonomous move count for trust-building period. |
 
 ### Manual cleanup
 
 | Command | Description |
 |---|---|
-| `python skill.py stage` | Classify inbox, save to pending, show report |
-| `python skill.py execute` | Apply all pending actions (runs real unsubscribe attempts first) |
+| `python skill.py stage` | Classify inbox, save to pending, show staged report grouped by disposition |
+| `python skill.py execute` | Apply all pending staged actions |
 | `python skill.py cancel` | Discard pending actions — nothing changes |
 | `python skill.py pending` | Show current staged actions |
-| `python skill.py adjust <email> <action>` | Change action for a specific sender before executing |
-| `python skill.py drain` | Fully automated: classify and execute in a loop until inbox is clean |
-| `python skill.py drain_categories` | Drain Gmail category tabs (Promotions, Updates, Social, Forums) |
-| `python skill.py purge_archive` | Trash archived emails from confirmed trash/unsubscribe senders |
-| `python skill.py body <msg_id>` | Fetch plain-text body of an email — use when subject alone is ambiguous |
+| `python skill.py adjust <email> <action>` | Change staged action for a specific sender before executing |
+| `python skill.py digest` | Full inbox status report grouped by tier (ACT/AWARE/ARCHIVE). Read-only. |
+| `python skill.py body <msg_id>` | Fetch plain-text body of an email — use when subject is ambiguous |
+
+### Decision layer — data, not code
+
+All behaviour tuning is a staged DB write. No branch, no PR, no git:
+
+```
+gmail sender set <pattern> --tier <act|aware|archive> [--bypass trash_direct|always_inbox]
+gmail sender list
+gmail sender remove <pattern>
+
+gmail type set <type> --tier <t> --disposition <d> [--ping on|off] [--needs-aj on|off]
+gmail type list
+gmail type remove <type>
+
+gmail ping set <type> on|off
+gmail ping list
+
+gmail config set <key> <value>
+gmail config list
+
+gmail rules show           # one-screen summary of all four tables
+```
+
+Changes take effect on the next heartbeat run.
+
+### Backlog drain (destructive — explicit gate)
+
+```
+python skill.py backlog-drain --i-understand              # drain inbox
+python skill.py backlog-drain --i-understand --categories # drain category tabs
+```
+
+Auto-executes without approval. Only for large backlog clearing events.
 
 ### Watch rules
 
-Named semantic watch rules. During heartbeat, a single Haiku call checks all new emails against active rules. Matches surface as IMMEDIATE regardless of normal priority tier.
+Named semantic watch rules checked on every heartbeat.
 
 | Command | Description |
 |---|---|
 | `python skill.py watch add <label> "<description>"` | Add a new watch rule |
-| `python skill.py watch list` | List all watch rules and their status |
-| `python skill.py watch remove <id>` | Remove a watch rule |
-| `python skill.py watch pause <id>` | Pause a watch rule without removing it |
-| `python skill.py watch resume <id>` | Re-activate a paused rule |
-
-Example: `python skill.py watch add recruiter "emails from recruiters or staffing agencies"`
+| `python skill.py watch list` | List all active rules |
+| `python skill.py watch remove <id>` | Remove a rule |
+| `python skill.py watch pause <id>` / `resume <id>` | Pause / re-activate |
 
 ### Archive expiry
 
-Per-tag retention policies. `expire run` trashes archived emails older than their retention period using Gmail's `older_than:Nd` filter — no per-email inspection needed.
+Per-tag retention. `expire run` trashes archived emails older than their retention period.
 
 | Command | Description |
 |---|---|
-| `python skill.py expire set <tag> <days>` | Set retention period for a tag |
-| `python skill.py expire list` | Show all policies (tags without a policy are kept forever) |
-| `python skill.py expire remove <tag>` | Remove a policy — tag reverts to keep forever |
-| `python skill.py expire preview` | Dry run — show what would be trashed |
-| `python skill.py expire run` | Execute the purge |
-
-Valid tags: `receipts`, `bills`, `job-search`, `health`, `family`, `projects`
+| `python skill.py expire set <tag> <days>` | Set retention period |
+| `python skill.py expire list` | Show all policies |
+| `python skill.py expire preview` | Dry run |
+| `python skill.py expire run` | Execute purge |
 
 ### Flagged emails
 
-Emails where Haiku sets `uncertain: true` are saved to `gmail_flagged` and surfaced as IMMEDIATE in heartbeat with a `[flagged #N — decide?]` annotation. They are not cached and not queued for digest until you decide.
+Emails where the classifier sets `uncertain=true` are saved to `gmail_flagged` and surfaced as IMMEDIATE in heartbeat.
 
 | Command | Description |
 |---|---|
-| `python skill.py flag list` | Show all flagged emails with IDs and Haiku's reason |
-| `python skill.py flag decide <id> <action>` | Execute the action immediately and confirm the sender rule |
-| `python skill.py flag clear` | Discard all flagged emails without deciding |
+| `python skill.py flag list` | Show flagged emails with IDs and reason |
+| `python skill.py flag decide <id> <action>` | Execute action and clear |
+| `python skill.py flag clear` | Discard without deciding |
 
-### Rule management
+### None-queue drain
+
+`jarvis/none` is a transient marker for emails awaiting tier-2 (body-level) classification.
 
 | Command | Description |
 |---|---|
-| `python skill.py review` | Show unconfirmed sender rules in SQLite |
-| `python skill.py confirm_action <action>` | Confirm all unconfirmed rules for a given action |
-| `python skill.py confirm_all` | Confirm all unconfirmed sender rules |
-| `python skill.py override <email> <action>` | Manually set a confirmed sender rule |
+| `python skill.py drain-none` | Body-classify all emails in the none queue |
 
-## Heartbeat priority detection
+## Correction feedback loop
 
-The `heartbeat` command splits results into tiers:
+When AJ drags a quarantined item back to the inbox, the next heartbeat detects it and surfaces:
+- A summary of the correction
+- A proposed `gmail_type_rules` update (`gmail type set <type> --tier act --needs-aj on`)
 
-**Immediate ping** (posts to Discord right away):
-- Tag is `family`
-- `calendar_hint: true` — appointment/booking with date in body not subject
-- Subject contains security keywords: unauthorized, breach, login attempt, etc.
-- Subject contains financial keywords: low balance, fraud alert, CRA, etc.
-- Action is `keep` and sender doesn't look automated (real person)
-- Matches a watch rule — annotated `[watch: label]`
-- Haiku flagged as uncertain — annotated `[flagged #N — decide?]`
+Staged then ✅ — the fix attaches to the *type*, not the sender, so it generalizes.
 
-**Digest queue** (accumulated, posted at 13:00 and 18:00 by cron):
-- All other actionable emails: trash, archive, unsubscribe
-
-## Real unsubscribe
-
-When `execute` runs, emails with action `unsubscribe` attempt a real HTTP unsubscribe before being trashed:
-
-1. Fetches `List-Unsubscribe` and `List-Unsubscribe-Post` headers from the Gmail API
-2. If `List-Unsubscribe-Post: List-Unsubscribe=One-Click` is present → RFC 8058 POST (preferred)
-3. Otherwise → plain GET to the HTTP URL
-4. If only `mailto:` is available → noted and skipped
-5. Email is always trashed regardless of unsubscribe outcome
-
-Results are shown in the `execute` output per sender.
+Repeated reversals of the same type retire that type's autonomous gate.
 
 ## Setup
 
-### 1. Google Cloud credentials
+### Google Cloud credentials
 
 1. Go to [console.cloud.google.com](https://console.cloud.google.com) → create a project
 2. Enable the **Gmail API**
 3. Create **OAuth 2.0 credentials** (Desktop app) → download JSON
 4. Rename to `gmail_credentials.json` and place in `JARVIS_CONFIG_DIR`
-5. On the OAuth consent screen, set publishing status to **Production** — Testing mode expires refresh tokens after 7 days
+5. Set publishing status to **Production** — Testing mode expires refresh tokens after 7 days
 
-### 2. Environment variables
+### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -140,7 +170,7 @@ Results are shown in the `execute` output per sender.
 | `JARVIS_DATA_DIR` | `/data` | Path to SQLite DB directory |
 | `JARVIS_CONFIG_DIR` | `/config/personal` | Path to credentials directory |
 
-### 3. Virtualenv and first run
+### First run
 
 ```bash
 cd skills/gmail-cleanup
@@ -149,87 +179,60 @@ python -m pip install -r requirements.txt
 python skill.py stage
 ```
 
-On first run (and after token expiry), the skill prints a URL to the terminal instead of opening a browser — works correctly in WSL2 headless environments. Open the URL in your Windows browser, grant access, and the token is saved automatically to `JARVIS_CONFIG_DIR/gmail_token.json` — gitignored.
+On first run, the skill prints an OAuth URL to the terminal (works in WSL2 headless). Open in Windows browser, grant access — token saved to `JARVIS_CONFIG_DIR/gmail_token.json`.
 
-## SQLite schema
+## SQLite schema (key tables)
 
-### `gmail_sender_rules`
+### `gmail_type_rules` — decision layer (authoritative)
 | Column | Type | Description |
 |---|---|---|
-| `sender_email` | TEXT PK | Normalized sender address |
-| `action` | TEXT | archive / trash / unsubscribe / keep |
-| `confirmed` | INTEGER | 1 = user-confirmed, 0 = Haiku suggestion |
-| `last_applied` | TEXT | ISO datetime of last application |
+| `type` | TEXT PK | Intent type key (e.g. `daycare_routine`, `unpaid_invoice`) |
+| `tier` | TEXT | act / aware / archive |
+| `disposition` | TEXT | inbox / file / quarantine / trash_direct |
+| `needs_aj` | INTEGER | 1 = must stay in inbox |
+| `ping` | INTEGER | 1 = interrupt immediately |
+| `note` | TEXT | Human rationale |
 
-Only `confirmed=1` rules are used as cache hits. Uncertain emails are never cached until decided.
+Edit via `gmail type set`. Changes take effect on next heartbeat.
 
-### `gmail_pending_actions`
+### `gmail_senders` — explicit sender overrides
 | Column | Type | Description |
 |---|---|---|
-| `msg_id` | TEXT PK | Gmail message ID |
-| `sender_email` | TEXT | Normalized sender address |
-| `sender_display` | TEXT | Display name from From header |
-| `subject` | TEXT | Email subject |
-| `action` | TEXT | Staged action |
-| `tag` | TEXT | jarvis/* label to apply |
-| `reason` | TEXT | Haiku's classification reason |
-| `staged_at` | TEXT | ISO datetime of staging |
+| `sender_pattern` | TEXT PK | Substring match against `From` address |
+| `default_tier` | TEXT | Tier override for this sender |
+| `bypass` | TEXT | `trash_direct` or `always_inbox` — skips classifier |
 
-### `gmail_heartbeat_state`
-| Column | Type | Description |
+Edit via `gmail sender set`.
+
+### `gmail_config` — thresholds and dials
+| Key | Default | Description |
 |---|---|---|
-| `key` | TEXT PK | `last_checked` or `digest_queue` |
-| `value` | TEXT | ISO timestamp or JSON array of queued items |
+| `autonomy_threshold` | 0.85 | Min confidence for autonomous moves |
+| `stage_threshold` | 0.60 | Below this → always stage |
+| `quarantine_retain_days` | 30 | Auto-purge window for quarantine |
+| `ledger_report_autonomous` | 1 | 1 = report autonomous moves in ledger |
+| `none_queue_alarm_threshold` | 20 | Alert if jarvis/none queue exceeds this |
 
-### `gmail_watches`
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER PK | Auto-increment ID |
-| `label` | TEXT | Short name for the rule |
-| `description` | TEXT | Natural language match criteria |
-| `active` | INTEGER | 1 = active, 0 = paused |
-| `created_at` | TEXT | ISO datetime |
+### `gmail_ping_rules` — Act-tier interrupt subset
+| Column | Description |
+|---|---|
+| `match` | Type key (e.g. `personal`, `security`) |
+| `ping` | 1 = interrupt, 0 = inbox silent |
 
-### `gmail_expire_policies`
-| Column | Type | Description |
-|---|---|---|
-| `tag` | TEXT PK | jarvis/* tag name |
-| `retain_days` | INTEGER | Days to keep archived emails with this tag |
+### `gmail_pending_actions` — staged action queue
+| Column | Description |
+|---|---|
+| `msg_id` | Gmail message ID |
+| `action` | Legacy field (kept for schema compat) |
+| `tag` | `jarvis/*` label to apply |
+| `reason` | Classifier's rationale |
 
-### `gmail_flagged`
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER PK | Auto-increment ID — used in `flag decide` |
-| `msg_id` | TEXT UNIQUE | Gmail message ID |
-| `sender_email` | TEXT | Normalized sender address |
-| `sender` | TEXT | Display name |
-| `subject` | TEXT | Email subject |
-| `reason` | TEXT | Haiku's uncertainty reason |
-| `flagged_at` | TEXT | ISO datetime |
+### `gmail_sender_rules` — **retired as decision primitive**
+Kept in schema for rollback. No longer read for decisions. Signal migrated to `gmail_senders`.
 
-### `deadlines`
-| Column | Type | Description |
-|---|---|---|
-| `id` | INTEGER PK | Auto-increment ID — used in `tasks complete` |
-| `title` | TEXT | Deadline description |
-| `due_date` | TEXT | ISO date YYYY-MM-DD |
-| `project` | TEXT | Category (e.g. `school`, `altaforma`) |
-| `notes` | TEXT | Context for Jarvis — what the deadline gates |
-| `completed` | INTEGER | 0 = pending, 1 = done |
-| `created_at` | TEXT | ISO datetime |
-
-Owned by the `tasks` skill. Created by `init_db()` here so the morning briefing can query it from the shared DB without a cross-skill dependency.
-
-## Personal classification rules
-
-Subject-conditional sender rules, always-keep names, and `NEVER_CACHE_SENDERS` live in `JARVIS_CONFIG_DIR/gmail_rules.json` — gitignored.
-
-Copy `config/examples/gmail_rules.json` as a starting point. If the personal file is absent the skill falls back to the example file.
-
-## Tagging
-
-Applied Gmail labels: `jarvis/receipts`, `jarvis/bills`, `jarvis/job-search`, `jarvis/health`, `jarvis/family`, `jarvis/projects`. Created automatically on first run.
+### Other tables
+`gmail_heartbeat_state`, `gmail_watches`, `gmail_expire_policies`, `gmail_flagged`, `gmail_tags` — see code.
 
 ## Calendar integration
 
-If `skills/calendar` is installed, the skill fetches the next 30 days of calendar events and injects them into the Haiku prompt. Appointment emails for events already on calendar are archived. Appointment emails not yet on calendar get `calendar_hint: true` and surface as IMMEDIATE in the heartbeat.
+If `skills/calendar` is installed, the skill fetches the next 30 days of events and injects them into the classifier prompt. Appointment emails for events already on calendar are filed. New appointments get `calendar_hint: true` and surface as IMMEDIATE in heartbeat.

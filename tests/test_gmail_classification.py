@@ -324,20 +324,33 @@ def test_tier1_tag_definitions_excludes_other():
     assert "projects" in definitions
 
 
-def test_classify_emails_forces_other_to_none():
-    """classify_emails must convert any tier-1 'other' tag to 'none' for tier-2 routing."""
+def test_classify_emails_other_type_routes_to_archive_file():
+    """classify_emails: when classifier returns type='other', the type_rules table
+    maps it to tier=archive, disposition=file. No panic, no inbox landing."""
+    new_format_response = json.dumps(
+        [
+            {
+                "type": "other",
+                "tier": "archive",
+                "disposition": "file",
+                "needs_aj": False,
+                "confidence": 0.90,
+                "calendar_hint": False,
+                "uncertain": False,
+                "reason": "no recognised type",
+                "tag": "none",
+            }
+        ]
+    )
     mock_response = MagicMock()
-    mock_response.content = [
-        MagicMock(
-            text='[{"action": "keep", "tag": "other", "reason": "no match", "calendar_hint": false, "uncertain": false}]'
-        )
-    ]
+    mock_response.content = [MagicMock(text=new_format_response)]
     mock_client = MagicMock()
     mock_client.messages.create.return_value = mock_response
 
     con = sqlite3.connect(":memory:")
-    con.execute("""
-        CREATE TABLE gmail_tags (
+    # Create the minimum tables required by classify_emails
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS gmail_tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             definition TEXT NOT NULL,
@@ -345,16 +358,42 @@ def test_classify_emails_forces_other_to_none():
             rule_spec TEXT NOT NULL DEFAULT '',
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
-        )
-    """)
-    con.execute("""
-        CREATE TABLE gmail_sender_rules (
+        );
+        CREATE TABLE IF NOT EXISTS gmail_sender_rules (
             sender_email TEXT PRIMARY KEY,
             action TEXT NOT NULL,
             confirmed INTEGER NOT NULL DEFAULT 0,
             last_applied TEXT
-        )
+        );
+        CREATE TABLE IF NOT EXISTS gmail_senders (
+            sender_pattern TEXT PRIMARY KEY,
+            friendly_name TEXT NOT NULL DEFAULT '',
+            default_tier TEXT NOT NULL DEFAULT 'archive',
+            bypass TEXT,
+            note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS gmail_type_rules (
+            type TEXT PRIMARY KEY,
+            tier TEXT NOT NULL,
+            disposition TEXT NOT NULL,
+            needs_aj INTEGER NOT NULL DEFAULT 0,
+            ping INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS gmail_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS gmail_ping_rules (
+            match TEXT PRIMARY KEY,
+            ping INTEGER NOT NULL DEFAULT 1,
+            note TEXT NOT NULL DEFAULT ''
+        );
     """)
+    skill._seed_decision_layer(con)
     for name, defn in [
         ("receipts", "Purchase"),
         ("projects", "Dev"),
@@ -362,7 +401,7 @@ def test_classify_emails_forces_other_to_none():
         ("none", "Transient"),
     ]:
         con.execute(
-            "INSERT INTO gmail_tags (name, definition, created_at) VALUES (?, ?, '2026-01-01')",
+            "INSERT OR IGNORE INTO gmail_tags (name, definition, created_at) VALUES (?, ?, '2026-01-01')",
             (name, defn),
         )
     con.commit()
@@ -383,11 +422,12 @@ def test_classify_emails_forces_other_to_none():
 
     with patch.object(skill, "anthropic") as mock_anthropic:
         mock_anthropic.Anthropic.return_value = mock_client
-        with patch.object(skill, "get_cached_action", return_value=None):
-            with patch.object(skill, "cache_rule"):
-                with patch.object(skill, "fetch_calendar_context", return_value=""):
-                    results = skill.classify_emails(emails, con)
+        with patch.object(skill, "fetch_calendar_context", return_value=""):
+            results = skill.classify_emails(emails, con)
 
+    assert results[0].email_type == "other", f"Expected type=other, got {results[0].email_type!r}"
+    assert results[0].tier == "archive", f"Expected tier=archive, got {results[0].tier!r}"
     assert (
-        results[0].tag == "none"
-    ), f"tier-1 'other' must be converted to 'none'; got '{results[0].tag}'"
+        results[0].disposition == "file"
+    ), f"Expected disposition=file, got {results[0].disposition!r}"
+    assert not results[0].needs_aj, "other type must not set needs_aj"
