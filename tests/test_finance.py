@@ -1379,3 +1379,231 @@ def test_monthly_coda_returns_string(tmp_path, monkeypatch):
     assert "net:" in lines[0]
     assert "Subs:" in lines[1]
     assert "GST" in lines[2]
+
+
+# ---------------------------------------------------------------------------
+# WS4: salience block
+# ---------------------------------------------------------------------------
+
+
+from skills.finance.salience import (  # noqa: E402
+    _cashflow_projection,
+    _category_anomalies,
+    _duplicate_charges,
+    _large_charge_forecast,
+    _subscription_drift,
+    compute_salience_block,
+)
+
+
+def _seed_salience_db(db):
+    """Seed a DB with enough data to exercise all 5 salience signals."""
+    today = date.today()
+
+    # Account with a known balance
+    upsert_account(
+        db,
+        {
+            "id": "sal-chq",
+            "institution": "RBC",
+            "name": "Chequing",
+            "type": "bank",
+            "currency": "CAD",
+            "balance_current": 3000.0,
+            "owner": "personal",
+            "source": "csv_import",
+            "last_synced": None,
+        },
+    )
+
+    # 3 months of income + spend for cashflow / anomaly signals.
+    # Use the 15th of each prior calendar month so these rows fall in the baseline window
+    # (not in the current-month window queried by _category_anomalies).
+    def _prior_month_15(n_months_ago: int) -> str:
+        y, m = today.year, today.month
+        for _ in range(n_months_ago):
+            m -= 1
+            if m == 0:
+                m, y = 12, y - 1
+        return f"{y:04d}-{m:02d}-15"
+
+    for months_ago in range(1, 4):
+        day = _prior_month_15(months_ago)
+        upsert_transaction(
+            db,
+            {
+                "id": f"sal-income-{months_ago}",
+                "account_id": "sal-chq",
+                "date": day,
+                "amount": 5000.0,
+                "description": "PAYROLL DEPOSIT",
+                "category": "income",
+                "owner": "personal",
+            },
+        )
+        # 5 grocery transactions per prior month so the month qualifies as a baseline period
+        for j in range(5):
+            upsert_transaction(
+                db,
+                {
+                    "id": f"sal-groceries-{months_ago}-{j}",
+                    "account_id": "sal-chq",
+                    "date": day,
+                    "amount": -60.0,
+                    "description": "IGA SUPERMARCHE",
+                    "category": "groceries",
+                    "owner": "personal",
+                },
+            )
+
+    # This month: anomalously high groceries (baseline ≈ $300/mo; this month $800 = >160% above)
+    upsert_transaction(
+        db,
+        {
+            "id": "sal-groceries-high",
+            "account_id": "sal-chq",
+            "date": today.isoformat(),
+            "amount": -800.0,
+            "description": "IGA SUPERMARCHE",
+            "category": "groceries",
+            "owner": "personal",
+        },
+    )
+
+    # Duplicate charge pair
+    upsert_transaction(
+        db,
+        {
+            "id": "sal-dup-a",
+            "account_id": "sal-chq",
+            "date": (today - timedelta(days=1)).isoformat(),
+            "amount": -49.99,
+            "description": "AMAZON PRIME",
+            "category": "subscriptions",
+            "owner": "personal",
+        },
+    )
+    upsert_transaction(
+        db,
+        {
+            "id": "sal-dup-b",
+            "account_id": "sal-chq",
+            "date": today.isoformat(),
+            "amount": -49.99,
+            "description": "AMAZON PRIME",
+            "category": "subscriptions",
+            "owner": "personal",
+        },
+    )
+
+    # Recurring monthly obligation
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "DESJARDINS MORTGAGE",
+            3202.0,
+            30,
+            (today - timedelta(days=10)).isoformat(),
+            (today + timedelta(days=20)).isoformat(),
+            "personal",
+        ),
+    )
+
+    # Irregular large charge due soon (quarterly/annual)
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "INSURANCE ANNUAL",
+            750.0,
+            365,
+            (today - timedelta(days=300)).isoformat(),
+            (today + timedelta(days=45)).isoformat(),
+            "personal",
+        ),
+    )
+
+    # New subscription (no cadence, seen recently)
+    db.execute(
+        "INSERT INTO recurring (merchant_norm, amount_median, cadence_days, last_seen, next_expected, owner) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "BRAND NEW SERVICE",
+            9.99,
+            None,
+            (today - timedelta(days=5)).isoformat(),
+            None,
+            "personal",
+        ),
+    )
+    db.commit()
+
+
+def test_cashflow_projection_returns_dict(db):
+    _seed_salience_db(db)
+    result = _cashflow_projection(db)
+    assert "monthly_income_est" in result
+    assert "monthly_obligations_est" in result
+    assert "monthly_net_est" in result
+    assert result["monthly_income_est"] > 0
+    assert result["monthly_obligations_est"] > 0
+
+
+def test_large_charge_forecast_finds_annual(db):
+    _seed_salience_db(db)
+    result = _large_charge_forecast(db, horizon_days=60)
+    assert len(result) == 1
+    assert result[0]["merchant"] == "INSURANCE ANNUAL"
+    assert result[0]["amount"] == 750.0
+    assert result[0]["days_away"] <= 60
+
+
+def test_category_anomalies_flags_high_groceries(db):
+    _seed_salience_db(db)
+    anomalies = _category_anomalies(db)
+    cats = [a["category"] for a in anomalies]
+    assert "groceries" in cats
+    groc = next(a for a in anomalies if a["category"] == "groceries")
+    assert groc["delta_pct"] > 20
+
+
+def test_subscription_drift_flags_new(db):
+    _seed_salience_db(db)
+    result = _subscription_drift(db)
+    assert isinstance(result["new"], list)
+    assert any(item["merchant"] == "BRAND NEW SERVICE" for item in result["new"])
+    assert result["alert"] is True
+
+
+def test_duplicate_charges_finds_amazon_prime(db):
+    _seed_salience_db(db)
+    dups = _duplicate_charges(db)
+    assert len(dups) >= 1
+    assert any(d["description"] == "AMAZON PRIME" for d in dups)
+
+
+def test_compute_salience_block_returns_all_keys(db):
+    _seed_salience_db(db)
+    block = compute_salience_block(db)
+    assert "cashflow_projection" in block
+    assert "large_charge_forecast" in block
+    assert "category_anomalies" in block
+    assert "subscription_drift" in block
+    assert "duplicate_charges" in block
+
+
+def test_compute_salience_block_empty_db(db):
+    block = compute_salience_block(db)
+    assert block["cashflow_projection"] is not None
+    assert block["large_charge_forecast"] == []
+    assert block["category_anomalies"] == []
+    assert block["duplicate_charges"] == []
+
+
+def test_finance_brief_includes_salience_key(tmp_path):
+    """finance_brief() dict always includes salience_block key."""
+    from skills.finance.brief import finance_brief
+
+    result = finance_brief(db_path=str(tmp_path / "finance.db"))
+    assert "salience_block" in result

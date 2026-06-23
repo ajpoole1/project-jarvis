@@ -33,6 +33,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from skills.finance.db import get_accounts, get_recurring, get_transactions, init_db  # noqa: E402
+from skills.finance.salience import compute_salience_block  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Env loading — must work standalone (morning-briefing imports this directly)
@@ -105,6 +106,7 @@ def finance_brief(db_path: str | None = None) -> dict:
         "altaforma_this_week": 0.0,
         "anomalies": [],
         "data_age_hours": None,
+        "salience_block": None,
     }
 
     if not path.exists():
@@ -178,6 +180,11 @@ def _build_brief(conn) -> dict:
         except ValueError:
             pass
 
+    try:
+        salience = compute_salience_block(conn)
+    except Exception:  # noqa: BLE001
+        salience = None
+
     return {
         "liquid": round(liquid, 2),
         "cc_outstanding": round(cc_total, 2),
@@ -188,4 +195,5 @@ def _build_brief(conn) -> dict:
         "altaforma_this_week": round(altaforma_week, 2),
         "anomalies": anomalies,
         "data_age_hours": data_age_hours,
+        "salience_block": salience,
     }
