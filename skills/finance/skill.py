@@ -54,14 +54,19 @@ from skills.finance.csv_import import (  # noqa: E402
 )
 from skills.finance.db import (  # noqa: E402
     _normalize_merchant,
+    apply_finance_rules,
+    apply_finance_rules_all,
+    delete_finance_rule,
     detect_recurring,
     get_accounts,
+    get_finance_rules,
     get_recurring,
     get_transactions,
     init_db,
     recompute_balances,
     set_balance_anchor,
     upsert_account,
+    upsert_finance_rule,
     upsert_position,
     upsert_transaction,
 )
@@ -259,6 +264,7 @@ def cmd_import(conn, file_path: str, account_id: str | None = None, owner: str =
     txns = parse_csv(str(path), account_id)
     balances = parse_csv_balances(str(path), account_id)
     inserted = skipped = 0
+    new_ids: list[str] = []
     seen_accounts: set[str] = set()
     for txn in txns:
         txn["owner"] = owner
@@ -268,6 +274,7 @@ def cmd_import(conn, file_path: str, account_id: str | None = None, owner: str =
             upsert_account(conn, _account_meta_from_id(aid, owner, balances.get(aid)))
         if upsert_transaction(conn, txn):
             inserted += 1
+            new_ids.append(txn["id"])
         else:
             skipped += 1
 
@@ -276,6 +283,8 @@ def cmd_import(conn, file_path: str, account_id: str | None = None, owner: str =
         if aid not in seen_accounts:
             upsert_account(conn, _account_meta_from_id(aid, owner, bal))
 
+    if new_ids:
+        apply_finance_rules(conn, new_ids)
     recompute_balances(conn)
     detect_recurring(conn)
 
@@ -975,83 +984,101 @@ def cmd_tag(conn, txn_id: str, owner: str, category: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Commands: rule add / list / remove
+# Commands: rule set / list / rm  (finance_rules data layer)
 # ---------------------------------------------------------------------------
 
 _VALID_OWNERS = {"personal", "altaforma"}
+_VALID_RECURRENCES = {"fixed_monthly", "variable", "weekly", "biweekly", "quarterly", "annual"}
 
 
-def cmd_rule_add(conn, pattern: str, owner: str, category: str | None = None) -> str:
-    if not pattern.strip():
-        return "Error: pattern must be non-empty."
+def cmd_rule_set(
+    conn,
+    merchant: str,
+    category: str | None = None,
+    owner: str = "personal",
+    descriptor: str | None = None,
+    recurrence: str | None = None,
+    amount_min: float | None = None,
+    amount_max: float | None = None,
+    is_transfer: bool = False,
+    priority: int = 0,
+    note: str | None = None,
+) -> str:
+    if not merchant.strip():
+        return "Error: --merchant must be non-empty."
     if owner not in _VALID_OWNERS:
         return f"Error: owner must be 'personal' or 'altaforma', got '{owner}'."
-    today = date.today().isoformat()
-    cur = conn.execute(
-        "INSERT INTO rules (pattern, owner, category, created) VALUES (?, ?, ?, ?)",
-        (pattern, owner, category, today),
+    if recurrence and recurrence not in _VALID_RECURRENCES:
+        return f"Error: --recurrence must be one of {sorted(_VALID_RECURRENCES)}."
+    if (amount_min is None) != (amount_max is None):
+        return "Error: --amount-min and --amount-max must be supplied together."
+
+    rule_id = upsert_finance_rule(
+        conn,
+        {
+            "match_merchant": merchant,
+            "match_descriptor": descriptor,
+            "match_recurrence": recurrence,
+            "match_amount_min": amount_min,
+            "match_amount_max": amount_max,
+            "category": category,
+            "owner": owner,
+            "is_transfer": is_transfer,
+            "priority": priority,
+            "note": note,
+        },
     )
-    conn.commit()
-    rule_id = cur.lastrowid
-    applied = _apply_rules_all(conn)
-    target = f"{owner} / {category}" if category else owner
-    return f'Rule added (id={rule_id}): "{pattern}" → {target}. Applied to {applied} existing transaction(s).'
+    applied = apply_finance_rules_all(conn)
+    parts = [f'Rule set (id={rule_id}): "{merchant}"']
+    if descriptor:
+        parts.append(f"descriptor={descriptor!r}")
+    if recurrence:
+        parts.append(f"recurrence={recurrence}")
+    if amount_min is not None:
+        parts.append(f"amount=${amount_min:.0f}–${amount_max:.0f}")
+    parts.append(f"→ {owner}")
+    if category:
+        parts.append(f"/ {category}")
+    parts.append(f"  Applied to {applied} transaction(s).")
+    return " ".join(parts)
 
 
-def cmd_rule_list(conn) -> str:
-    rows = conn.execute(
-        "SELECT id, pattern, owner, category, created FROM rules ORDER BY id"
-    ).fetchall()
+def cmd_rule_list(conn, merchant_filter: str | None = None) -> str:
+    rows = get_finance_rules(conn, merchant_filter)
     if not rows:
-        return "No rules defined."
-    col_widths = {
-        "id": max(2, max(len(str(r["id"])) for r in rows)),
-        "pattern": max(7, max(len(r["pattern"]) for r in rows)),
-        "owner": max(5, max(len(r["owner"]) for r in rows)),
-        "category": max(8, max(len(r["category"] or "") for r in rows)),
-        "created": 10,
-    }
+        return "No finance rules defined."
 
-    def _pad(val, width):
-        return str(val or "").ljust(width)
-
-    header = (
-        f"{'id'.ljust(col_widths['id'])}  "
-        f"{'pattern'.ljust(col_widths['pattern'])}  "
-        f"{'owner'.ljust(col_widths['owner'])}  "
-        f"{'category'.ljust(col_widths['category'])}  "
-        f"created"
-    )
-    sep = (
-        "  ".join("-" * col_widths[k] for k in ("id", "pattern", "owner", "category"))
-        + "  ----------"
-    )
-    lines = [header, sep]
+    lines = [
+        f"  {'id':>3}  {'merchant':<32}  {'desc':<16}  {'recur':<13}  "
+        f"{'amt range':>14}  {'cat':<18}  {'owner':<10}  pri  note",
+        "  " + "─" * 130,
+    ]
     for r in rows:
+        amt = ""
+        if r.get("match_amount_min") is not None:
+            amt = f"${r['match_amount_min']:.0f}–${r['match_amount_max']:.0f}"
         lines.append(
-            f"{_pad(r['id'], col_widths['id'])}  "
-            f"{_pad(r['pattern'], col_widths['pattern'])}  "
-            f"{_pad(r['owner'], col_widths['owner'])}  "
-            f"{_pad(r['category'], col_widths['category'])}  "
-            f"{r['created'] or ''}"
+            f"  {r['id']:>3}  {(r['match_merchant'] or ''):<32}  "
+            f"{(r['match_descriptor'] or ''):<16}  "
+            f"{(r['match_recurrence'] or ''):<13}  "
+            f"{amt:>14}  "
+            f"{(r['category'] or ''):<18}  "
+            f"{(r['owner'] or ''):<10}  "
+            f"{r['priority']:>3}  "
+            f"{(r['note'] or '')}"
         )
     return "\n".join(lines)
 
 
-def cmd_rule_remove(conn, rule_id: int) -> str:
-    row = conn.execute(
-        "SELECT id, pattern, owner, category FROM rules WHERE id = ?", (rule_id,)
-    ).fetchone()
-    if not row:
+def cmd_rule_rm(conn, rule_id: int) -> str:
+    rows = get_finance_rules(conn)
+    target = next((r for r in rows if r["id"] == rule_id), None)
+    if not target:
         return f"Rule {rule_id} not found."
-    conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
-    conn.commit()
-    if row["category"]:
-        target = f"{row['owner']}/{row['category']}"
-    else:
-        target = row["owner"]
+    delete_finance_rule(conn, rule_id)
     return (
-        f'Rule {rule_id} removed ("{row["pattern"]}" {target}). '
+        f'Rule {rule_id} removed ("{target["match_merchant"]}" → '
+        f'{target["owner"]}/{target["category"]}). '
         f"Run finance apply-rules to re-categorize if needed."
     )
 
@@ -1466,18 +1493,56 @@ def main() -> None:
     p_tag.add_argument("owner", choices=["personal", "altaforma"])
     p_tag.add_argument("--category", default=None, metavar="CAT")
 
-    p_rule = sub.add_parser("rule", help="Manage classification rules")
+    p_rule = sub.add_parser("rule", help="Manage finance_rules decision layer")
     rule_sub = p_rule.add_subparsers(dest="rule_cmd", required=True)
 
-    p_rule_add = rule_sub.add_parser("add", help="Add a new LIKE classification rule")
-    p_rule_add.add_argument("pattern", help="SQL LIKE pattern (e.g. %%DIGITALOCEAN%%)")
-    p_rule_add.add_argument("owner", choices=["personal", "altaforma"])
-    p_rule_add.add_argument("--category", default=None, metavar="CAT")
+    p_rule_set = rule_sub.add_parser("set", help="Add/update a finance rule")
+    p_rule_set.add_argument(
+        "--merchant", required=True, metavar="PAT", help="SQL LIKE pattern (e.g. %%ANTHROPIC%%)"
+    )
+    p_rule_set.add_argument("--category", default=None, metavar="CAT")
+    p_rule_set.add_argument("--owner", choices=["personal", "altaforma"], default="personal")
+    p_rule_set.add_argument(
+        "--descriptor",
+        default=None,
+        metavar="D",
+        help="Substring that must appear in description (optional)",
+    )
+    p_rule_set.add_argument(
+        "--recurrence",
+        choices=list(_VALID_RECURRENCES),
+        default=None,
+        help="Recurrence type for sub-vs-usage disambiguation",
+    )
+    p_rule_set.add_argument(
+        "--amount-min",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Minimum abs(amount) — must pair with --amount-max",
+    )
+    p_rule_set.add_argument(
+        "--amount-max",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Maximum abs(amount) — must pair with --amount-min",
+    )
+    p_rule_set.add_argument(
+        "--transfer", action="store_true", help="Mark as internal transfer (excluded from spend)"
+    )
+    p_rule_set.add_argument(
+        "--priority", type=int, default=0, help="Match priority — higher wins (default 0)"
+    )
+    p_rule_set.add_argument("--note", default=None, metavar="NOTE", help="Human-readable note")
 
-    rule_sub.add_parser("list", help="List all classification rules")
+    p_rule_list = rule_sub.add_parser("list", help="List finance rules")
+    p_rule_list.add_argument(
+        "--merchant", default=None, metavar="PAT", help="Filter by merchant substring"
+    )
 
-    p_rule_remove = rule_sub.add_parser("remove", help="Remove a rule by id")
-    p_rule_remove.add_argument("id", type=int)
+    p_rule_rm = rule_sub.add_parser("rm", help="Remove a rule by id")
+    p_rule_rm.add_argument("id", type=int)
 
     args = parser.parse_args()
     conn = init_db(str(DB_PATH))
@@ -1548,7 +1613,7 @@ def main() -> None:
             print(cmd_debt(conn))
 
         elif args.cmd == "apply-rules":
-            n = _apply_rules_all(conn)
+            n = apply_finance_rules_all(conn)
             print(f"Applied rules to all transactions — {n} row(s) updated.")
 
         elif args.cmd == "bills-due":
@@ -1558,12 +1623,26 @@ def main() -> None:
             print(cmd_tag(conn, args.txn_id, args.owner, args.category))
 
         elif args.cmd == "rule":
-            if args.rule_cmd == "add":
-                print(cmd_rule_add(conn, args.pattern, args.owner, args.category))
+            if args.rule_cmd == "set":
+                print(
+                    cmd_rule_set(
+                        conn,
+                        merchant=args.merchant,
+                        category=args.category,
+                        owner=args.owner,
+                        descriptor=args.descriptor,
+                        recurrence=args.recurrence,
+                        amount_min=args.amount_min,
+                        amount_max=args.amount_max,
+                        is_transfer=args.transfer,
+                        priority=args.priority,
+                        note=args.note,
+                    )
+                )
             elif args.rule_cmd == "list":
-                print(cmd_rule_list(conn))
-            elif args.rule_cmd == "remove":
-                print(cmd_rule_remove(conn, args.id))
+                print(cmd_rule_list(conn, getattr(args, "merchant", None)))
+            elif args.rule_cmd == "rm":
+                print(cmd_rule_rm(conn, args.id))
 
     finally:
         conn.close()

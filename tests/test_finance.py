@@ -684,32 +684,36 @@ def test_cmd_recurring_no_data(populated_db):
 # ---------------------------------------------------------------------------
 
 
-def test_rule_add_with_category(populated_db):
-    result = _skill.cmd_rule_add(
-        populated_db, "%DIGITALOCEAN%", "altaforma", category="infrastructure"
+def test_rule_set_with_category(populated_db):
+    result = _skill.cmd_rule_set(
+        populated_db, "%DIGITALOCEAN%", category="infrastructure", owner="altaforma"
     )
-    assert "Rule added" in result
+    assert "Rule set" in result
     assert "id=" in result
     assert "%DIGITALOCEAN%" in result
     assert "altaforma" in result
     assert "infrastructure" in result
     assert "Applied to" in result
-    row = populated_db.execute("SELECT * FROM rules WHERE pattern = '%DIGITALOCEAN%'").fetchone()
+    row = populated_db.execute(
+        "SELECT * FROM finance_rules WHERE match_merchant = '%DIGITALOCEAN%'"
+    ).fetchone()
     assert row is not None
     assert row["owner"] == "altaforma"
     assert row["category"] == "infrastructure"
 
 
-def test_rule_add_without_category(populated_db):
-    result = _skill.cmd_rule_add(populated_db, "%SHOPIFY%", "altaforma")
-    assert "Rule added" in result
+def test_rule_set_without_category(populated_db):
+    result = _skill.cmd_rule_set(populated_db, "%SHOPIFY%", owner="altaforma")
+    assert "Rule set" in result
     assert "Applied to" in result
-    row = populated_db.execute("SELECT * FROM rules WHERE pattern = '%SHOPIFY%'").fetchone()
+    row = populated_db.execute(
+        "SELECT * FROM finance_rules WHERE match_merchant = '%SHOPIFY%'"
+    ).fetchone()
     assert row is not None
     assert row["category"] is None
 
 
-def test_rule_add_applies_to_existing(db):
+def test_rule_set_applies_to_existing(db):
     upsert_transaction(
         db,
         _sample_txn({"id": "r1", "description": "DIGITALOCEAN INVOICE", "owner": "personal"}),
@@ -718,16 +722,15 @@ def test_rule_add_applies_to_existing(db):
         db,
         _sample_txn({"id": "r2", "description": "METRO GROCERIES", "owner": "personal"}),
     )
-    result = _skill.cmd_rule_add(db, "%DIGITALOCEAN%", "altaforma", category="hosting")
+    result = _skill.cmd_rule_set(db, "%DIGITALOCEAN%", owner="altaforma", category="hosting")
     assert "Applied to" in result
-    assert "existing transaction(s)." in result
     row = db.execute("SELECT owner, category FROM transactions WHERE id = 'r1'").fetchone()
     assert row["owner"] == "altaforma"
     assert row["category"] == "hosting"
 
 
 def test_rule_list_shows_rows(db):
-    _skill.cmd_rule_add(db, "%SHOPIFY%", "altaforma", category="saas")
+    _skill.cmd_rule_set(db, "%SHOPIFY%", owner="altaforma", category="saas")
     result = _skill.cmd_rule_list(db)
     assert "%SHOPIFY%" in result
     assert "altaforma" in result
@@ -735,47 +738,107 @@ def test_rule_list_shows_rows(db):
 
 
 def test_rule_list_empty(db):
-    db.execute("DELETE FROM rules")
+    db.execute("DELETE FROM finance_rules")
     db.commit()
     result = _skill.cmd_rule_list(db)
-    assert result == "No rules defined."
+    assert "No finance rules" in result
 
 
-def test_rule_remove_deletes_row(db):
-    _skill.cmd_rule_add(db, "%DIGITALOCEAN%", "altaforma", category="infrastructure")
-    row = db.execute("SELECT id FROM rules WHERE pattern = '%DIGITALOCEAN%'").fetchone()
+def test_rule_rm_deletes_row(db):
+    _skill.cmd_rule_set(db, "%DIGITALOCEAN%", owner="altaforma", category="infrastructure")
+    row = db.execute(
+        "SELECT id FROM finance_rules WHERE match_merchant = '%DIGITALOCEAN%'"
+    ).fetchone()
     rule_id = row["id"]
-    result = _skill.cmd_rule_remove(db, rule_id)
+    result = _skill.cmd_rule_rm(db, rule_id)
     assert f"Rule {rule_id} removed" in result
     assert "%DIGITALOCEAN%" in result
-    assert "altaforma" in result
-    assert "infrastructure" in result
-    assert "apply-rules" in result
-    remaining = db.execute("SELECT id FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    remaining = db.execute("SELECT id FROM finance_rules WHERE id = ?", (rule_id,)).fetchone()
     assert remaining is None
 
 
-def test_rule_remove_nonexistent(db):
-    result = _skill.cmd_rule_remove(db, 999)
-    assert result == "Rule 999 not found."
+def test_rule_rm_nonexistent(db):
+    result = _skill.cmd_rule_rm(db, 999)
+    assert "not found" in result
 
 
-def test_rule_add_empty_pattern(db):
-    count_before = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
-    result = _skill.cmd_rule_add(db, "", "personal")
+def test_rule_set_empty_merchant(db):
+    count_before = db.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
+    result = _skill.cmd_rule_set(db, "")
     assert "Error" in result
     assert "non-empty" in result
-    count_after = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    count_after = db.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
     assert count_after == count_before
 
 
-def test_rule_add_invalid_owner(db):
-    count_before = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
-    result = _skill.cmd_rule_add(db, "%AMAZON%", "business")
+def test_rule_set_invalid_owner(db):
+    count_before = db.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
+    result = _skill.cmd_rule_set(db, "%AMAZON%", owner="business")
     assert "Error" in result
     assert "personal" in result or "altaforma" in result
-    count_after = db.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    count_after = db.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
     assert count_after == count_before
+
+
+# ---------------------------------------------------------------------------
+# finance_rules — mixed-merchant FX-drift proof (Anthropic Max sub vs API usage)
+# ---------------------------------------------------------------------------
+# Seeded rules (from _seed_transfer_rules):
+#   priority=20: ANTHROPIC%CLAUDE% + recurrence=fixed_monthly → personal/subscriptions
+#   priority=10: ANTHROPIC%            + recurrence=variable   → altaforma/subscriptions
+#
+# The key invariant: the sub rule matches on descriptor+recurrence, NOT amount.
+# Two cycles with different converted CAD amounts must both hit personal/subscriptions.
+
+
+def test_anthropic_sub_matches_personal_across_fx_cycles(db):
+    """Claude Max sub (fixed_monthly) → personal regardless of converted CAD amount."""
+    # Cycle 1: USD/CAD = 1.36 → $140 × 1.36 = ~$190.40
+    t1 = _sample_txn(
+        {
+            "id": "ant-sub-1",
+            "description": "ANTHROPIC CLAUDE AI SUBSCRIPTION",
+            "amount": -190.40,
+        }
+    )
+    # Cycle 2: USD/CAD = 1.42 → $140 × 1.42 = ~$198.80
+    t2 = _sample_txn(
+        {
+            "id": "ant-sub-2",
+            "description": "ANTHROPIC CLAUDE AI SUBSCRIPTION",
+            "amount": -198.80,
+        }
+    )
+    upsert_transaction(db, t1)
+    upsert_transaction(db, t2)
+    from skills.finance.db import apply_finance_rules
+
+    apply_finance_rules(db, ["ant-sub-1", "ant-sub-2"])
+    rows = db.execute(
+        "SELECT id, owner, category FROM transactions WHERE id IN ('ant-sub-1', 'ant-sub-2')"
+        " ORDER BY id"
+    ).fetchall()
+    assert rows[0]["owner"] == "personal"
+    assert rows[1]["owner"] == "personal"
+    assert rows[0]["category"] == "subscriptions"
+
+
+def test_anthropic_api_matches_altaforma(db):
+    """Anthropic API usage (no 'CLAUDE' in description) → altaforma."""
+    t = _sample_txn(
+        {
+            "id": "ant-api-1",
+            "description": "ANTHROPIC USAGE BILLING",
+            "amount": -47.83,
+        }
+    )
+    upsert_transaction(db, t)
+    from skills.finance.db import apply_finance_rules
+
+    apply_finance_rules(db, ["ant-api-1"])
+    row = db.execute("SELECT owner, category FROM transactions WHERE id = 'ant-api-1'").fetchone()
+    assert row["owner"] == "altaforma"
+    assert row["category"] == "subscriptions"
 
 
 # ---------------------------------------------------------------------------

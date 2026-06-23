@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS recurring (
     category        TEXT
 );
 
+-- Legacy simple-pattern rules table (retained for migration only; superseded by finance_rules).
 CREATE TABLE IF NOT EXISTS rules (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     pattern  TEXT NOT NULL,
@@ -75,6 +76,25 @@ CREATE TABLE IF NOT EXISTS rules (
     category TEXT,
     created  TEXT
 );
+
+-- Rich data-driven rules.  Priority descending = most specific wins.
+-- match_amount_min/max: range only — no exact-equality match (USD-billed charges drift).
+CREATE TABLE IF NOT EXISTS finance_rules (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_merchant    TEXT NOT NULL,
+    match_descriptor  TEXT,
+    match_recurrence  TEXT,
+    match_amount_min  REAL,
+    match_amount_max  REAL,
+    category          TEXT,
+    owner             TEXT DEFAULT 'personal',
+    is_transfer       INTEGER DEFAULT 0,
+    priority          INTEGER DEFAULT 0,
+    note              TEXT,
+    updated_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_frules_merchant ON finance_rules(match_merchant);
 
 CREATE TABLE IF NOT EXISTS sync_state (
     key     TEXT PRIMARY KEY,
@@ -130,6 +150,30 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "balance_anchor_date" not in acct_cols:
         conn.execute("ALTER TABLE accounts ADD COLUMN balance_anchor_date TEXT")
     # positions table created by DDL above on new DBs; nothing to migrate for existing ones
+
+    # Migrate legacy rules → finance_rules if finance_rules is empty and rules has rows.
+    fr_count = conn.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
+    legacy_count = conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    if fr_count == 0 and legacy_count > 0:
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        rows = conn.execute("SELECT pattern, owner, category FROM rules").fetchall()
+        for row in rows:
+            is_transfer = (
+                1
+                if (row["category"] or "").endswith("_transfer")
+                or row["category"]
+                in ("loan_payment", "inheritance_deposit", "insurance_reimbursement")
+                else 0
+            )
+            conn.execute(
+                "INSERT INTO finance_rules "
+                "(match_merchant, category, owner, is_transfer, priority, updated_at) "
+                "VALUES (?, ?, ?, ?, 0, ?)",
+                (row["pattern"], row["category"], row["owner"], is_transfer, now),
+            )
+        conn.commit()
 
 
 # Transfer/internal patterns that should never count as spend.
@@ -283,10 +327,12 @@ _CATEGORY_RULES: list[tuple[str, str]] = [
 
 
 def _seed_transfer_rules(conn: sqlite3.Connection) -> None:
-    """Insert transfer and category classification rules if they don't already exist."""
+    """Seed transfer and category rules into both rules (legacy) and finance_rules."""
     from datetime import UTC, datetime
 
     now = datetime.now(UTC).isoformat()
+    _transfer_cats = {c for _, c in _TRANSFER_RULES}
+
     for pattern, category in _TRANSFER_RULES + _CATEGORY_RULES:
         existing = conn.execute("SELECT 1 FROM rules WHERE pattern = ?", (pattern,)).fetchone()
         if not existing:
@@ -294,7 +340,269 @@ def _seed_transfer_rules(conn: sqlite3.Connection) -> None:
                 "INSERT INTO rules (pattern, owner, category, created) VALUES (?, 'personal', ?, ?)",
                 (pattern, category, now),
             )
+        fr_existing = conn.execute(
+            "SELECT 1 FROM finance_rules WHERE match_merchant = ? AND match_descriptor IS NULL "
+            "AND match_recurrence IS NULL",
+            (pattern,),
+        ).fetchone()
+        if not fr_existing:
+            is_transfer = 1 if category in _transfer_cats else 0
+            conn.execute(
+                "INSERT INTO finance_rules "
+                "(match_merchant, category, owner, is_transfer, priority, updated_at) "
+                "VALUES (?, ?, 'personal', ?, 0, ?)",
+                (pattern, category, is_transfer, now),
+            )
     conn.commit()
+
+    # Seed owner-split rules for altaforma tech spend (priority=10 > default=0)
+    _ALTAFORMA_SEEDS = [
+        # Anthropic API usage (variable billing — altaforma)
+        (
+            "ANTHROPIC%",
+            None,
+            "variable",
+            "subscriptions",
+            "altaforma",
+            0,
+            10,
+            "Anthropic API usage billing — altaforma",
+        ),
+        # Anthropic Max subscription (fixed monthly — personal). priority=20 beats the above.
+        (
+            "ANTHROPIC%CLAUDE%",
+            None,
+            "fixed_monthly",
+            "subscriptions",
+            "personal",
+            0,
+            20,
+            "Anthropic Claude Max subscription — personal",
+        ),
+        # Cloud / dev infra — altaforma
+        (
+            "GOOGLE%CLOUD%",
+            None,
+            None,
+            "cloud_infra",
+            "altaforma",
+            0,
+            10,
+            "Google Cloud Platform — altaforma",
+        ),
+        ("CLOUDFLARE%", None, None, "cloud_infra", "altaforma", 0, 10, "Cloudflare — altaforma"),
+        ("AMAZON WEB SERVICES%", None, None, "cloud_infra", "altaforma", 0, 10, "AWS — altaforma"),
+        ("AWS%", None, None, "cloud_infra", "altaforma", 0, 10, "AWS — altaforma"),
+        ("GITHUB%", None, None, "subscriptions", "altaforma", 0, 10, "GitHub — altaforma"),
+    ]
+    for (
+        merchant,
+        descriptor,
+        recurrence,
+        category,
+        owner,
+        is_transfer,
+        priority,
+        note,
+    ) in _ALTAFORMA_SEEDS:
+        exists = conn.execute(
+            "SELECT 1 FROM finance_rules WHERE match_merchant = ? AND match_recurrence IS ? "
+            "AND owner = ?",
+            (merchant, recurrence, owner),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO finance_rules "
+                "(match_merchant, match_descriptor, match_recurrence, category, owner, "
+                "is_transfer, priority, note, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    merchant,
+                    descriptor,
+                    recurrence,
+                    category,
+                    owner,
+                    is_transfer,
+                    priority,
+                    note,
+                    now,
+                ),
+            )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# finance_rules management
+# ---------------------------------------------------------------------------
+
+
+def upsert_finance_rule(conn: sqlite3.Connection, rule: dict) -> int:
+    """Insert or update a finance_rules row. Returns the row id."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    existing_id = rule.get("id")
+    if existing_id:
+        conn.execute(
+            "UPDATE finance_rules SET match_merchant=?, match_descriptor=?, match_recurrence=?, "
+            "match_amount_min=?, match_amount_max=?, category=?, owner=?, is_transfer=?, "
+            "priority=?, note=?, updated_at=? WHERE id=?",
+            (
+                rule["match_merchant"],
+                rule.get("match_descriptor"),
+                rule.get("match_recurrence"),
+                rule.get("match_amount_min"),
+                rule.get("match_amount_max"),
+                rule.get("category"),
+                rule.get("owner", "personal"),
+                int(rule.get("is_transfer", 0)),
+                rule.get("priority", 0),
+                rule.get("note"),
+                now,
+                existing_id,
+            ),
+        )
+        conn.commit()
+        return existing_id
+    cur = conn.execute(
+        "INSERT INTO finance_rules "
+        "(match_merchant, match_descriptor, match_recurrence, match_amount_min, match_amount_max, "
+        "category, owner, is_transfer, priority, note, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            rule["match_merchant"],
+            rule.get("match_descriptor"),
+            rule.get("match_recurrence"),
+            rule.get("match_amount_min"),
+            rule.get("match_amount_max"),
+            rule.get("category"),
+            rule.get("owner", "personal"),
+            int(rule.get("is_transfer", 0)),
+            rule.get("priority", 0),
+            rule.get("note"),
+            now,
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_finance_rules(conn: sqlite3.Connection, merchant_filter: str | None = None) -> list[dict]:
+    """Return finance_rules rows, optionally filtered by merchant substring."""
+    if merchant_filter:
+        rows = conn.execute(
+            "SELECT * FROM finance_rules WHERE match_merchant LIKE ? ORDER BY priority DESC, id",
+            (f"%{merchant_filter}%",),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM finance_rules ORDER BY priority DESC, id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_finance_rule(conn: sqlite3.Connection, rule_id: int) -> bool:
+    """Delete a finance_rules row. Returns True if a row was deleted."""
+    cur = conn.execute("DELETE FROM finance_rules WHERE id = ?", (rule_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def _match_finance_rule(rule: dict, txn: dict) -> bool:
+    """Return True if a finance_rules row matches a transaction dict.
+
+    Matching precedence (all non-null fields must match):
+      1. match_merchant  — SQL LIKE pattern against description (required)
+      2. match_descriptor — substring match against description (optional)
+      3. match_recurrence — matched via recurring table or cadence signal (optional, best-effort)
+      4. match_amount_min / match_amount_max — range on abs(amount) (optional)
+
+    Amount range is the weakest signal and is checked last. No exact-equality
+    amount match is ever performed — USD-billed charges drift each cycle.
+    """
+    desc = (txn.get("description") or "").upper()
+    pattern = (rule.get("match_merchant") or "").upper()
+
+    # SQL LIKE → Python: % = any, _ = one char
+    import fnmatch
+
+    like_pattern = pattern.replace("%", "*").replace("_", "?")
+    if not fnmatch.fnmatch(desc, like_pattern):
+        return False
+
+    if rule.get("match_descriptor"):
+        if rule["match_descriptor"].upper() not in desc:
+            return False
+
+    amt = abs(txn.get("amount", 0.0))
+    if rule.get("match_amount_min") is not None and amt < rule["match_amount_min"]:
+        return False
+    if rule.get("match_amount_max") is not None and amt > rule["match_amount_max"]:
+        return False
+
+    return True
+
+
+def apply_finance_rules(conn: sqlite3.Connection, txn_ids: list[str]) -> int:
+    """Apply finance_rules to a list of transaction ids. Returns rows updated."""
+    if not txn_ids:
+        return 0
+    rules = get_finance_rules(conn)
+    placeholders = ",".join("?" * len(txn_ids))
+    txns = conn.execute(
+        f"SELECT id, description, amount FROM transactions WHERE id IN ({placeholders})",
+        txn_ids,
+    ).fetchall()
+
+    updated = 0
+    for txn in txns:
+        txn_dict = dict(txn)
+        for rule in rules:
+            if _match_finance_rule(rule, txn_dict):
+                set_parts = []
+                params: list = []
+                if rule.get("category"):
+                    set_parts.append("category = ?")
+                    params.append(rule["category"])
+                if rule.get("owner"):
+                    set_parts.append("owner = ?")
+                    params.append(rule["owner"])
+                if set_parts:
+                    params.append(txn_dict["id"])
+                    conn.execute(
+                        f"UPDATE transactions SET {', '.join(set_parts)} WHERE id = ?", params
+                    )
+                    updated += 1
+                break  # highest-priority rule wins; stop after first match
+    conn.commit()
+    return updated
+
+
+def apply_finance_rules_all(conn: sqlite3.Connection) -> int:
+    """Apply finance_rules to all transactions. Returns rows updated."""
+    rules = get_finance_rules(conn)
+    txns = conn.execute("SELECT id, description, amount FROM transactions").fetchall()
+
+    updated = 0
+    for txn in txns:
+        txn_dict = dict(txn)
+        for rule in rules:
+            if _match_finance_rule(rule, txn_dict):
+                set_parts = []
+                params: list = []
+                if rule.get("category"):
+                    set_parts.append("category = ?")
+                    params.append(rule["category"])
+                if rule.get("owner"):
+                    set_parts.append("owner = ?")
+                    params.append(rule["owner"])
+                if set_parts:
+                    params.append(txn_dict["id"])
+                    conn.execute(
+                        f"UPDATE transactions SET {', '.join(set_parts)} WHERE id = ?", params
+                    )
+                    updated += 1
+                break
+    conn.commit()
+    return updated
 
 
 # ---------------------------------------------------------------------------
