@@ -778,6 +778,75 @@ def test_cmd_recurring_no_data(populated_db):
 
 
 # ---------------------------------------------------------------------------
+# Tom QA regression tests (blocking bugs from PR #74 review)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_finance_rules_handles_more_than_999_ids(db):
+    """apply_finance_rules must not raise sqlite3.OperationalError for >999 txn_ids."""
+    from skills.finance.db import apply_finance_rules
+
+    for i in range(1001):
+        upsert_transaction(
+            db,
+            {
+                "id": f"bulk-{i:04d}",
+                "account_id": "rbc-04330-5118989",
+                "date": "2026-01-15",
+                "amount": -10.0,
+                "description": "IGA SUPERMARCHE",
+                "category": None,
+                "owner": "personal",
+            },
+        )
+    # Should complete without error; IGA% seed rule will match all rows
+    updated = apply_finance_rules(db, [f"bulk-{i:04d}" for i in range(1001)])
+    assert updated >= 0
+
+
+def test_upsert_finance_rule_is_transfer_none_does_not_crash(db):
+    """upsert_finance_rule must handle is_transfer=None without TypeError."""
+    from skills.finance.db import upsert_finance_rule
+
+    rule_id = upsert_finance_rule(
+        db,
+        {
+            "match_merchant": "%TEST_NONE%",
+            "category": "test",
+            "owner": "personal",
+            "is_transfer": None,
+        },
+    )
+    assert isinstance(rule_id, int)
+    row = db.execute("SELECT is_transfer FROM finance_rules WHERE id = ?", (rule_id,)).fetchone()
+    assert row["is_transfer"] == 0
+
+
+def test_migrate_works_without_row_factory(tmp_path):
+    """_migrate must not crash when called on a connection without row_factory set."""
+    import sqlite3 as _sqlite3
+
+    from skills.finance.db import _DDL, _migrate
+
+    db_file = str(tmp_path / "raw.db")
+    conn = _sqlite3.connect(db_file)
+    # Do NOT set row_factory — raw tuple rows
+    conn.executescript(_DDL)
+    # Seed a legacy rules row to trigger the migration path
+    conn.execute(
+        "INSERT INTO rules (pattern, owner, category, created) VALUES (?, ?, ?, ?)",
+        ("%RAW_TEST%", "personal", "groceries", "2026-01-01"),
+    )
+    conn.commit()
+    # Must not raise TypeError
+    _migrate(conn)
+    conn.commit()
+    migrated = conn.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
+    assert migrated == 1
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # rule add / list / remove
 # ---------------------------------------------------------------------------
 

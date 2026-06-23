@@ -172,18 +172,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
         now = datetime.now(UTC).isoformat()
         rows = conn.execute("SELECT pattern, owner, category FROM rules").fetchall()
         for row in rows:
+            # Use index access — row_factory may not be set on all callers.
+            category = row[2] if not isinstance(row, sqlite3.Row) else row["category"]
             is_transfer = (
                 1
-                if (row["category"] or "").endswith("_transfer")
-                or row["category"]
-                in ("loan_payment", "inheritance_deposit", "insurance_reimbursement")
+                if (category or "").endswith("_transfer")
+                or category in ("loan_payment", "inheritance_deposit", "insurance_reimbursement")
                 else 0
             )
+            pattern = row[0] if not isinstance(row, sqlite3.Row) else row["pattern"]
+            owner = row[1] if not isinstance(row, sqlite3.Row) else row["owner"]
             conn.execute(
                 "INSERT INTO finance_rules "
                 "(match_merchant, category, owner, is_transfer, priority, updated_at) "
                 "VALUES (?, ?, ?, ?, 0, ?)",
-                (row["pattern"], row["category"], row["owner"], is_transfer, now),
+                (pattern, category, owner, is_transfer, now),
             )
         conn.commit()
 
@@ -467,7 +470,7 @@ def upsert_finance_rule(conn: sqlite3.Connection, rule: dict) -> int:
                 rule.get("match_amount_max"),
                 rule.get("category"),
                 rule.get("owner", "personal"),
-                int(rule.get("is_transfer", 0)),
+                int(rule.get("is_transfer") or 0),
                 rule.get("priority", 0),
                 rule.get("note"),
                 now,
@@ -489,7 +492,7 @@ def upsert_finance_rule(conn: sqlite3.Connection, rule: dict) -> int:
             rule.get("match_amount_max"),
             rule.get("category"),
             rule.get("owner", "personal"),
-            int(rule.get("is_transfer", 0)),
+            int(rule.get("is_transfer") or 0),
             rule.get("priority", 0),
             rule.get("note"),
             now,
@@ -558,11 +561,18 @@ def apply_finance_rules(conn: sqlite3.Connection, txn_ids: list[str]) -> int:
     if not txn_ids:
         return 0
     rules = get_finance_rules(conn)
-    placeholders = ",".join("?" * len(txn_ids))
-    txns = conn.execute(
-        f"SELECT id, description, amount FROM transactions WHERE id IN ({placeholders})",
-        txn_ids,
-    ).fetchall()
+    # SQLite variable limit is 999; fetch in chunks to handle large imports safely.
+    _CHUNK = 900
+    txns = []
+    for i in range(0, len(txn_ids), _CHUNK):
+        chunk = txn_ids[i : i + _CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        txns.extend(
+            conn.execute(
+                f"SELECT id, description, amount FROM transactions WHERE id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+        )
 
     updated = 0
     for txn in txns:
