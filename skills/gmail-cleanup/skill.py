@@ -483,6 +483,14 @@ def _seed_decision_layer(con: sqlite3.Connection) -> None:
             "appointment not yet on calendar — calendar_hint path",
         ),
         ("security", "act", "inbox", 1, 1, "security alert — interrupt immediately"),
+        (
+            "verification_code",
+            "act",
+            "inbox",
+            1,
+            0,
+            "one-time passcode / 2FA / OTP — keep in inbox to grab it, but never ping",
+        ),
         ("personal", "act", "inbox", 1, 1, "real human email, not automated — interrupt"),
         ("promo", "archive", "quarantine", 0, 0, "marketing/promo — quarantine (reversible)"),
         (
@@ -1036,7 +1044,8 @@ def _build_intent_classifier_prompt(
         "  statement — account statement or bill with no outstanding balance\n"
         "  receipt — purchase confirmation, shipping notice, order tracking\n"
         "  appointment — appointment/booking not yet on the user's calendar\n"
-        "  security — sign-in alert, password reset, 2FA, fraud alert\n"
+        "  security — unexpected sign-in/login alert, fraud alert, account compromised, or a password reset you did not request\n"
+        "  verification_code — a one-time passcode, 2FA/OTP, or email-verification code sent to complete a login or signup\n"
         "  personal — real human email, not automated (check From header carefully)\n"
         "  promo — marketing, sale announcements, promotional offers\n"
         "  redundant_duplicate — duplicate or redundant notification the user already has\n"
