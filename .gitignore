@@ -95,3 +95,6 @@ config/personal/
 config/openclaw/
 data/
 logs/
+
+# Pre-edit skill backups (kept locally for rollback, never committed)
+skills/**/_backup_*/

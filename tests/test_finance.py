@@ -1,12 +1,10 @@
-"""Unit tests for finance skill P1.
+"""Unit tests for finance skill.
 
 All tests use fixture data — no live API calls, no ~/.jarvis.env required.
-WEALTHICA_CLIENT_ID is intentionally absent so wealthica.py uses mock mode.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -22,11 +20,6 @@ _FINANCE_DIR = _REPO_ROOT / "skills" / "finance"
 for _p in (str(_REPO_ROOT), str(_FINANCE_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-
-# Remove any live Wealthica credentials so all tests use mock mode
-os.environ.pop("WEALTHICA_CLIENT_ID", None)
-os.environ.pop("WEALTHICA_SECRET", None)
-os.environ.pop("WEALTHICA_USER", None)
 
 from skills.finance.alerts import (  # noqa: E402
     _check_bill_shortfall,
@@ -674,17 +667,6 @@ def test_cmd_tag_prefix_match(populated_db):
 def test_cmd_tag_not_found(populated_db):
     result = _skill.cmd_tag(populated_db, "zzz-no-such", "personal")
     assert "not found" in result.lower()
-
-
-def test_cmd_sync_mock_mode(tmp_path, monkeypatch):
-    """sync with no credentials uses mock Wealthica data."""
-    db_file = tmp_path / "finance.db"
-    monkeypatch.setattr(_skill, "DB_PATH", db_file)
-    conn = init_db(str(db_file))
-    result = _skill.cmd_sync(conn)
-    assert "Synced" in result
-    assert "mock mode" in result
-    conn.close()
 
 
 def test_cmd_bills_due_no_bills(populated_db):

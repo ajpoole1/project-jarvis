@@ -1,24 +1,33 @@
-"""Finance skill — personal CFO backed by Wealthica + SQLite.
+"""Finance skill — stdlib-only personal CFO backed by SQLite + CSV import.
 
-Commands (P1):
-  sync [--since DATE] [--full]
+Commands:
   import <file> [--account ID] [--owner personal|altaforma]
+  import-holdings <file> [--as-of DATE]
+  ingest                      sweep the dropbox inbox folder
   accounts
   liquid
   spend [--month|--week|--from DATE --to DATE] [--owner personal|altaforma]
   top [N] [--period]
   search <term>
   net [--month|--from DATE --to DATE]
+  compare [--month|--week] [--baseline N]
   recurring
   bills-due [--days N]
+  debt
+  runway [--include-inheritance]
+  altaforma [--quarter]
+  subs-audit
   tag <txn_id> <personal|altaforma> [--category CAT]
-  scrape --bank <rbc|td> [--days 30] [--first-auth] [--dry-run]
+  rule set --merchant PAT [--descriptor D] [--recurrence TYPE]
+          [--amount-min N --amount-max N] --category CAT [--owner OWN] [--transfer]
+  rule list [--merchant PAT]
+  rule rm <id>
+  apply-rules
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import calendar
 import os
 import re
@@ -36,7 +45,6 @@ _REPO_ROOT = Path(__file__).parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skills.finance.alerts import check_alerts  # noqa: E402
 from skills.finance.csv_import import (  # noqa: E402
     _rbc_payment_canonical,
     parse_csv,
@@ -57,9 +65,6 @@ from skills.finance.db import (  # noqa: E402
     upsert_position,
     upsert_transaction,
 )
-from skills.finance.scraper_errors import ScraperError, SessionExpiredError  # noqa: E402
-from skills.finance.wealthica import get_institutions, get_token  # noqa: E402
-from skills.finance.wealthica import get_transactions as wealthica_get_transactions  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Env + paths
@@ -183,109 +188,6 @@ def _apply_rules_all(conn) -> int:
 def _fmt_amount(amount: float) -> str:
     sign = "-" if amount < 0 else "+"
     return f"{sign}${abs(amount):,.2f}"
-
-
-# ---------------------------------------------------------------------------
-# Command: sync
-# ---------------------------------------------------------------------------
-
-
-def cmd_sync(conn, since: str | None = None, full: bool = False) -> str:
-    client_id = os.environ.get("WEALTHICA_CLIENT_ID")
-    secret = os.environ.get("WEALTHICA_SECRET")
-    user = os.environ.get("WEALTHICA_USER")
-
-    today = date.today().isoformat()
-
-    if full:
-        start_date = "2020-01-01"
-    elif since:
-        start_date = since
-    else:
-        last_row = conn.execute("SELECT value FROM sync_state WHERE key = 'last_sync'").fetchone()
-        if last_row:
-            start_date = last_row["value"][:10]
-        else:
-            start_date = (date.today() - timedelta(days=90)).isoformat()
-
-    # Token — cached or fresh
-    token: str | None = None
-    if client_id:
-        token_row = conn.execute("SELECT value FROM sync_state WHERE key = 'token'").fetchone()
-        expiry_row = conn.execute(
-            "SELECT value FROM sync_state WHERE key = 'token_expiry'"
-        ).fetchone()
-        now_iso = datetime.now(UTC).isoformat()
-        if token_row and expiry_row and expiry_row["value"] > now_iso:
-            token = token_row["value"]
-        else:
-            token = get_token(client_id, secret or "", user or "")
-            expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
-            conn.execute(
-                "INSERT OR REPLACE INTO sync_state (key, value, updated) VALUES ('token', ?, ?)",
-                (token, now_iso),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO sync_state (key, value, updated) VALUES ('token_expiry', ?, ?)",
-                (expiry, now_iso),
-            )
-            conn.commit()
-    # token=None → mock mode in wealthica module
-
-    # Sync accounts
-    institutions = get_institutions(token)
-    now_str = datetime.now(UTC).isoformat()
-    for inst in institutions:
-        upsert_account(
-            conn,
-            {
-                "id": inst.get("_id"),
-                "institution": inst.get("institution"),
-                "name": inst.get("name"),
-                "type": inst.get("type"),
-                "currency": inst.get("currency", "CAD"),
-                "balance_current": inst.get("balance", 0.0),
-                "source": "wealthica",
-                "last_synced": now_str,
-            },
-        )
-
-    # Sync transactions
-    txns = wealthica_get_transactions(token, start_date, today)
-    new_ids: list[str] = []
-    for txn in txns:
-        row = {
-            "id": txn.get("_id"),
-            "account_id": txn.get("account"),
-            "date": txn.get("date"),
-            "amount": txn.get("amount", 0.0),
-            "description": txn.get("description", ""),
-            "category": txn.get("category"),
-            "currency": txn.get("currency", "CAD"),
-            "is_pending": 1 if txn.get("pending") else 0,
-            "source": "wealthica",
-        }
-        if upsert_transaction(conn, row):
-            new_ids.append(row["id"])
-
-    if new_ids:
-        _apply_rules(conn, new_ids)
-
-    detect_recurring(conn)
-    alerts = check_alerts(conn, new_ids)
-
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_state (key, value, updated) VALUES ('last_sync', ?, ?)",
-        (now_str, now_str),
-    )
-    conn.commit()
-
-    mode = " [mock mode — set WEALTHICA_CLIENT_ID for live sync]" if not client_id else ""
-    alert_note = f"  {len(alerts)} alert(s) pending." if alerts else ""
-    return (
-        f"Synced {len(new_ids)} new transactions across {len(institutions)} accounts. "
-        f"Last sync: {now_str[:16].replace('T', ' ')} UTC.{mode}{alert_note}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1155,82 +1057,6 @@ def cmd_rule_remove(conn, rule_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Command: scrape
-# ---------------------------------------------------------------------------
-
-
-def cmd_scrape(
-    conn,
-    bank: str,
-    days: int = 30,
-    first_auth: bool = False,
-    dry_run: bool = False,
-) -> str:
-    if bank == "rbc":
-        from skills.finance import scraper_rbc  # lazy import — playwright optional
-
-        async def _run():
-            return await scraper_rbc.fetch_transactions(days=days, force_headful=first_auth)
-
-        try:
-            txns = asyncio.run(_run())
-        except SessionExpiredError as exc:
-            return str(exc)
-        except ScraperError as exc:
-            return f"Scrape failed: {exc}"
-    elif bank == "td":
-        from skills.finance import scraper_td
-
-        async def _run_td():
-            return await scraper_td.fetch_transactions(days=days)
-
-        try:
-            asyncio.run(_run_td())
-        except NotImplementedError as exc:
-            return str(exc)
-        return "TD scraper not yet implemented."
-    else:
-        return f"Unknown bank: {bank}. Supported: rbc, td"
-
-    if dry_run:
-        lines = [f"[dry-run] {len(txns)} transactions from {bank.upper()}:"]
-        for t in txns[:20]:
-            lines.append(
-                f"  {t['date']}  {_fmt_amount(t['amount'])}  {t['description']}  [{t['account']}]"
-            )
-        if len(txns) > 20:
-            lines.append(f"  … {len(txns) - 20} more")
-        return "\n".join(lines)
-
-    inserted = skipped = 0
-    for txn in txns:
-        row = {
-            "id": txn["id"],
-            "account_id": txn.get("account_id", f"{bank}-unknown"),
-            "date": txn["date"],
-            "amount": txn["amount"],
-            "description": txn["description"],
-            "category": txn.get("category"),
-            "currency": txn.get("currency", "CAD"),
-            "owner": "personal",
-            "is_pending": txn.get("is_pending", 0),
-            "source": txn.get("source", f"scraper_{bank}"),
-            "note": None,
-        }
-        if upsert_transaction(conn, row):
-            inserted += 1
-        else:
-            skipped += 1
-
-    next_bank = "td" if bank == "rbc" else ""
-    next_hint = f"  Next: finance scrape --bank {next_bank}" if next_bank else ""
-    return (
-        f"Scraped {len(txns)} transactions from {bank.upper()} "
-        f"({inserted} new, {skipped} already in DB).{next_hint}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # Command: runway
 # ---------------------------------------------------------------------------
 
@@ -1547,10 +1373,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="finance", description="Personal CFO skill")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_sync = sub.add_parser("sync", help="Sync from Wealthica")
-    p_sync.add_argument("--since", default=None, metavar="DATE", help="Start date (YYYY-MM-DD)")
-    p_sync.add_argument("--full", action="store_true", help="Full history sync from 2020-01-01")
-
     p_import = sub.add_parser("import", help="Import CSV transactions")
     p_import.add_argument("file", help="CSV file path")
     p_import.add_argument("--account", default=None, metavar="ID", help="Account ID to assign")
@@ -1657,20 +1479,11 @@ def main() -> None:
     p_rule_remove = rule_sub.add_parser("remove", help="Remove a rule by id")
     p_rule_remove.add_argument("id", type=int)
 
-    p_scrape = sub.add_parser("scrape", help="Scrape transactions from bank via Playwright")
-    p_scrape.add_argument("--bank", required=True, choices=["rbc", "td"], help="Bank to scrape")
-    p_scrape.add_argument("--days", type=int, default=30, metavar="N", help="Days of history")
-    p_scrape.add_argument("--first-auth", action="store_true", help="Force headful login + MFA")
-    p_scrape.add_argument("--dry-run", action="store_true", help="Print instead of importing")
-
     args = parser.parse_args()
     conn = init_db(str(DB_PATH))
 
     try:
-        if args.cmd == "sync":
-            print(cmd_sync(conn, args.since, args.full))
-
-        elif args.cmd == "import":
+        if args.cmd == "import":
             print(cmd_import(conn, args.file, args.account, args.owner))
 
         elif args.cmd == "import-holdings":
@@ -1751,17 +1564,6 @@ def main() -> None:
                 print(cmd_rule_list(conn))
             elif args.rule_cmd == "remove":
                 print(cmd_rule_remove(conn, args.id))
-
-        elif args.cmd == "scrape":
-            print(
-                cmd_scrape(
-                    conn,
-                    bank=args.bank,
-                    days=args.days,
-                    first_auth=args.first_auth,
-                    dry_run=args.dry_run,
-                )
-            )
 
     finally:
         conn.close()
