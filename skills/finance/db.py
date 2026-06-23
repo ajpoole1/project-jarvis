@@ -13,7 +13,7 @@ import re
 import sqlite3
 import statistics
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import UTC, date, timedelta
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -167,7 +167,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     fr_count = conn.execute("SELECT COUNT(*) FROM finance_rules").fetchone()[0]
     legacy_count = conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
     if fr_count == 0 and legacy_count > 0:
-        from datetime import UTC, datetime
+        from datetime import datetime
 
         now = datetime.now(UTC).isoformat()
         rows = conn.execute("SELECT pattern, owner, category FROM rules").fetchall()
@@ -343,7 +343,7 @@ _CATEGORY_RULES: list[tuple[str, str]] = [
 
 def _seed_transfer_rules(conn: sqlite3.Connection) -> None:
     """Seed transfer and category rules into both rules (legacy) and finance_rules."""
-    from datetime import UTC, datetime
+    from datetime import datetime
 
     now = datetime.now(UTC).isoformat()
     _transfer_cats = {c for _, c in _TRANSFER_RULES}
@@ -453,7 +453,7 @@ def _seed_transfer_rules(conn: sqlite3.Connection) -> None:
 
 def upsert_finance_rule(conn: sqlite3.Connection, rule: dict) -> int:
     """Insert or update a finance_rules row. Returns the row id."""
-    from datetime import UTC, datetime
+    from datetime import datetime
 
     now = datetime.now(UTC).isoformat()
     existing_id = rule.get("id")
@@ -521,6 +521,27 @@ def delete_finance_rule(conn: sqlite3.Connection, rule_id: int) -> bool:
     return cur.rowcount > 0
 
 
+def _like_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a SQL LIKE pattern to a regex.
+
+    SQL LIKE semantics: % = any sequence, _ = exactly one char.
+    All other regex metacharacters (including [ ] which fnmatch treats as
+    glob classes) are escaped so bank strings like [POS] match literally.
+    """
+    parts = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "%":
+            parts.append(".*")
+        elif ch == "_":
+            parts.append(".")
+        else:
+            parts.append(re.escape(ch))
+        i += 1
+    return re.compile("".join(parts), re.IGNORECASE)
+
+
 def _match_finance_rule(rule: dict, txn: dict) -> bool:
     """Return True if a finance_rules row matches a transaction dict.
 
@@ -536,11 +557,7 @@ def _match_finance_rule(rule: dict, txn: dict) -> bool:
     desc = (txn.get("description") or "").upper()
     pattern = (rule.get("match_merchant") or "").upper()
 
-    # SQL LIKE → Python: % = any, _ = one char
-    import fnmatch
-
-    like_pattern = pattern.replace("%", "*").replace("_", "?")
-    if not fnmatch.fnmatch(desc, like_pattern):
+    if not _like_to_regex(pattern).fullmatch(desc):
         return False
 
     if rule.get("match_descriptor"):
@@ -642,8 +659,10 @@ def propose_tag_rule(
 ) -> int:
     """Write a pending rule proposal. Returns the proposal id."""
     import json
-    from datetime import UTC, datetime
+    from datetime import datetime
 
+    # Coerce any sqlite3.Row objects to plain dicts so json.dumps doesn't crash.
+    safe_sample = [dict(row) if isinstance(row, sqlite3.Row) else row for row in sample]
     cur = conn.execute(
         "INSERT INTO tag_proposals (match_merchant, category, owner, match_count, sample_json, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -652,7 +671,7 @@ def propose_tag_rule(
             category,
             owner,
             match_count,
-            json.dumps(sample),
+            json.dumps(safe_sample),
             datetime.now(UTC).isoformat(),
         ),
     )
@@ -668,10 +687,16 @@ def confirm_tag_rule(conn: sqlite3.Connection, proposal_id: int) -> tuple[dict |
     row = conn.execute("SELECT * FROM tag_proposals WHERE id = ?", (proposal_id,)).fetchone()
     if not row:
         return None, 0
+    # Support both sqlite3.Row and raw tuple rows (row_factory may not be set on all callers).
+    if isinstance(row, sqlite3.Row):
+        match_merchant, category, owner = row["match_merchant"], row["category"], row["owner"]
+    else:
+        # Column order: id(0), match_merchant(1), category(2), owner(3), match_count(4), sample_json(5), created_at(6)
+        match_merchant, category, owner = row[1], row[2], row[3]
     rule = {
-        "match_merchant": row["match_merchant"],
-        "category": row["category"],
-        "owner": row["owner"],
+        "match_merchant": match_merchant,
+        "category": category,
+        "owner": owner,
         "priority": 5,
         "note": f"generalised from tag --confirm-rule {proposal_id}",
     }

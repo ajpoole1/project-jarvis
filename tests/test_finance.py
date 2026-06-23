@@ -846,6 +846,17 @@ def test_migrate_works_without_row_factory(tmp_path):
     conn.close()
 
 
+def test_match_finance_rule_bracket_in_description(db):
+    """_match_finance_rule must match [POS] literally, not as a glob character class."""
+    from skills.finance.db import _match_finance_rule
+
+    rule = {"match_merchant": "%[POS]%", "owner": "personal", "category": "pos_purchase"}
+    txn_match = {"description": "INTERAC [POS] SOME STORE", "amount": -25.0}
+    txn_no_match = {"description": "INTERAC SOME STORE", "amount": -25.0}
+    assert _match_finance_rule(rule, txn_match) is True
+    assert _match_finance_rule(rule, txn_no_match) is False
+
+
 # ---------------------------------------------------------------------------
 # rule add / list / remove
 # ---------------------------------------------------------------------------
