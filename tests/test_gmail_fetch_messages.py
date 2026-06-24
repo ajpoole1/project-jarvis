@@ -110,45 +110,49 @@ def _make_q_service(q_to_ids: dict[str, list[str]]) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# Test 1 — fetch_inbox_messages includes CATEGORY_UPDATES email
+# Test 1 — fetch_inbox_messages uses in:inbox query
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_inbox_messages_includes_category_updates():
-    """Email with only CATEGORY_UPDATES (no INBOX label) must be returned."""
-    service = _make_service({"CATEGORY_UPDATES": ["msg-updates-1"]})
+def test_fetch_inbox_messages_uses_inbox_query():
+    """fetch_inbox_messages must query with q='in:inbox', not label filters."""
+    service = _make_q_service({"in:inbox": ["msg-inbox-1", "msg-inbox-2"]})
     result = skill.fetch_inbox_messages(service, batch_size=10)
     ids = [m["id"] for m in result]
-    assert "msg-updates-1" in ids, "CATEGORY_UPDATES message must appear in result"
+    assert "msg-inbox-1" in ids
+    assert "msg-inbox-2" in ids
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — fetch_new_messages includes CATEGORY_PROMOTIONS email
+# Test 2 — fetch_new_messages uses in:inbox query
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_new_messages_includes_category_promotions():
-    """Email with only CATEGORY_PROMOTIONS must be returned by fetch_new_messages."""
-    service = _make_q_service({"label:category-promotions": ["msg-promo-1"]})
+def test_fetch_new_messages_uses_inbox_query():
+    """fetch_new_messages must use in:inbox (not label OR clauses)."""
+    service = _make_q_service({"in:inbox": ["msg-new-1"]})
     result = skill.fetch_new_messages(service, since_epoch=None, batch_size=10)
     ids = [m["id"] for m in result]
-    assert "msg-promo-1" in ids, "CATEGORY_PROMOTIONS message must appear in result"
+    assert "msg-new-1" in ids
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — dedup: email with both INBOX and CATEGORY_UPDATES appears exactly once
+# Test 3 — fetch_new_messages appends after: filter when since_epoch given
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_dedup_both_labels():
-    """Email carrying both INBOX and CATEGORY_UPDATES must appear exactly once."""
-    # Both label buckets return the same message ID
-    service = _make_service(
-        {
-            "INBOX": ["msg-shared-1"],
-            "CATEGORY_UPDATES": ["msg-shared-1"],
-        }
-    )
-    result = skill.fetch_inbox_messages(service, batch_size=10)
-    ids = [m["id"] for m in result]
-    assert ids.count("msg-shared-1") == 1, "Duplicate message must be deduped to exactly one entry"
+def test_fetch_new_messages_appends_after_epoch():
+    """When since_epoch is set, the query must include 'after:<epoch>'."""
+    captured = {}
+
+    def _list_side_effect(**kwargs):
+        captured["q"] = kwargs.get("q", "")
+        mock_result = MagicMock()
+        mock_result.execute.return_value = {"messages": []}
+        return mock_result
+
+    service = MagicMock()
+    service.users().messages().list.side_effect = _list_side_effect
+    skill.fetch_new_messages(service, since_epoch=1700000000, batch_size=10)
+    assert "in:inbox" in captured["q"]
+    assert "after:1700000000" in captured["q"]
