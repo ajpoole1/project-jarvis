@@ -20,11 +20,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 _SKILL_ROOT = Path(__file__).parents[2]
 _DISCORD_SCRIPT = _SKILL_ROOT / "scripts" / "discord_post.py"
-_LOCAL_TZ = ZoneInfo("America/Toronto")
 
 # Load ~/.jarvis.env
 _env_path = Path.home() / ".jarvis.env"
@@ -33,7 +31,7 @@ if _env_path.exists():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
-            os.environ.setdefault(_k.strip(), _v.strip())
+            os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
 _WARN_THRESHOLD_MB = int(os.environ.get("GATEWAY_RSS_WARN_MB", "1500"))
 
@@ -86,8 +84,6 @@ def cmd_check() -> None:
             f"Approaching OOM — consider restarting: `systemctl --user restart openclaw-gateway`"
         )
         _post_discord(msg)
-        # Emit to stdout so the dispatcher also forwards it to Discord (belt-and-suspenders)
-        print(msg)
 
 
 def main() -> None:
