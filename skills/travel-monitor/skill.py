@@ -15,6 +15,7 @@ Phase 0: scaffold — DB schema, command-surface stub, env wiring.
 Phase 1: Amadeus flights lane — OAuth2, Cheapest Date Search (triage), Offers Search (confirm).
 Phase 2: Hotels lane — Firecrawl JSON-extract of Google Hotels price calendar per named property.
 Phase 3: Packages lane — Firecrawl JSON-extract of operator flex-date search (costco/aircanada/westjet/expedia).
+Phase 4: Reconciliation + deal detection + Discord alert.
 """
 
 from __future__ import annotations
@@ -947,6 +948,196 @@ def _lane_packages(watch: dict, operator: str, conn: sqlite3.Connection | None =
 
 
 # ---------------------------------------------------------------------------
+# Reconciliation (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def _reconcile(lane_results: list[dict], stay_nights: int) -> dict | None:
+    """
+    Join flight + hotel results on matching checkin date → best DIY total.
+    Compare against best package total across all operators.
+    Return the winning option dict, or None if insufficient data to reconcile.
+
+    Returned dict keys:
+      winner        — 'diy' or 'package'
+      headline      — winning total price (CAD)
+      checkin       — winning checkin date
+      checkout      — winning checkout date
+      diy_total     — best DIY total (or None)
+      diy_flight    — flight component of best DIY
+      diy_hotel     — hotel component of best DIY
+      diy_carrier   — carrier for best DIY flight
+      diy_provider  — hotel provider for best DIY
+      pkg_total     — best package total (or None)
+      pkg_operator  — operator for best package
+      pkg_checkin   — checkin for best package
+      pkg_checkout  — checkout for best package
+      pkg_desc      — package description
+      delta         — abs(diy_total - pkg_total) if both available, else None
+    """
+    # Separate results by lane
+    flight_result = next(
+        (r for r in lane_results if r.get("lane") == "flight" and r.get("status") == "ok"), None
+    )
+    hotel_result = next(
+        (r for r in lane_results if r.get("lane") == "hotel" and r.get("status") == "ok"), None
+    )
+    pkg_results = [
+        r for r in lane_results if r.get("lane") == "package" and r.get("status") == "ok"
+    ]
+
+    # Best DIY: join flights + hotels on matching checkin date
+    best_diy: dict | None = None
+    if flight_result and hotel_result:
+        # Index hotel results by checkin date → cheapest price for that date
+        hotel_by_date: dict[str, dict] = {}
+        for stay in hotel_result.get("results", []):
+            ci = stay.get("checkin", "")
+            price = stay.get("price")
+            if ci and price is not None:
+                if ci not in hotel_by_date or price < hotel_by_date[ci]["price"]:
+                    hotel_by_date[ci] = stay
+
+        for flight in flight_result.get("results", []):
+            ci = flight.get("checkin", "")
+            if ci not in hotel_by_date:
+                continue
+            hotel = hotel_by_date[ci]
+            diy_total = flight["price"] + hotel["price"]
+            if best_diy is None or diy_total < best_diy["diy_total"]:
+                best_diy = {
+                    "diy_total": diy_total,
+                    "checkin": ci,
+                    "checkout": flight.get("checkout", ""),
+                    "diy_flight": flight["price"],
+                    "diy_hotel": hotel["price"],
+                    "diy_carrier": flight.get("carrier", ""),
+                    "diy_provider": hotel.get("provider", ""),
+                }
+    elif flight_result and not hotel_result:
+        # No hotel data — flight-only DIY (partial)
+        for flight in flight_result.get("results", []):
+            if best_diy is None or flight["price"] < best_diy["diy_total"]:
+                best_diy = {
+                    "diy_total": flight["price"],
+                    "checkin": flight.get("checkin", ""),
+                    "checkout": flight.get("checkout", ""),
+                    "diy_flight": flight["price"],
+                    "diy_hotel": None,
+                    "diy_carrier": flight.get("carrier", ""),
+                    "diy_provider": None,
+                }
+
+    # Best package: cheapest across all operators
+    best_pkg: dict | None = None
+    for pkg_lane in pkg_results:
+        for pkg in pkg_lane.get("results", []):
+            price = pkg.get("price")
+            if price is None:
+                continue
+            if best_pkg is None or price < best_pkg["pkg_total"]:
+                best_pkg = {
+                    "pkg_total": price,
+                    "pkg_operator": pkg_lane.get("operator", ""),
+                    "pkg_checkin": pkg.get("checkin", ""),
+                    "pkg_checkout": pkg.get("checkout", ""),
+                    "pkg_desc": pkg.get("description", ""),
+                }
+
+    if best_diy is None and best_pkg is None:
+        return None
+
+    diy_total = best_diy["diy_total"] if best_diy else None
+    pkg_total = best_pkg["pkg_total"] if best_pkg else None
+
+    if diy_total is not None and pkg_total is not None:
+        delta = abs(diy_total - pkg_total)
+        if diy_total <= pkg_total:
+            winner = "diy"
+            headline = diy_total
+            checkin = best_diy["checkin"]
+            checkout = best_diy["checkout"]
+        else:
+            winner = "package"
+            headline = pkg_total
+            checkin = best_pkg["pkg_checkin"]
+            checkout = best_pkg["pkg_checkout"]
+    elif diy_total is not None:
+        winner = "diy"
+        headline = diy_total
+        checkin = best_diy["checkin"]
+        checkout = best_diy["checkout"]
+        delta = None
+    else:
+        winner = "package"
+        headline = pkg_total
+        checkin = best_pkg["pkg_checkin"]
+        checkout = best_pkg["pkg_checkout"]
+        delta = None
+
+    return {
+        "winner": winner,
+        "headline": headline,
+        "checkin": checkin,
+        "checkout": checkout,
+        "diy_total": diy_total,
+        "diy_flight": best_diy["diy_flight"] if best_diy else None,
+        "diy_hotel": best_diy["diy_hotel"] if best_diy else None,
+        "diy_carrier": best_diy["diy_carrier"] if best_diy else None,
+        "diy_provider": best_diy["diy_provider"] if best_diy else None,
+        "pkg_total": pkg_total,
+        "pkg_operator": best_pkg["pkg_operator"] if best_pkg else None,
+        "pkg_checkin": best_pkg["pkg_checkin"] if best_pkg else None,
+        "pkg_checkout": best_pkg["pkg_checkout"] if best_pkg else None,
+        "pkg_desc": best_pkg["pkg_desc"] if best_pkg else None,
+        "delta": delta,
+    }
+
+
+def _format_deal_alert(
+    watch_name: str, stay_nights: int, adults: int, children: int, rec: dict, reason: str
+) -> str:
+    """Format the Discord deal alert message."""
+    pax = f"{adults}+{children} pax" if children else f"{adults} pax"
+    header = f":airplane: **{watch_name}** · {stay_nights}n · {pax}"
+
+    winner = rec["winner"]
+    headline = rec["headline"]
+    checkin = rec["checkin"]
+    checkout = rec["checkout"]
+
+    lines = [
+        header,
+        f"**Best this scan: ${headline:,.0f} CAD** ({checkin} – {checkout}) — {reason}",
+    ]
+
+    if winner == "package" and rec.get("pkg_operator"):
+        op = rec["pkg_operator"].title()
+        lines.append(f"  Package: **{op}** ${rec['pkg_total']:,.0f}")
+        if rec.get("pkg_desc"):
+            lines.append(f"  ({rec['pkg_desc']})")
+    elif winner == "diy":
+        parts = []
+        if rec.get("diy_flight") is not None:
+            carrier = f" via {rec['diy_carrier']}" if rec.get("diy_carrier") else ""
+            parts.append(f"flight ${rec['diy_flight']:,.0f}{carrier}")
+        if rec.get("diy_hotel") is not None:
+            prov = f" ({rec['diy_provider']})" if rec.get("diy_provider") else ""
+            parts.append(f"hotel ${rec['diy_hotel']:,.0f}{prov}")
+        if parts:
+            lines.append("  DIY: " + " + ".join(parts))
+
+    if rec.get("diy_total") is not None and rec.get("pkg_total") is not None:
+        delta = rec["delta"]
+        cheaper = "Package" if rec["pkg_total"] < rec["diy_total"] else "DIY"
+        lines.append(
+            f"  {cheaper} wins by ${delta:,.0f} vs {'DIY' if cheaper == 'Package' else 'package'} ${max(rec['diy_total'], rec['pkg_total']):,.0f}"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Deal detection
 # ---------------------------------------------------------------------------
 
@@ -1325,7 +1516,8 @@ def cmd_check(args: list[str]) -> None:
     Scheduled run: scan active watches, run lanes, reconcile, detect deals.
     Silent unless a deal or health alert fires.
 
-    Phase 1: flights lane live via Amadeus; hotels+packages still stubbed.
+    Phase 4: reconcile flight+hotel → DIY total, compare vs best package,
+    persist reconciled row, run deal detection, Discord alert on deal.
     """
     conn = _init_db()
     try:
@@ -1409,10 +1601,41 @@ def cmd_check(args: list[str]) -> None:
                     + (f" reason={reason}" if reason else ""),
                     file=sys.stderr,
                 )
+            # Phase 4: reconcile, persist headline, detect deal
+            rec = _reconcile(lane_results, stay_nights)
+            if rec is not None:
+                headline = rec["headline"]
+                checked_at = _now_utc().isoformat()
+                conn.execute(
+                    """INSERT INTO travel_price_history
+                       (watch_id, checked_at, lane, best_price, currency, checkin, checkout,
+                        provider, raw, method)
+                       VALUES (?, ?, 'reconciled', ?, 'CAD', ?, ?, ?, ?, 'reconcile')""",
+                    (
+                        watch_id,
+                        checked_at,
+                        headline,
+                        rec["checkin"],
+                        rec["checkout"],
+                        rec.get("pkg_operator") or rec.get("diy_carrier") or "",
+                        json.dumps(rec),
+                    ),
+                )
+                conn.commit()
+
+                deal_reason = _detect_deal(conn, watch_id, headline, target_price, checked_at)
+                if deal_reason:
+                    alert = _format_deal_alert(
+                        name, stay_nights, adults, children, rec, deal_reason
+                    )
+                    _discord_post(alert)
+                    print(
+                        f"[travel-monitor] watch={watch_id} name={name!r} DEAL: {deal_reason} "
+                        f"headline=${headline:.0f}",
+                        file=sys.stderr,
+                    )
         finally:
             conn.close()
-
-        # Phase 4 will join flight + hotel results here and run _detect_deal()
 
 
 # ---------------------------------------------------------------------------
