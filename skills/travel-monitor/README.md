@@ -101,7 +101,7 @@ hotel/package sites far more aggressively than retail.
 - **Phase 2** ✅ — Hotels lane: Firecrawl JSON-extract, Google Hotels, named property price calendar
 - **Phase 3** ✅ — Packages lane: Firecrawl JSON-extract per operator (costco, aircanada, westjet, expedia)
 - **Phase 4** ✅ — Reconciliation + deal detection + Discord alert
-- **Phase 5** — Health/degradation hardening + cadence escalation
+- **Phase 5** ✅ — Health/degradation hardening (fail_count, degraded status) + cadence escalation (weekly→daily within ESCALATE_DAYS)
 
 ## Notes
 

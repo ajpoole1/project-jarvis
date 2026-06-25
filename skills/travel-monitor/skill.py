@@ -16,6 +16,7 @@ Phase 1: Amadeus flights lane — OAuth2, Cheapest Date Search (triage), Offers 
 Phase 2: Hotels lane — Firecrawl JSON-extract of Google Hotels price calendar per named property.
 Phase 3: Packages lane — Firecrawl JSON-extract of operator flex-date search (costco/aircanada/westjet/expedia).
 Phase 4: Reconciliation + deal detection + Discord alert.
+Phase 5: Health/degradation hardening (fail_count, degraded status) + cadence escalation (weekly→daily).
 """
 
 from __future__ import annotations
@@ -1516,8 +1517,8 @@ def cmd_check(args: list[str]) -> None:
     Scheduled run: scan active watches, run lanes, reconcile, detect deals.
     Silent unless a deal or health alert fires.
 
-    Phase 4: reconcile flight+hotel → DIY total, compare vs best package,
-    persist reconciled row, run deal detection, Discord alert on deal.
+    Phase 4+5: reconcile, persist, deal detect, Discord alert.
+    Health hardening: fail_count tracking, degraded status, cadence escalation.
     """
     conn = _init_db()
     try:
@@ -1586,14 +1587,23 @@ def cmd_check(args: list[str]) -> None:
             for op in operators:
                 lane_results.append(_lane_packages(watch_stub, op, conn))
 
+            # Phase 5: health accounting — count real failures (not stubs)
+            real_failures = [
+                r
+                for r in lane_results
+                if r.get("status") == "unavailable" and r.get("reason") != "not_implemented"
+            ]
+            ok_lanes = [r for r in lane_results if r.get("status") == "ok"]
+
             for result in lane_results:
                 lane = result.get("lane", "unknown")
                 status = result.get("status", "unknown")
                 reason = result.get("reason", "")
                 if status == "unavailable" and reason != "not_implemented":
+                    op_tag = f"/{result['operator']}" if result.get("operator") else ""
                     alert = (
                         f":warning: **travel-monitor health** | watch={watch_id} `{name}` | "
-                        f"lane={lane} unavailable — {reason}"
+                        f"lane={lane}{op_tag} unavailable — {reason}"
                     )
                     _discord_post(alert)
                 print(
@@ -1601,7 +1611,65 @@ def cmd_check(args: list[str]) -> None:
                     + (f" reason={reason}" if reason else ""),
                     file=sys.stderr,
                 )
-            # Phase 4: reconcile, persist headline, detect deal
+
+            # Update fail_count and status
+            if ok_lanes:
+                # At least one lane succeeded — reset fail counter if needed
+                if fail_count != 0:
+                    conn.execute(
+                        "UPDATE travel_watches SET fail_count = 0, status = 'active' WHERE id = ?",
+                        (watch_id,),
+                    )
+            elif real_failures:
+                # All lanes failed this run
+                new_fail_count = fail_count + 1
+                new_status = "degraded" if new_fail_count >= 3 else "active"
+                conn.execute(
+                    "UPDATE travel_watches SET fail_count = ?, status = ? WHERE id = ?",
+                    (new_fail_count, new_status, watch_id),
+                )
+                if new_fail_count == 3:
+                    _discord_post(
+                        f":x: **travel-monitor degraded** | watch={watch_id} `{name}` | "
+                        f"all lanes failed {new_fail_count} consecutive runs — "
+                        "manual check recommended"
+                    )
+                    print(
+                        f"[travel-monitor] watch={watch_id} name={name!r} DEGRADED after "
+                        f"{new_fail_count} consecutive failures",
+                        file=sys.stderr,
+                    )
+            conn.commit()
+
+            # Phase 5: cadence escalation — auto-flip weekly→daily within ESCALATE_DAYS
+            try:
+                days_until_window = (
+                    date.fromisoformat(window_start) - date.fromisoformat(today)
+                ).days
+            except ValueError:
+                days_until_window = None
+
+            if (
+                days_until_window is not None
+                and days_until_window <= ESCALATE_DAYS
+                and cadence == "weekly"
+            ):
+                conn.execute(
+                    "UPDATE travel_watches SET cadence = 'daily' WHERE id = ?",
+                    (watch_id,),
+                )
+                conn.commit()
+                _discord_post(
+                    f":alarm_clock: **travel-monitor** | watch={watch_id} `{name}` | "
+                    f"window starts in {days_until_window}d — escalating to daily scans"
+                )
+                print(
+                    f"[travel-monitor] watch={watch_id} name={name!r} escalated weekly→daily "
+                    f"({days_until_window}d until window_start)",
+                    file=sys.stderr,
+                )
+
+            # Reconcile, persist headline, detect deal
             rec = _reconcile(lane_results, stay_nights)
             if rec is not None:
                 headline = rec["headline"]
