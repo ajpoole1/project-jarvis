@@ -244,13 +244,48 @@ def _read_session_transcript() -> str | None:
     return "\n\n".join(lines) if lines else None
 
 
-def _run_haiku_sweep(window_text: str) -> list[dict]:
-    """Run headless Haiku sweep, return list of artifact dicts."""
+_STRICT_SYSTEM = "Output ONLY a raw JSON array, no markdown, no prose, no code fences."
+
+
+def _extract_json_array(text: str) -> list[dict]:
+    """
+    Extract the first balanced [...] array from text, tolerating markdown fences
+    and any surrounding prose. Raises ValueError if no valid array found.
+    """
+    import re
+
+    # Strip ```json ... ``` or ``` ... ``` fences
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = re.sub(r"```", "", text)
+
+    # Find the first '[' and its matching ']'
+    start = text.find("[")
+    if start == -1:
+        raise ValueError(f"no JSON array found in output: {text[:200]!r}")
+
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : i + 1]
+                result = json.loads(candidate)
+                if not isinstance(result, list):
+                    raise ValueError(f"parsed value is not a list: {type(result)}")
+                return result
+
+    raise ValueError(f"unbalanced brackets in output: {text[:200]!r}")
+
+
+def _call_haiku(window_text: str, strict: bool = False) -> str:
+    """Make one Haiku API call. Returns the raw text content."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
 
-    payload = {
+    payload: dict = {
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 2048,
         "messages": [
@@ -260,6 +295,8 @@ def _run_haiku_sweep(window_text: str) -> list[dict]:
             }
         ],
     }
+    if strict:
+        payload["system"] = _STRICT_SYSTEM
 
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
@@ -274,11 +311,37 @@ def _run_haiku_sweep(window_text: str) -> list[dict]:
     with urllib.request.urlopen(req, timeout=45) as resp:
         response = json.loads(resp.read().decode())
 
-    text = response["content"][0]["text"].strip()
-    artifacts = json.loads(text)
-    if not isinstance(artifacts, list):
-        raise ValueError(f"Unexpected Haiku output: {text[:200]}")
-    return artifacts
+    return response["content"][0]["text"].strip()
+
+
+def _run_haiku_sweep(window_text: str) -> list[dict]:
+    """
+    Run headless Haiku sweep. Retries once with a strict system prompt on parse
+    failure. Returns list of artifact dicts (may be empty).
+    Raises only on HTTP/auth errors or total parse failure after retry.
+    """
+    # Attempt 1 — standard call
+    text = _call_haiku(window_text, strict=False)
+    try:
+        return _extract_json_array(text)
+    except (ValueError, json.JSONDecodeError) as first_exc:
+        print(
+            f"[nightly-checkpoint] haiku parse attempt 1 failed ({first_exc}); "
+            f"raw[:500]={text[:500]!r}; retrying with strict system prompt",
+            file=sys.stderr,
+        )
+
+    # Attempt 2 — strict system prompt
+    text2 = _call_haiku(window_text, strict=True)
+    try:
+        return _extract_json_array(text2)
+    except (ValueError, json.JSONDecodeError) as second_exc:
+        print(
+            f"[nightly-checkpoint] haiku parse attempt 2 failed ({second_exc}); "
+            f"raw[:500]={text2[:500]!r}",
+            file=sys.stderr,
+        )
+        raise ValueError(f"Haiku output unparseable after 2 attempts: {second_exc}") from second_exc
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -302,6 +365,33 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         if col not in existing:
             conn.execute(f"ALTER TABLE knowledge_pending_writes ADD COLUMN {col} {defn}")
     conn.commit()
+
+
+def _stage_raw_fallback(transcript: str) -> None:
+    """
+    Write the full session transcript as a raw pending-write row so no thread
+    is lost when the Haiku sweep output is unparseable.
+    Provenance 'nightly-checkpoint-raw' flags it for manual review.
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        _ensure_schema(conn)
+        now = datetime.now(TZ).isoformat()
+        date_tag = datetime.now(TZ).strftime("%Y-%m-%d")
+        conn.execute(
+            """INSERT INTO knowledge_pending_writes
+               (title, summary, suggested_path, provenance, confidence, filed, created_at)
+               VALUES (?, ?, ?, 'nightly-checkpoint-raw', 0.0, 0, ?)""",
+            (
+                f"[RAW] Session transcript {date_tag}",
+                transcript,
+                "~/.jarvis/knowledge/personal/",
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _stage_artifacts(artifacts: list[dict]) -> int:
@@ -382,8 +472,24 @@ def phase_capture() -> tuple[bool, str]:
     try:
         artifacts = _run_haiku_sweep(transcript)
     except Exception as exc:
-        _alert(f"Haiku sweep failed: {exc}. Skipping restart to preserve session.")
-        return False, f"haiku failed: {exc}"
+        # Transcript was read successfully — data-loss risk is low.
+        # Write the raw transcript as a fallback so nothing is lost, then
+        # proceed with the restart rather than silently skipping it forever.
+        try:
+            _stage_raw_fallback(transcript)
+            _alert(
+                f"Haiku sweep unparseable ({exc}). "
+                "Raw transcript saved to `knowledge pending` (provenance=nightly-checkpoint-raw) "
+                "for manual review. Proceeding with restart."
+            )
+        except Exception as db_exc:
+            # Raw write also failed — transcript at genuine risk of loss, skip restart.
+            _alert(
+                f"Haiku sweep failed ({exc}) AND raw fallback failed ({db_exc}). "
+                "Skipping restart to preserve session."
+            )
+            return False, f"haiku failed + raw fallback failed: {db_exc}"
+        return True, f"haiku parse failed ({exc}), raw fallback written, restart proceeding"
 
     if not artifacts:
         _update_live_state("sweep found nothing undocumented — clean slate.")
