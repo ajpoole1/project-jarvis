@@ -55,6 +55,7 @@ DEAL_DROP_PCT = float(os.environ.get("TRAVEL_MONITOR_DEAL_DROP_PCT", "10"))
 N_MEDIAN = int(os.environ.get("TRAVEL_MONITOR_N_MEDIAN", "8"))
 N_DAY_LOW = int(os.environ.get("TRAVEL_MONITOR_N_DAY_LOW", "30"))
 ESCALATE_DAYS = int(os.environ.get("TRAVEL_MONITOR_ESCALATE_DAYS", "21"))
+DEGRADE_AFTER = int(os.environ.get("TRAVEL_MONITOR_DEGRADE_AFTER", "3"))
 
 VALID_OPERATORS = {"costco", "aircanada", "westjet", "expedia"}
 VALID_CADENCES = {"weekly", "daily"}
@@ -261,12 +262,20 @@ def _amadeus_token() -> str:
 
 
 def _amadeus_get(path: str, params: dict) -> dict:
-    """GET against the Amadeus production API with bearer auth."""
-    token = _amadeus_token()
-    url = f"{_AMADEUS_BASE}{path}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    """GET against the Amadeus production API with bearer auth. Retries once on 401."""
+    for attempt in range(2):
+        token = _amadeus_token()
+        url = f"{_AMADEUS_BASE}{path}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and attempt == 0:
+                # Token expired or revoked mid-run — evict cache and retry once
+                _amadeus_token_cache.clear()
+                continue
+            raise
 
 
 def _amadeus_cheapest_dates(
@@ -444,20 +453,17 @@ def _lane_flights(watch: dict, conn: sqlite3.Connection | None = None) -> dict:
 
         # Persist to travel_price_history if conn provided (scheduled check run)
         if conn is not None and watch_id is not None:
-            conn.execute(
-                """INSERT INTO travel_price_history
-                   (watch_id, checked_at, lane, best_price, currency, checkin, checkout,
-                    provider, raw, method)
-                   VALUES (?, ?, 'flight', ?, 'CAD', ?, ?, ?, ?, 'amadeus_offers')""",
-                (
-                    watch_id,
-                    checked_at,
-                    best["price"],
-                    dep_str,
-                    ret_d.isoformat(),
-                    best["carrier"],
-                    json.dumps(offers),
-                ),
+            _record_price(
+                conn,
+                watch_id,
+                checked_at,
+                "flight",
+                best["price"],
+                dep_str,
+                ret_d.isoformat(),
+                best["carrier"],
+                offers,
+                "amadeus_offers",
             )
 
     if conn is not None:
@@ -470,6 +476,32 @@ def _lane_flights(watch: dict, conn: sqlite3.Connection | None = None) -> dict:
         return {"lane": "flight", "status": "unavailable", "reason": "no_offers_returned"}
 
     return {"lane": "flight", "status": "ok", "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Shared DB helper
+# ---------------------------------------------------------------------------
+
+
+def _record_price(
+    conn: sqlite3.Connection,
+    watch_id: int,
+    checked_at: str,
+    lane: str,
+    price: float,
+    checkin: str,
+    checkout: str,
+    provider: str,
+    raw: object,
+    method: str,
+) -> None:
+    conn.execute(
+        """INSERT INTO travel_price_history
+           (watch_id, checked_at, lane, best_price, currency, checkin, checkout,
+            provider, raw, method)
+           VALUES (?, ?, ?, ?, 'CAD', ?, ?, ?, ?, ?)""",
+        (watch_id, checked_at, lane, price, checkin, checkout, provider, json.dumps(raw), method),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +563,10 @@ def _firecrawl_extract(url: str, schema: dict, prompt: str) -> tuple[dict | None
         print(f"[travel-monitor] firecrawl success=false: {err}", file=sys.stderr)
         return None, "error"
 
-    extracted = (data.get("data") or {}).get("extract")
+    raw = data.get("data")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else {}
+    extracted = (raw or {}).get("extract") if isinstance(raw, dict) else None
     if not isinstance(extracted, dict):
         return None, "parse_error"
 
@@ -675,20 +710,17 @@ def _lane_hotels(watch: dict, conn: sqlite3.Connection | None = None) -> dict:
             all_results.append(row)
 
             if conn is not None and watch_id is not None:
-                conn.execute(
-                    """INSERT INTO travel_price_history
-                       (watch_id, checked_at, lane, best_price, currency, checkin, checkout,
-                        provider, raw, method)
-                       VALUES (?, ?, 'hotel', ?, 'CAD', ?, ?, ?, ?, 'firecrawl_extract')""",
-                    (
-                        watch_id,
-                        checked_at,
-                        price,
-                        checkin,
-                        checkout,
-                        f"{hotel_name} / {provider}".strip(" /"),
-                        json.dumps(stay),
-                    ),
+                _record_price(
+                    conn,
+                    watch_id,
+                    checked_at,
+                    "hotel",
+                    price,
+                    checkin,
+                    checkout,
+                    f"{hotel_name} / {provider}".strip(" /"),
+                    stay,
+                    "firecrawl_extract",
                 )
 
     if conn is not None and watch_id is not None:
@@ -915,20 +947,17 @@ def _lane_packages(watch: dict, operator: str, conn: sqlite3.Connection | None =
         results.append(row)
 
         if conn is not None and watch_id is not None:
-            conn.execute(
-                """INSERT INTO travel_price_history
-                   (watch_id, checked_at, lane, best_price, currency, checkin, checkout,
-                    provider, raw, method)
-                   VALUES (?, ?, 'package', ?, 'CAD', ?, ?, ?, ?, 'firecrawl_extract')""",
-                (
-                    watch_id,
-                    checked_at,
-                    price,
-                    checkin,
-                    checkout,
-                    operator,
-                    json.dumps(pkg),
-                ),
+            _record_price(
+                conn,
+                watch_id,
+                checked_at,
+                "package",
+                price,
+                checkin,
+                checkout,
+                operator,
+                pkg,
+                "firecrawl_extract",
             )
 
     if conn is not None and watch_id is not None:
@@ -1306,9 +1335,7 @@ def cmd_add(args: list[str]) -> None:
         "package_operators": operators,
     }
 
-    lane_results: list[dict] = []
-    if True:  # flights always probed
-        lane_results.append(_lane_flights(watch_stub))
+    lane_results: list[dict] = [_lane_flights(watch_stub)]  # flights always probed
     if hotel_targets:
         lane_results.append(_lane_hotels(watch_stub))
     for op in operators:
@@ -1368,7 +1395,7 @@ def cmd_add(args: list[str]) -> None:
         f"Watching **{name}** — {origin}→{dest}, {adults}+{children} pax, "
         f"{stay_nights} nights in {window_start}–{window_end}. Cadence: {cadence}."
     ]
-    if target_price:
+    if target_price is not None:
         msg_parts.append(f"Alert target: ${target_price:.0f} CAD.")
     if stubs:
         stub_names = [r.get("operator", r.get("lane", "?")) for r in stubs]
@@ -1526,61 +1553,57 @@ def cmd_check(args: list[str]) -> None:
             """SELECT id, name, destination, origin_iata, window_start, window_end,
                       stay_nights, adults, children, hotel_targets, package_operators,
                       target_price, cadence, fail_count
-               FROM travel_watches WHERE status = 'active'"""
+               FROM travel_watches WHERE status IN ('active', 'degraded')"""
         ).fetchall()
-    finally:
-        conn.close()
 
-    if not watches:
-        return
+        if not watches:
+            return
 
-    today = _today_local()
+        today = _today_local()
 
-    for row in watches:
-        (
-            watch_id,
-            name,
-            dest,
-            origin,
-            window_start,
-            window_end,
-            stay_nights,
-            adults,
-            children,
-            hotel_targets_json,
-            operators_json,
-            target_price,
-            cadence,
-            fail_count,
-        ) = row
+        for row in watches:
+            (
+                watch_id,
+                name,
+                dest,
+                origin,
+                window_start,
+                window_end,
+                stay_nights,
+                adults,
+                children,
+                hotel_targets_json,
+                operators_json,
+                target_price,
+                cadence,
+                fail_count,
+            ) = row
 
-        # Skip if watch window has passed
-        if today > window_end:
-            print(
-                f"[travel-monitor] watch={watch_id} name={name!r} window expired, skipping",
-                file=sys.stderr,
-            )
-            continue
+            # Skip if watch window has passed
+            if today > window_end:
+                print(
+                    f"[travel-monitor] watch={watch_id} window expired, skipping",
+                    file=sys.stderr,
+                )
+                continue
 
-        hotel_targets: list[str] = json.loads(hotel_targets_json or "[]")
-        operators: list[str] = json.loads(operators_json or "[]")
+            hotel_targets: list[str] = json.loads(hotel_targets_json or "[]")
+            operators: list[str] = json.loads(operators_json or "[]")
 
-        watch_stub = {
-            "id": watch_id,
-            "name": name,
-            "destination": dest,
-            "origin_iata": origin,
-            "window_start": window_start,
-            "window_end": window_end,
-            "stay_nights": stay_nights,
-            "adults": adults,
-            "children": children,
-            "hotel_targets": hotel_targets,
-            "package_operators": operators,
-        }
+            watch_stub = {
+                "id": watch_id,
+                "name": name,
+                "destination": dest,
+                "origin_iata": origin,
+                "window_start": window_start,
+                "window_end": window_end,
+                "stay_nights": stay_nights,
+                "adults": adults,
+                "children": children,
+                "hotel_targets": hotel_targets,
+                "package_operators": operators,
+            }
 
-        conn = _init_db()
-        try:
             lane_results: list[dict] = [_lane_flights(watch_stub, conn)]
             if hotel_targets:
                 lane_results.append(_lane_hotels(watch_stub, conn))
@@ -1607,7 +1630,7 @@ def cmd_check(args: list[str]) -> None:
                     )
                     _discord_post(alert)
                 print(
-                    f"[travel-monitor] watch={watch_id} name={name!r} lane={lane} status={status}"
+                    f"[travel-monitor] watch={watch_id} lane={lane} status={status}"
                     + (f" reason={reason}" if reason else ""),
                     file=sys.stderr,
                 )
@@ -1623,25 +1646,28 @@ def cmd_check(args: list[str]) -> None:
             elif real_failures:
                 # All lanes failed this run
                 new_fail_count = fail_count + 1
-                new_status = "degraded" if new_fail_count >= 3 else "active"
+                new_status = "degraded" if new_fail_count >= DEGRADE_AFTER else "active"
                 conn.execute(
                     "UPDATE travel_watches SET fail_count = ?, status = ? WHERE id = ?",
                     (new_fail_count, new_status, watch_id),
                 )
-                if new_fail_count == 3:
+                if new_fail_count == DEGRADE_AFTER:
                     _discord_post(
                         f":x: **travel-monitor degraded** | watch={watch_id} `{name}` | "
                         f"all lanes failed {new_fail_count} consecutive runs — "
                         "manual check recommended"
                     )
                     print(
-                        f"[travel-monitor] watch={watch_id} name={name!r} DEGRADED after "
+                        f"[travel-monitor] watch={watch_id} DEGRADED after "
                         f"{new_fail_count} consecutive failures",
                         file=sys.stderr,
                     )
             conn.commit()
 
-            # Phase 5: cadence escalation — auto-flip weekly→daily within ESCALATE_DAYS
+            # Phase 5: cadence escalation — suggest daily when within ESCALATE_DAYS.
+            # We post a one-time Discord suggestion; the user approves via `schedules propose`.
+            # The schedules dispatcher fires based on the schedules table, not travel_watches.cadence,
+            # so only a human-approved schedule change actually increases firing frequency.
             try:
                 days_until_window = (
                     date.fromisoformat(window_start) - date.fromisoformat(today)
@@ -1651,7 +1677,7 @@ def cmd_check(args: list[str]) -> None:
 
             if (
                 days_until_window is not None
-                and days_until_window <= ESCALATE_DAYS
+                and 0 <= days_until_window <= ESCALATE_DAYS
                 and cadence == "weekly"
             ):
                 conn.execute(
@@ -1661,10 +1687,11 @@ def cmd_check(args: list[str]) -> None:
                 conn.commit()
                 _discord_post(
                     f":alarm_clock: **travel-monitor** | watch={watch_id} `{name}` | "
-                    f"window starts in {days_until_window}d — escalating to daily scans"
+                    f"window starts in {days_until_window}d — consider switching to daily scans: "
+                    f"`schedules propose --skill travel-monitor --schedule daily@09:00`"
                 )
                 print(
-                    f"[travel-monitor] watch={watch_id} name={name!r} escalated weekly→daily "
+                    f"[travel-monitor] watch={watch_id} escalation suggested "
                     f"({days_until_window}d until window_start)",
                     file=sys.stderr,
                 )
@@ -1674,20 +1701,17 @@ def cmd_check(args: list[str]) -> None:
             if rec is not None:
                 headline = rec["headline"]
                 checked_at = _now_utc().isoformat()
-                conn.execute(
-                    """INSERT INTO travel_price_history
-                       (watch_id, checked_at, lane, best_price, currency, checkin, checkout,
-                        provider, raw, method)
-                       VALUES (?, ?, 'reconciled', ?, 'CAD', ?, ?, ?, ?, 'reconcile')""",
-                    (
-                        watch_id,
-                        checked_at,
-                        headline,
-                        rec["checkin"],
-                        rec["checkout"],
-                        rec.get("pkg_operator") or rec.get("diy_carrier") or "",
-                        json.dumps(rec),
-                    ),
+                _record_price(
+                    conn,
+                    watch_id,
+                    checked_at,
+                    "reconciled",
+                    headline,
+                    rec["checkin"],
+                    rec["checkout"],
+                    rec.get("pkg_operator") or rec.get("diy_carrier") or "",
+                    rec,
+                    "reconcile",
                 )
                 conn.commit()
 
@@ -1698,12 +1722,12 @@ def cmd_check(args: list[str]) -> None:
                     )
                     _discord_post(alert)
                     print(
-                        f"[travel-monitor] watch={watch_id} name={name!r} DEAL: {deal_reason} "
+                        f"[travel-monitor] watch={watch_id} DEAL: {deal_reason} "
                         f"headline=${headline:.0f}",
                         file=sys.stderr,
                     )
-        finally:
-            conn.close()
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
