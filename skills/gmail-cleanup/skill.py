@@ -291,7 +291,8 @@ def init_db():
             tag             TEXT NOT NULL DEFAULT 'none',
             reason          TEXT,
             staged_at       TEXT DEFAULT (datetime('now')),
-            label_ids_json  TEXT NOT NULL DEFAULT '[]'
+            label_ids_json  TEXT NOT NULL DEFAULT '[]',
+            disposition     TEXT NOT NULL DEFAULT 'file'
         )
     """)
     try:
