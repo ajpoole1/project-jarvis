@@ -11,8 +11,8 @@ Alerts only — never books anything. Silent run unless a deal or health alert f
 
 Stdlib only; no virtualenv needed.
 
-Phase 0: scaffold only — DB schema, command-surface stub, env wiring.
-         Lanes return NotImplementedError stubs; no actual fetching.
+Phase 0: scaffold — DB schema, command-surface stub, env wiring.
+Phase 1: Amadeus flights lane — OAuth2, Cheapest Date Search (triage), Offers Search (confirm).
 """
 
 from __future__ import annotations
@@ -22,7 +22,10 @@ import os
 import sqlite3
 import subprocess
 import sys
-from datetime import UTC, datetime, timedelta
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -208,16 +211,260 @@ def _parse_args(args: list[str]) -> dict[str, list[str] | str]:
 
 
 # ---------------------------------------------------------------------------
-# Lane stubs (Phase 1–3 will replace these)
+# Amadeus helpers (Phase 1)
+# ---------------------------------------------------------------------------
+
+# Module-level token cache — valid for one process lifetime (~30 min TTL is fine
+# since a check run completes in well under that).
+_amadeus_token_cache: dict[str, str | float] = {}
+
+_AMADEUS_BASE = "https://api.amadeus.com"
+
+
+def _amadeus_token() -> str:
+    """Fetch or return cached Amadeus OAuth2 bearer token."""
+    cached = _amadeus_token_cache.get("token")
+    if cached:
+        return str(cached)
+
+    client_id = os.environ.get("AMADEUS_CLIENT_ID", "")
+    client_secret = os.environ.get("AMADEUS_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        raise RuntimeError("AMADEUS_CLIENT_ID / AMADEUS_CLIENT_SECRET not set")
+
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"{_AMADEUS_BASE}/v1/security/oauth2/token",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read())
+
+    token = data.get("access_token", "")
+    if not token:
+        raise RuntimeError(f"Amadeus token response missing access_token: {data}")
+    _amadeus_token_cache["token"] = token
+    return token
+
+
+def _amadeus_get(path: str, params: dict) -> dict:
+    """GET against the Amadeus production API with bearer auth."""
+    token = _amadeus_token()
+    url = f"{_AMADEUS_BASE}{path}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def _amadeus_cheapest_dates(
+    origin: str, destination: str, window_start: str, window_end: str
+) -> dict[str, float]:
+    """
+    Flight Cheapest Date Search — one call across the full window.
+    Returns {YYYY-MM-DD: round_trip_price_CAD} for departure dates in the window.
+    """
+    params = {
+        "origin": origin,
+        "destination": destination,
+        "departureDate": f"{window_start},{window_end}",
+        "currencyCode": "CAD",
+        "oneWay": "false",
+    }
+    data = _amadeus_get("/v1/shopping/flight-dates", params)
+    result: dict[str, float] = {}
+    for item in data.get("data", []):
+        dep_date = item.get("departureDate", "")
+        price = item.get("price", {}).get("total")
+        if dep_date and price is not None:
+            try:
+                result[dep_date] = float(price)
+            except (TypeError, ValueError):
+                pass
+    return result
+
+
+def _amadeus_flight_offers(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: str,
+    adults: int,
+    children: int,
+) -> list[dict]:
+    """
+    Flight Offers Search (live prices) for a single departure+return date pair.
+    Returns list of {price: float, carrier: str} sorted cheapest-first; max 3.
+    """
+    params: dict = {
+        "originLocationCode": origin,
+        "destinationLocationCode": destination,
+        "departureDate": departure_date,
+        "returnDate": return_date,
+        "adults": adults,
+        "currencyCode": "CAD",
+        "max": 3,
+    }
+    if children:
+        params["children"] = children
+    data = _amadeus_get("/v2/shopping/flight-offers", params)
+    offers = []
+    for offer in data.get("data", []):
+        try:
+            price = float(offer["price"]["grandTotal"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        carrier_codes = set()
+        for itin in offer.get("itineraries", []):
+            for seg in itin.get("segments", []):
+                c = seg.get("carrierCode", "")
+                if c:
+                    carrier_codes.add(c)
+        carrier = "/".join(sorted(carrier_codes)) or "unknown"
+        offers.append({"price": price, "carrier": carrier})
+    return sorted(offers, key=lambda x: x["price"])[:3]
+
+
+# ---------------------------------------------------------------------------
+# Lane — flights (Phase 1)
 # ---------------------------------------------------------------------------
 
 
-def _lane_flights(watch: dict) -> dict:
+def _lane_flights(watch: dict, conn: sqlite3.Connection | None = None) -> dict:
     """
-    Phase 1: Amadeus OAuth2 + Flight Cheapest Date Search + Offers Search.
-    Returns {lane: 'flight', status: 'unavailable', reason: 'not_implemented'}.
+    Amadeus flights lane.
+
+    Phase A (triage): Flight Cheapest Date Search → {date: price} map across the window.
+    Phase B (confirm): Flight Offers Search for the cheapest 1–3 candidate dates (live prices).
+
+    Cost rule: one cheapest-dates call (server-side sweep), then ≤3 offers calls.
+    Never loops all candidate dates with discrete calls.
     """
-    return {"lane": "flight", "status": "unavailable", "reason": "not_implemented"}
+    origin = watch["origin_iata"]
+    destination = watch["destination"]
+    window_start = watch["window_start"]
+    window_end = watch["window_end"]
+    stay_nights = int(watch["stay_nights"])
+    adults = int(watch.get("adults", 2))
+    children = int(watch.get("children", 0))
+    watch_id = watch.get("id")
+
+    # Confirm window boundary for valid departure dates:
+    # last valid departure = window_end - stay_nights (so return still falls in window)
+    try:
+        ws_date = date.fromisoformat(window_start)
+        we_date = date.fromisoformat(window_end)
+    except ValueError as exc:
+        return {"lane": "flight", "status": "unavailable", "reason": f"bad_dates: {exc}"}
+
+    last_dep = we_date - timedelta(days=stay_nights)
+    if last_dep < ws_date:
+        return {
+            "lane": "flight",
+            "status": "unavailable",
+            "reason": "window_too_short_for_stay",
+        }
+
+    # Phase A — triage
+    try:
+        triage = _amadeus_cheapest_dates(origin, destination, window_start, last_dep.isoformat())
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode(errors="replace")[:300]
+        except Exception:
+            pass
+        reason = f"amadeus_http_{exc.code}: {body}"
+        print(f"[travel-monitor] flights triage HTTP error: {reason}", file=sys.stderr)
+        return {"lane": "flight", "status": "unavailable", "reason": reason}
+    except Exception as exc:
+        reason = f"amadeus_error: {exc}"
+        print(f"[travel-monitor] flights triage error: {exc}", file=sys.stderr)
+        return {"lane": "flight", "status": "unavailable", "reason": reason}
+
+    if not triage:
+        return {"lane": "flight", "status": "unavailable", "reason": "no_triage_results"}
+
+    # Pick up to 3 cheapest candidate departure dates
+    candidates = sorted(triage.items(), key=lambda kv: kv[1])[:3]
+
+    # Phase B — confirm each candidate with live offers
+    checked_at = _now_utc().isoformat()
+    results: list[dict] = []
+
+    for dep_str, triage_price in candidates:
+        try:
+            dep_d = date.fromisoformat(dep_str)
+        except ValueError:
+            continue
+        ret_d = dep_d + timedelta(days=stay_nights)
+        try:
+            offers = _amadeus_flight_offers(
+                origin, destination, dep_str, ret_d.isoformat(), adults, children
+            )
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode(errors="replace")[:200]
+            except Exception:
+                pass
+            print(
+                f"[travel-monitor] offers HTTP error for {dep_str}: {exc.code} {body}",
+                file=sys.stderr,
+            )
+            continue
+        except Exception as exc:
+            print(f"[travel-monitor] offers error for {dep_str}: {exc}", file=sys.stderr)
+            continue
+
+        if not offers:
+            continue
+
+        best = offers[0]
+        row = {
+            "checkin": dep_str,
+            "checkout": ret_d.isoformat(),
+            "price": best["price"],
+            "carrier": best["carrier"],
+            "triage_price": triage_price,
+        }
+        results.append(row)
+
+        # Persist to travel_price_history if conn provided (scheduled check run)
+        if conn is not None and watch_id is not None:
+            conn.execute(
+                """INSERT INTO travel_price_history
+                   (watch_id, checked_at, lane, best_price, currency, checkin, checkout,
+                    provider, raw, method)
+                   VALUES (?, ?, 'flight', ?, 'CAD', ?, ?, ?, ?, 'amadeus_offers')""",
+                (
+                    watch_id,
+                    checked_at,
+                    best["price"],
+                    dep_str,
+                    ret_d.isoformat(),
+                    best["carrier"],
+                    json.dumps(offers),
+                ),
+            )
+
+    if conn is not None:
+        try:
+            conn.commit()
+        except Exception as exc:
+            print(f"[travel-monitor] flights DB commit error: {exc}", file=sys.stderr)
+
+    if not results:
+        return {"lane": "flight", "status": "unavailable", "reason": "no_offers_returned"}
+
+    return {"lane": "flight", "status": "ok", "results": results}
 
 
 def _lane_hotels(watch: dict) -> dict:
@@ -620,7 +867,7 @@ def cmd_check(args: list[str]) -> None:
     Scheduled run: scan active watches, run lanes, reconcile, detect deals.
     Silent unless a deal or health alert fires.
 
-    Phase 0: stub — loads watches, logs lane stubs, posts nothing (no real data yet).
+    Phase 1: flights lane live via Amadeus; hotels+packages still stubbed.
     """
     conn = _init_db()
     try:
@@ -681,23 +928,32 @@ def cmd_check(args: list[str]) -> None:
             "package_operators": operators,
         }
 
-        lane_results: list[dict] = [_lane_flights(watch_stub)]
-        if hotel_targets:
-            lane_results.append(_lane_hotels(watch_stub))
-        for op in operators:
-            lane_results.append(_lane_packages(watch_stub, op))
+        conn = _init_db()
+        try:
+            lane_results: list[dict] = [_lane_flights(watch_stub, conn)]
+            if hotel_targets:
+                lane_results.append(_lane_hotels(watch_stub))
+            for op in operators:
+                lane_results.append(_lane_packages(watch_stub, op))
 
-        for result in lane_results:
-            lane = result.get("lane", "unknown")
-            status = result.get("status", "unknown")
-            reason = result.get("reason", "")
-            print(
-                f"[travel-monitor] watch={watch_id} name={name!r} lane={lane} status={status}"
-                + (f" reason={reason}" if reason else ""),
-                file=sys.stderr,
-            )
+            for result in lane_results:
+                lane = result.get("lane", "unknown")
+                status = result.get("status", "unknown")
+                reason = result.get("reason", "")
+                if status == "unavailable" and reason != "not_implemented":
+                    alert = (
+                        f":warning: **travel-monitor health** | watch={watch_id} `{name}` | "
+                        f"lane={lane} unavailable — {reason}"
+                    )
+                    _discord_post(alert)
+                print(
+                    f"[travel-monitor] watch={watch_id} name={name!r} lane={lane} status={status}"
+                    + (f" reason={reason}" if reason else ""),
+                    file=sys.stderr,
+                )
+        finally:
+            conn.close()
 
-        # Phase 0: no real data — skip reconciliation and deal detection
         # Phase 4 will join flight + hotel results here and run _detect_deal()
 
 

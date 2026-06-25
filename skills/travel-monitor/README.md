@@ -97,7 +97,7 @@ hotel/package sites far more aggressively than retail.
 ## Phasing
 
 - **Phase 0** ✅ — Scaffold: skill dir, schema, command-surface stub, env wiring
-- **Phase 1** — Flights lane: Amadeus OAuth + Cheapest Date Search + Offers Search
+- **Phase 1** ✅ — Flights lane: Amadeus OAuth + Cheapest Date Search + Offers Search
 - **Phase 2** — Hotels lane: Firecrawl scrape, named property, by-provider + date calendar
 - **Phase 3** — Packages lane: Firecrawl per operator (wire one at a time)
 - **Phase 4** — Reconciliation + deal detection + Discord alert
