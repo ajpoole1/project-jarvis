@@ -13,6 +13,7 @@ Stdlib only; no virtualenv needed.
 
 Phase 0: scaffold — DB schema, command-surface stub, env wiring.
 Phase 1: Amadeus flights lane — OAuth2, Cheapest Date Search (triage), Offers Search (confirm).
+Phase 2: Hotels lane — Firecrawl JSON-extract of Google Hotels price calendar per named property.
 """
 
 from __future__ import annotations
@@ -219,6 +220,7 @@ def _parse_args(args: list[str]) -> dict[str, list[str] | str]:
 _amadeus_token_cache: dict[str, str | float] = {}
 
 _AMADEUS_BASE = "https://api.amadeus.com"
+_FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape"
 
 
 def _amadeus_token() -> str:
@@ -467,12 +469,236 @@ def _lane_flights(watch: dict, conn: sqlite3.Connection | None = None) -> dict:
     return {"lane": "flight", "status": "ok", "results": results}
 
 
-def _lane_hotels(watch: dict) -> dict:
+# ---------------------------------------------------------------------------
+# Firecrawl helper (Phase 2+)
+# ---------------------------------------------------------------------------
+
+
+def _firecrawl_extract(url: str, schema: dict, prompt: str) -> tuple[dict | None, str | None]:
     """
-    Phase 2: Firecrawl scrape of named property by-provider + date-calendar view.
-    Returns {lane: 'hotel', status: 'unavailable', reason: 'not_implemented'}.
+    Firecrawl JSON extraction (stealth + JS rendering + LLM schema parse).
+    ~5–9 credits per call. Returns (extracted_dict, None) or (None, error_type).
+
+    error_type values: 'no_key', 'quota', 'rate_limit', 'parse_error', 'error'
     """
-    return {"lane": "hotel", "status": "unavailable", "reason": "not_implemented"}
+    api_key = os.environ.get("FIRECRAWL_API_KEY", "")
+    if not api_key:
+        return None, "no_key"
+
+    payload = json.dumps(
+        {
+            "url": url,
+            "formats": ["extract"],
+            "extract": {"schema": schema, "prompt": prompt},
+        }
+    ).encode()
+    req = urllib.request.Request(
+        _FIRECRAWL_SCRAPE_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+            if "credit" in body.lower() or "quota" in body.lower():
+                return None, "quota"
+        except Exception:
+            pass
+        if exc.code == 402:
+            return None, "quota"
+        if exc.code == 429:
+            return None, "rate_limit"
+        print(f"[travel-monitor] firecrawl HTTP {exc.code}: {body[:200]}", file=sys.stderr)
+        return None, "error"
+    except Exception as exc:
+        print(f"[travel-monitor] firecrawl error: {exc}", file=sys.stderr)
+        return None, "error"
+
+    if not data.get("success"):
+        err = data.get("error", "unknown")
+        print(f"[travel-monitor] firecrawl success=false: {err}", file=sys.stderr)
+        return None, "error"
+
+    extracted = (data.get("data") or {}).get("extract")
+    if not isinstance(extracted, dict):
+        return None, "parse_error"
+
+    return extracted, None
+
+
+# ---------------------------------------------------------------------------
+# Lane — hotels (Phase 2)
+# ---------------------------------------------------------------------------
+
+# Google Hotels URL: search for a named property with a date range.
+# The page renders a price calendar covering the window server-side.
+# One scrape per property per run (cost rule).
+_GOOGLE_HOTELS_SEARCH = "https://www.google.com/travel/hotels"
+
+_HOTEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "hotel_name": {"type": "string"},
+        "stays": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "checkin": {"type": "string", "description": "YYYY-MM-DD"},
+                    "checkout": {"type": "string", "description": "YYYY-MM-DD"},
+                    "price_total": {
+                        "type": "number",
+                        "description": "Total price in CAD for the stay",
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "Booking provider name, e.g. Booking.com",
+                    },
+                },
+                "required": ["checkin", "checkout", "price_total"],
+            },
+        },
+    },
+    "required": ["stays"],
+}
+
+_HOTEL_PROMPT = (
+    "Extract all available hotel stay options shown on this page. "
+    "For each available check-in date shown in the price calendar, extract: "
+    "the check-in date (YYYY-MM-DD), checkout date (YYYY-MM-DD), "
+    "the lowest total price shown in CAD, and the cheapest provider name. "
+    "Include only dates that have a price shown. "
+    "All prices must be in CAD — if shown in another currency, convert or skip."
+)
+
+
+def _google_hotels_url(
+    hotel_name: str, window_start: str, window_end: str, stay_nights: int
+) -> str:
+    """Build a Google Hotels search URL for a named property with date range."""
+    params = urllib.parse.urlencode(
+        {
+            "q": hotel_name,
+            "dates": f"{window_start},{window_end}",
+            "nights": stay_nights,
+            "curr": "CAD",
+        }
+    )
+    return f"{_GOOGLE_HOTELS_SEARCH}?{params}"
+
+
+def _lane_hotels(watch: dict, conn: sqlite3.Connection | None = None) -> dict:
+    """
+    Hotels lane: Firecrawl JSON-extract of Google Hotels for each named property.
+
+    One scrape call per hotel_target per run (server-side date calendar covers the
+    full window — no per-date looping). One retry on parse_error.
+
+    Returns {lane: 'hotel', status: 'ok', results: [{hotel, checkin, checkout, price, provider}]}
+    or {status: 'unavailable', reason: '...'} on failure.
+    """
+    hotel_targets: list[str] = watch.get("hotel_targets", [])
+    if not hotel_targets:
+        return {"lane": "hotel", "status": "unavailable", "reason": "no_hotel_targets"}
+
+    window_start = watch["window_start"]
+    window_end = watch["window_end"]
+    stay_nights = int(watch["stay_nights"])
+    watch_id = watch.get("id")
+    checked_at = _now_utc().isoformat()
+
+    all_results: list[dict] = []
+    any_failure = False
+
+    for hotel_name in hotel_targets:
+        url = _google_hotels_url(hotel_name, window_start, window_end, stay_nights)
+
+        extracted, err = _firecrawl_extract(url, _HOTEL_SCHEMA, _HOTEL_PROMPT)
+
+        # One retry on parse error (page may have rendered partially)
+        if err == "parse_error":
+            print(
+                f"[travel-monitor] hotels parse_error for {hotel_name!r}, retrying",
+                file=sys.stderr,
+            )
+            extracted, err = _firecrawl_extract(url, _HOTEL_SCHEMA, _HOTEL_PROMPT)
+
+        if err or extracted is None:
+            print(
+                f"[travel-monitor] hotels lane failed for {hotel_name!r}: {err}",
+                file=sys.stderr,
+            )
+            any_failure = True
+            continue
+
+        stays = extracted.get("stays", [])
+        if not stays:
+            print(
+                f"[travel-monitor] hotels: no stays extracted for {hotel_name!r}",
+                file=sys.stderr,
+            )
+            any_failure = True
+            continue
+
+        for stay in stays:
+            checkin = stay.get("checkin", "")
+            checkout = stay.get("checkout", "")
+            price_raw = stay.get("price_total")
+            provider = stay.get("provider", "")
+
+            if not checkin or not checkout or price_raw is None:
+                continue
+            try:
+                price = float(price_raw)
+            except (TypeError, ValueError):
+                continue
+
+            row = {
+                "hotel": hotel_name,
+                "checkin": checkin,
+                "checkout": checkout,
+                "price": price,
+                "provider": provider,
+            }
+            all_results.append(row)
+
+            if conn is not None and watch_id is not None:
+                conn.execute(
+                    """INSERT INTO travel_price_history
+                       (watch_id, checked_at, lane, best_price, currency, checkin, checkout,
+                        provider, raw, method)
+                       VALUES (?, ?, 'hotel', ?, 'CAD', ?, ?, ?, ?, 'firecrawl_extract')""",
+                    (
+                        watch_id,
+                        checked_at,
+                        price,
+                        checkin,
+                        checkout,
+                        f"{hotel_name} / {provider}".strip(" /"),
+                        json.dumps(stay),
+                    ),
+                )
+
+    if conn is not None and watch_id is not None:
+        try:
+            conn.commit()
+        except Exception as exc:
+            print(f"[travel-monitor] hotels DB commit error: {exc}", file=sys.stderr)
+
+    if not all_results:
+        reason = "scrape_failed" if any_failure else "no_stays_extracted"
+        return {"lane": "hotel", "status": "unavailable", "reason": reason}
+
+    return {"lane": "hotel", "status": "ok", "results": all_results}
 
 
 def _lane_packages(watch: dict, operator: str) -> dict:
@@ -932,7 +1158,7 @@ def cmd_check(args: list[str]) -> None:
         try:
             lane_results: list[dict] = [_lane_flights(watch_stub, conn)]
             if hotel_targets:
-                lane_results.append(_lane_hotels(watch_stub))
+                lane_results.append(_lane_hotels(watch_stub, conn))
             for op in operators:
                 lane_results.append(_lane_packages(watch_stub, op))
 
