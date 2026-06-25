@@ -1,0 +1,3 @@
+# No virtualenv needed — stdlib only (urllib, json, sqlite3, re, os, sys, pathlib, datetime)
+# Amadeus = REST + OAuth2 over urllib
+# Firecrawl = HTTP API over urllib (never the CLI)
