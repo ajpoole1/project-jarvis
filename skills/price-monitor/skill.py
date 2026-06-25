@@ -79,9 +79,15 @@ def _init_db() -> sqlite3.Connection:
             fail_count    INTEGER NOT NULL DEFAULT 0,
             active_from   TEXT,
             active_until  TEXT,
-            created_at    TEXT NOT NULL
+            created_at    TEXT NOT NULL,
+            deal_drop_pct REAL
         )
     """)
+    try:
+        conn.execute("ALTER TABLE price_watches ADD COLUMN deal_drop_pct REAL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS price_history (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -577,8 +583,14 @@ def _detect_deal(
     current_price: float,
     target_price: float | None,
     inserted_at: str,
+    deal_drop_pct: float | None = None,
 ) -> str | None:
-    """Return a human-readable deal reason, or None."""
+    """Return a human-readable deal reason, or None.
+
+    deal_drop_pct: per-watch override; falls back to global DEAL_DROP_PCT when None.
+    """
+    effective_drop_pct = deal_drop_pct if deal_drop_pct is not None else DEAL_DROP_PCT
+
     # 1. Target price hit
     if target_price is not None and current_price <= target_price:
         return f"at or below target ${target_price:.2f}"
@@ -596,11 +608,11 @@ def _detect_deal(
     if len(prior_prices) < 2:
         return None  # not enough history for statistical checks
 
-    # 2. Drop ≥ DEAL_DROP_PCT% from trailing median
+    # 2. Drop ≥ effective_drop_pct% from trailing median
     median_price = _median(prior_prices[:N_MEDIAN])
     if median_price > 0:
         drop_pct = (median_price - current_price) / median_price * 100
-        if drop_pct >= DEAL_DROP_PCT:
+        if drop_pct >= effective_drop_pct:
             return f"{drop_pct:.0f}% below {len(prior_prices)}-reading median ${median_price:.2f}"
 
     # 3. N-day low — is current price below every prior reading in the window?
@@ -647,6 +659,16 @@ def cmd_add(args: list[str]) -> None:
             print("Error: --target-price must be a number", file=sys.stderr)
             sys.exit(1)
 
+    deal_drop_pct: float | None = None
+    if "deal_drop_pct" in params:
+        try:
+            deal_drop_pct = float(params["deal_drop_pct"])
+            if deal_drop_pct <= 0:
+                raise ValueError
+        except ValueError:
+            print("Error: --deal-drop-pct must be a positive number", file=sys.stderr)
+            sys.exit(1)
+
     active_from = params.get("active_from") or None
     active_until = params.get("active_until") or None
 
@@ -677,8 +699,9 @@ def cmd_add(args: list[str]) -> None:
         cur = conn.execute(
             """INSERT INTO price_watches
                (name, url, vendor, target_price, currency, last_price, last_checked,
-                parse_method, status, fail_count, active_from, active_until, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)""",
+                parse_method, status, fail_count, active_from, active_until, created_at,
+                deal_drop_pct)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?)""",
             (
                 name,
                 url,
@@ -691,6 +714,7 @@ def cmd_add(args: list[str]) -> None:
                 active_from,
                 active_until,
                 now_iso,
+                deal_drop_pct,
             ),
         )
         watch_id = cur.lastrowid
@@ -704,6 +728,8 @@ def cmd_add(args: list[str]) -> None:
         msg = f"Tracking — ${price:.2f}{currency_str} via {method}, I'll alert on drops."
         if target_price is not None:
             msg += f" Target: ${target_price:.2f}{currency_str}."
+        if deal_drop_pct is not None:
+            msg += f" Deal threshold: {deal_drop_pct:.0f}% (overrides global {DEAL_DROP_PCT:.0f}%)."
 
         print(
             json.dumps(
@@ -714,6 +740,7 @@ def cmd_add(args: list[str]) -> None:
                     "price": price,
                     "currency": currency,
                     "parse_method": method,
+                    "deal_drop_pct": deal_drop_pct,
                     "message": msg,
                 },
                 indent=2,
@@ -728,7 +755,8 @@ def cmd_list(args: list[str]) -> None:
     try:
         rows = conn.execute(
             """SELECT id, name, last_price, currency, last_checked,
-                      status, parse_method, active_from, active_until, target_price
+                      status, parse_method, active_from, active_until, target_price,
+                      deal_drop_pct
                FROM price_watches
                ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'degraded' THEN 1 ELSE 2 END, id ASC"""
         ).fetchall()
@@ -749,14 +777,25 @@ def cmd_list(args: list[str]) -> None:
         "Method",
         "Date Range",
         "Target",
+        "Drop%",
     ]
     col_widths = [len(h) for h in headers]
 
     table_rows: list[list[str]] = []
     for row in rows:
-        row_id, name, last_price, currency, last_checked, status, method, afrom, auntil, target = (
-            row
-        )
+        (
+            row_id,
+            name,
+            last_price,
+            currency,
+            last_checked,
+            status,
+            method,
+            afrom,
+            auntil,
+            target,
+            ddp,
+        ) = row
 
         price_str = f"${last_price:.2f}" if last_price is not None else "—"
         cur_str = currency or "—"
@@ -775,6 +814,7 @@ def cmd_list(args: list[str]) -> None:
             date_range = "—"
 
         target_str = f"${target:.2f}" if target is not None else "—"
+        ddp_str = f"{ddp:.0f}%" if ddp is not None else f"({DEAL_DROP_PCT:.0f}%)"
         name_trunc = name[:32] if len(name) > 32 else name
 
         r = [
@@ -787,6 +827,7 @@ def cmd_list(args: list[str]) -> None:
             method or "—",
             date_range,
             target_str,
+            ddp_str,
         ]
         table_rows.append(r)
         for i, cell in enumerate(r):
@@ -845,13 +886,77 @@ def cmd_resolve(args: list[str]) -> None:
         conn.close()
 
 
+def cmd_set(args: list[str]) -> None:
+    """Adjust per-watch settings on an existing watch. Currently supports --deal-drop-pct."""
+    params: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        if args[i].startswith("--") and i + 1 < len(args):
+            params[args[i][2:].replace("-", "_")] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    if "id" not in params:
+        print("Error: --id is required", file=sys.stderr)
+        sys.exit(1)
+
+    watch_id = int(params["id"])
+
+    if "deal_drop_pct" not in params:
+        print("Error: nothing to set — supported options: --deal-drop-pct N", file=sys.stderr)
+        sys.exit(1)
+
+    raw = params["deal_drop_pct"]
+    if raw.lower() in ("none", "null", "reset"):
+        deal_drop_pct: float | None = None
+        label = f"global ({DEAL_DROP_PCT:.0f}%)"
+    else:
+        try:
+            deal_drop_pct = float(raw)
+            if deal_drop_pct <= 0:
+                raise ValueError
+            label = f"{deal_drop_pct:.0f}%"
+        except ValueError:
+            print(
+                "Error: --deal-drop-pct must be a positive number, or 'reset' to restore global",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    conn = _init_db()
+    try:
+        row = conn.execute("SELECT name FROM price_watches WHERE id = ?", (watch_id,)).fetchone()
+        if not row:
+            print(f"No watch with id={watch_id}", file=sys.stderr)
+            sys.exit(1)
+        conn.execute(
+            "UPDATE price_watches SET deal_drop_pct = ? WHERE id = ?",
+            (deal_drop_pct, watch_id),
+        )
+        conn.commit()
+        print(
+            json.dumps(
+                {
+                    "id": watch_id,
+                    "name": row[0],
+                    "deal_drop_pct": deal_drop_pct,
+                    "message": f"Watch #{watch_id} ({row[0]}): deal threshold set to {label}.",
+                },
+                indent=2,
+            )
+        )
+    finally:
+        conn.close()
+
+
 def cmd_check(args: list[str]) -> None:
     """Scheduled daily run: probe all active watches, detect deals, post to Discord."""
     conn = _init_db()
     try:
         watches = conn.execute(
             """SELECT id, name, url, target_price, currency, parse_method,
-                      fail_count, active_from, active_until
+                      fail_count, active_from, active_until, deal_drop_pct
                FROM price_watches WHERE status = 'active'"""
         ).fetchall()
     finally:
@@ -872,6 +977,7 @@ def cmd_check(args: list[str]) -> None:
         fail_count,
         active_from,
         active_until,
+        watch_deal_drop_pct,
     ) in watches:
         if not _is_in_window(active_from, active_until):
             continue
@@ -929,7 +1035,9 @@ def cmd_check(args: list[str]) -> None:
             )
             conn.commit()
 
-            deal_reason = _detect_deal(conn, watch_id, price, target_price, now_iso)
+            deal_reason = _detect_deal(
+                conn, watch_id, price, target_price, now_iso, watch_deal_drop_pct
+            )
             currency_label = f" {stored_currency}" if stored_currency else ""
 
             if deal_reason:
@@ -961,10 +1069,11 @@ def main() -> None:
         print(
             "Usage: skill.py <command> [args...]\n"
             "Commands:\n"
-            "  add --name N --url U [--target-price P]\n"
+            "  add --name N --url U [--target-price P] [--deal-drop-pct N]\n"
             "      [--active-from YYYY-MM-DD] [--active-until YYYY-MM-DD]\n"
             "  list\n"
             "  resolve --id N --action bought|passed\n"
+            "  set --id N --deal-drop-pct N|reset\n"
             "  check",
             file=sys.stderr,
         )
@@ -977,6 +1086,7 @@ def main() -> None:
         "add": cmd_add,
         "list": cmd_list,
         "resolve": cmd_resolve,
+        "set": cmd_set,
         "check": cmd_check,
     }
 
