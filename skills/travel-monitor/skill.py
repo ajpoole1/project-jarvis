@@ -14,6 +14,7 @@ Stdlib only; no virtualenv needed.
 Phase 0: scaffold — DB schema, command-surface stub, env wiring.
 Phase 1: Amadeus flights lane — OAuth2, Cheapest Date Search (triage), Offers Search (confirm).
 Phase 2: Hotels lane — Firecrawl JSON-extract of Google Hotels price calendar per named property.
+Phase 3: Packages lane — Firecrawl JSON-extract of operator flex-date search (costco/aircanada/westjet/expedia).
 """
 
 from __future__ import annotations
@@ -701,17 +702,248 @@ def _lane_hotels(watch: dict, conn: sqlite3.Connection | None = None) -> dict:
     return {"lane": "hotel", "status": "ok", "results": all_results}
 
 
-def _lane_packages(watch: dict, operator: str) -> dict:
+# ---------------------------------------------------------------------------
+# Lane — packages (Phase 3)
+# ---------------------------------------------------------------------------
+
+_PACKAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "packages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "checkin": {"type": "string", "description": "YYYY-MM-DD departure date"},
+                    "checkout": {"type": "string", "description": "YYYY-MM-DD return date"},
+                    "price_total": {
+                        "type": "number",
+                        "description": "Total package price in CAD for all travellers",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Brief description, e.g. hotel name or package title",
+                    },
+                },
+                "required": ["checkin", "checkout", "price_total"],
+            },
+        },
+    },
+    "required": ["packages"],
+}
+
+_PACKAGE_PROMPT = (
+    "Extract all vacation package options shown on this page for the destination and dates. "
+    "For each package listing extract: the departure/check-in date (YYYY-MM-DD), "
+    "return/check-out date (YYYY-MM-DD), the total package price in CAD for all travellers, "
+    "and a brief description (hotel name or package title). "
+    "Include only packages that have a price shown. "
+    "All prices must be in CAD — if shown in USD or another currency, convert or skip."
+)
+
+
+def _operator_url(
+    operator: str,
+    destination: str,
+    origin: str,
+    window_start: str,
+    window_end: str,
+    stay_nights: int,
+    adults: int,
+    children: int,
+) -> str | None:
+    """Return a flex-date search URL for the given operator, or None if unknown."""
+    dest_lc = destination.lower()
+    origin_lc = origin.lower()
+
+    if operator == "costco":
+        # Costco Travel CA vacation packages flex search
+        params = urllib.parse.urlencode(
+            {
+                "destinationCode": destination,
+                "originCode": origin,
+                "departureDate": window_start,
+                "returnDate": window_end,
+                "nights": stay_nights,
+                "adults": adults,
+                "children": children,
+                "flexible": "true",
+            }
+        )
+        return f"https://www.costcotravel.ca/vacation-packages/search?{params}"
+
+    if operator == "aircanada":
+        params = urllib.parse.urlencode(
+            {
+                "origin": origin_lc,
+                "destination": dest_lc,
+                "departureDate": window_start,
+                "returnDate": window_end,
+                "duration": stay_nights,
+                "adults": adults,
+                "children": children,
+                "flexible": "true",
+                "currency": "CAD",
+            }
+        )
+        return f"https://www.aircanadavacations.com/search?{params}"
+
+    if operator == "westjet":
+        params = urllib.parse.urlencode(
+            {
+                "from": origin_lc,
+                "to": dest_lc,
+                "departureDate": window_start,
+                "returnDate": window_end,
+                "duration": stay_nights,
+                "adults": adults,
+                "children": children,
+                "flexible": "true",
+                "currency": "CAD",
+            }
+        )
+        return f"https://www.westjetvacations.com/search?{params}"
+
+    if operator == "expedia":
+        params = urllib.parse.urlencode(
+            {
+                "destination": dest_lc,
+                "origin": origin_lc,
+                "startDate": window_start,
+                "endDate": window_end,
+                "duration": stay_nights,
+                "adults": adults,
+                "children": children,
+                "sort": "PRICE_LOW_TO_HIGH",
+                "currency": "CAD",
+            }
+        )
+        return f"https://www.expedia.ca/Vacation-Packages?{params}"
+
+    return None
+
+
+def _lane_packages(watch: dict, operator: str, conn: sqlite3.Connection | None = None) -> dict:
     """
-    Phase 3: Firecrawl scrape of operator flex-date search.
-    Returns {lane: 'package', operator: ..., status: 'unavailable', reason: 'not_implemented'}.
+    Packages lane: Firecrawl JSON-extract of each operator's flex-date vacation search.
+
+    One scrape per operator per run (operator search page returns results across the
+    full window server-side — cost rule maintained). One retry on parse_error.
+
+    Returns {lane: 'package', operator: str, status: 'ok', results: [...]}
+    or {status: 'unavailable', reason: '...'} on failure.
     """
-    return {
-        "lane": "package",
-        "operator": operator,
-        "status": "unavailable",
-        "reason": "not_implemented",
-    }
+    destination = watch["destination"]
+    origin = watch["origin_iata"]
+    window_start = watch["window_start"]
+    window_end = watch["window_end"]
+    stay_nights = int(watch["stay_nights"])
+    adults = int(watch.get("adults", 2))
+    children = int(watch.get("children", 0))
+    watch_id = watch.get("id")
+    checked_at = _now_utc().isoformat()
+
+    url = _operator_url(
+        operator, destination, origin, window_start, window_end, stay_nights, adults, children
+    )
+    if url is None:
+        return {
+            "lane": "package",
+            "operator": operator,
+            "status": "unavailable",
+            "reason": f"unknown_operator: {operator}",
+        }
+
+    extracted, err = _firecrawl_extract(url, _PACKAGE_SCHEMA, _PACKAGE_PROMPT)
+
+    # One retry on parse error
+    if err == "parse_error":
+        print(
+            f"[travel-monitor] packages parse_error for {operator!r}, retrying",
+            file=sys.stderr,
+        )
+        extracted, err = _firecrawl_extract(url, _PACKAGE_SCHEMA, _PACKAGE_PROMPT)
+
+    if err or extracted is None:
+        print(
+            f"[travel-monitor] packages lane failed for {operator!r}: {err}",
+            file=sys.stderr,
+        )
+        return {
+            "lane": "package",
+            "operator": operator,
+            "status": "unavailable",
+            "reason": err or "scrape_failed",
+        }
+
+    packages = extracted.get("packages", [])
+    if not packages:
+        print(
+            f"[travel-monitor] packages: no results extracted for {operator!r}",
+            file=sys.stderr,
+        )
+        return {
+            "lane": "package",
+            "operator": operator,
+            "status": "unavailable",
+            "reason": "no_packages_extracted",
+        }
+
+    results: list[dict] = []
+    for pkg in packages:
+        checkin = pkg.get("checkin", "")
+        checkout = pkg.get("checkout", "")
+        price_raw = pkg.get("price_total")
+        description = pkg.get("description", "")
+
+        if not checkin or not checkout or price_raw is None:
+            continue
+        try:
+            price = float(price_raw)
+        except (TypeError, ValueError):
+            continue
+
+        row = {
+            "operator": operator,
+            "checkin": checkin,
+            "checkout": checkout,
+            "price": price,
+            "description": description,
+        }
+        results.append(row)
+
+        if conn is not None and watch_id is not None:
+            conn.execute(
+                """INSERT INTO travel_price_history
+                   (watch_id, checked_at, lane, best_price, currency, checkin, checkout,
+                    provider, raw, method)
+                   VALUES (?, ?, 'package', ?, 'CAD', ?, ?, ?, ?, 'firecrawl_extract')""",
+                (
+                    watch_id,
+                    checked_at,
+                    price,
+                    checkin,
+                    checkout,
+                    operator,
+                    json.dumps(pkg),
+                ),
+            )
+
+    if conn is not None and watch_id is not None:
+        try:
+            conn.commit()
+        except Exception as exc:
+            print(f"[travel-monitor] packages DB commit error: {exc}", file=sys.stderr)
+
+    if not results:
+        return {
+            "lane": "package",
+            "operator": operator,
+            "status": "unavailable",
+            "reason": "no_valid_packages",
+        }
+
+    return {"lane": "package", "operator": operator, "status": "ok", "results": results}
 
 
 # ---------------------------------------------------------------------------
@@ -1160,7 +1392,7 @@ def cmd_check(args: list[str]) -> None:
             if hotel_targets:
                 lane_results.append(_lane_hotels(watch_stub, conn))
             for op in operators:
-                lane_results.append(_lane_packages(watch_stub, op))
+                lane_results.append(_lane_packages(watch_stub, op, conn))
 
             for result in lane_results:
                 lane = result.get("lane", "unknown")

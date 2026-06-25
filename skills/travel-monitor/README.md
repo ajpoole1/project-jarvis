@@ -99,7 +99,7 @@ hotel/package sites far more aggressively than retail.
 - **Phase 0** ✅ — Scaffold: skill dir, schema, command-surface stub, env wiring
 - **Phase 1** ✅ — Flights lane: Amadeus OAuth + Cheapest Date Search + Offers Search
 - **Phase 2** ✅ — Hotels lane: Firecrawl JSON-extract, Google Hotels, named property price calendar
-- **Phase 3** — Packages lane: Firecrawl per operator (wire one at a time)
+- **Phase 3** ✅ — Packages lane: Firecrawl JSON-extract per operator (costco, aircanada, westjet, expedia)
 - **Phase 4** — Reconciliation + deal detection + Discord alert
 - **Phase 5** — Health/degradation hardening + cadence escalation
 
