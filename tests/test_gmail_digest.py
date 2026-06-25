@@ -295,6 +295,37 @@ def test_cmd_digest_all_tier_buckets():
     assert "ARCHIVE" in result
 
 
+def test_cmd_digest_header_counts_act_aware_only():
+    """Header 'in inbox' count must be act+aware only; archive is reported separately."""
+    act_s = _make_summary("m1", "Alice", "keep")
+    act_s.tier = "act"
+    act_s.disposition = "inbox"
+    aware_s = _make_summary("m2", "Newsletter", "archive")
+    aware_s.tier = "aware"
+    aware_s.disposition = "file"
+    archive_a = _make_summary("m3", "Spammer", "archive")
+    archive_a.tier = "archive"
+    archive_a.disposition = "file"
+    archive_b = _make_summary("m4", "Promo", "archive")
+    archive_b.tier = "archive"
+    archive_b.disposition = "file"
+    summaries = [act_s, aware_s, archive_a, archive_b]
+    with (
+        patch.object(skill, "get_gmail_service", return_value=MagicMock()),
+        patch.object(skill, "init_db", return_value=MagicMock()),
+        patch.object(
+            skill, "fetch_inbox_messages", return_value=[{"id": s.msg_id} for s in summaries]
+        ),
+        patch.object(skill, "classify_emails", return_value=summaries),
+        patch.object(skill, "save_pending"),
+    ):
+        result = skill.cmd_digest()
+    # 1 act + 1 aware = 2 in inbox; 2 archive reported separately
+    assert "2 in inbox" in result
+    assert "2 to archive" in result
+    assert "4 emails in inbox" not in result  # old misleading total must be gone
+
+
 def test_cmd_heartbeat_no_digest_queue_writes():
     """Heartbeat must never call set_heartbeat_state with key 'digest_queue'."""
     con = _make_hb_db()
@@ -333,3 +364,46 @@ def test_cmd_heartbeat_no_digest_queue_writes():
     assert (
         "digest_queue" not in written_keys
     ), f"heartbeat must not write to digest_queue; keys written: {written_keys}"
+
+
+# ---------------------------------------------------------------------------
+# Bug fix — fetch_inbox_messages must not return archived category-tab mail
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_inbox_messages_uses_in_inbox_query():
+    """fetch_inbox_messages must query with q='in:inbox', not bare labelIds per category."""
+    mock_service = MagicMock()
+    mock_list = mock_service.users.return_value.messages.return_value.list
+    mock_list.return_value.execute.return_value = {"messages": []}
+
+    skill.fetch_inbox_messages(mock_service, batch_size=10)
+
+    call_kwargs = mock_list.call_args_list
+    assert call_kwargs, "messages().list() was never called"
+    for call in call_kwargs:
+        kwargs = call.kwargs if call.kwargs else call[1]
+        assert "in:inbox" in kwargs.get("q", ""), f"Expected q containing 'in:inbox', got: {kwargs}"
+        assert (
+            "labelIds" not in kwargs
+        ), f"fetch_inbox_messages must not pass bare labelIds; got: {kwargs}"
+
+
+def test_fetch_inbox_messages_archived_promo_not_returned():
+    """Archived promo messages (CATEGORY_PROMOTIONS but no INBOX) must not be staged."""
+    mock_service = MagicMock()
+    mock_list = mock_service.users.return_value.messages.return_value.list
+
+    def _list_side_effect(**kwargs):
+        mock_result = MagicMock()
+        if "in:inbox" in kwargs.get("q", ""):
+            mock_result.execute.return_value = {"messages": []}
+        else:
+            mock_result.execute.return_value = {"messages": [{"id": "archived-promo-123"}]}
+        return mock_result
+
+    mock_list.side_effect = _list_side_effect
+
+    result = skill.fetch_inbox_messages(mock_service, batch_size=10)
+    ids = [m["id"] for m in result]
+    assert "archived-promo-123" not in ids, "Archived promo message must not appear in inbox fetch"

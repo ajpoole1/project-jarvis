@@ -864,20 +864,17 @@ def _apply_keep_archive_policy(summaries: list[EmailSummary]) -> None:
 
 def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
     seen_ids: set[str] = set()
-    for label in INBOX_LABELS:
-        page_token = None
-        while len(seen_ids) < batch_size:
-            fetch = min(500, batch_size - len(seen_ids))
-            kwargs = {"userId": "me", "labelIds": [label], "maxResults": fetch}
-            if page_token:
-                kwargs["pageToken"] = page_token
-            result = service.users().messages().list(**kwargs).execute()
-            for m in result.get("messages", []):
-                seen_ids.add(m["id"])
-            page_token = result.get("nextPageToken")
-            if not page_token:
-                break
-        if len(seen_ids) >= batch_size:
+    page_token = None
+    while len(seen_ids) < batch_size:
+        fetch = min(500, batch_size - len(seen_ids))
+        kwargs = {"userId": "me", "q": "in:inbox", "maxResults": fetch}
+        if page_token:
+            kwargs["pageToken"] = page_token
+        result = service.users().messages().list(**kwargs).execute()
+        for m in result.get("messages", []):
+            seen_ids.add(m["id"])
+        page_token = result.get("nextPageToken")
+        if not page_token:
             break
     messages = []
     for msg_id in list(seen_ids)[:batch_size]:
@@ -898,11 +895,7 @@ def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
 
 def fetch_new_messages(service, since_epoch: int | None, batch_size: int) -> list[dict]:
     """Fetch inbox messages newer than since_epoch (Unix seconds). No filter if None."""
-    label_clause = " ".join(
-        f"label:{lbl.lower().replace('_', '-')}" if lbl != "INBOX" else "in:inbox"
-        for lbl in INBOX_LABELS
-    )
-    query = f"{{{label_clause}}}"
+    query = "in:inbox"
     if since_epoch:
         query += f" after:{since_epoch}"
     seen_ids: set[str] = set()
@@ -2268,8 +2261,7 @@ def cmd_digest() -> str:
     aware = [s for s in summaries if s.tier == "aware"]
     archive = [s for s in summaries if s.tier == "archive"]
 
-    total = len(summaries)
-    lines = [f"**Gmail digest** ({total} emails in inbox)\n"]
+    lines = [f"**Gmail digest** ({len(act) + len(aware)} in inbox · {len(archive)} to archive)\n"]
 
     if act:
         lines.append(f"**ACT — inbox ({len(act)})**")
