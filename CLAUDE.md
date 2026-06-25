@@ -28,7 +28,7 @@ Private repo. Personal data and knowledge live here. Logic and personal state ar
 
 - **SQLite is the shared memory layer.** Skills query it on demand. It is never preloaded into Claude context.
 - **Two-root knowledge model.** `knowledge/` (committed) holds generic reference content (garden, recipes, preferences, projects). `~/.jarvis/knowledge/` (private, local-only, 700/600 perms, WSL2 home ext4) holds personal/people/home content. Agent reads both on demand (lazy RAG); writes route via the knowledge skill using `TIERS.md` domain mapping. See `knowledge/KNOWLEDGE.md` and `knowledge/TIERS.md` for full schema. FTS5 index rebuilt on each search call; no embeddings; no ingest-pdf. Both roots are agent-writable for `*.md` only — see Write Boundary section below.
-- **Python for all skill logic.** One virtualenv per skill for skills with third-party dependencies. Stdlib-only skills (`followups`, `schedules`, `knowledge`, `price-monitor`) are intentionally venv-free — their `requirements.txt` documents this explicitly. The dispatcher auto-selects `skills/<name>/.venv/bin/python` if present, falling back to system `python3` for stdlib-only skills. OpenClaw shells out to Python.
+- **Python for all skill logic.** One virtualenv per skill for skills with third-party dependencies. Stdlib-only skills (`followups`, `schedules`, `knowledge`) are intentionally venv-free — their `requirements.txt` documents this explicitly. The dispatcher auto-selects `skills/<name>/.venv/bin/python` if present, falling back to system `python3` for stdlib-only skills. OpenClaw shells out to Python.
 - **Home Assistant is the smart home API.** One skill controls all devices. Never bypass HA to talk to devices directly. HA runs natively in WSL2 (Python venv at `/srv/homeassistant`), not in Docker.
 - **VPS + Pi hybrid is Phase 4+.** Current setup is PC-only. Zigbee, Pi, and garden irrigation are 2027 scope.
 
@@ -59,7 +59,7 @@ Every skill lives in `/skills/<skill-name>/`:
 
 **Scheduling:**
 - **One cron surface — single line.** The crontab has exactly one job: `*/10 7-23 * * *  cron_followups.sh`. Everything runs through the `schedules` skill dispatcher. Jarvis proposes jobs (`schedules propose`); AJ approves; the heartbeat dispatches them. Jarvis never writes crontab. Never create ad-hoc crons for user tasks.
-- **Current approved schedules (in `jarvis.db`):** gmail-cleanup heartbeat (10m), gmail-cleanup digest (daily@13:00 + daily@18:00), morning-briefing (daily@07:00). All dispatched by the single heartbeat tick.
+- **Current approved schedules (in `jarvis.db`):** gmail-cleanup heartbeat (10m), gmail-cleanup digest (daily@13:00 + daily@18:00), morning-briefing (daily@07:00), gmail-cleanup ledger (daily@12:00). Authoritative list is always `jarvis.db`; this is a snapshot only.
 - **Dispatcher Discord routing:** the dispatcher forwards any non-empty skill stdout to Discord. Skills that need multi-part posting (e.g. morning-briefing with its 3-message split) post to Discord themselves via a `_post_discord()` subprocess helper — they produce no stdout. Error alerts (non-zero exit, skill-not-found, timeout) are always posted by the dispatcher regardless.
 - **Heartbeat liveness:** the dispatcher writes `last_tick` to a `heartbeat` SQLite table on every tick and posts a Discord alert if the gap exceeds 30 min (catches outages and WSL restarts).
 - If a needed skill doesn't exist, say so and flag it as a coding task — do not improvise with a cron or a shell command.
@@ -147,7 +147,24 @@ jarvis/
 │   ├── knowledge/             ← FTS5 search + conversational capture loop
 │   ├── tasks/                 ← Deadline tracking
 │   ├── followups/             ← Active follow-ups + anti-nag engine
-│   └── price-monitor/         ← Free price watcher (Shopify/JSON-LD/OG, stdlib only)
+│   ├── price-monitor/         ← Price watcher (Shopify/JSON-LD/OG + Firecrawl cascade)
+│   ├── schedules/             ← Agent-safe job scheduler; Jarvis proposes, AJ approves
+│   ├── finance/               ← Personal CFO — accounts, transfers, salience alerts
+│   ├── travel-monitor/        ← Flexible-date travel-cost tracker (flights + hotels + packages)
+│   ├── gateway-watchdog/      ← OpenClaw RSS memory alert (Discord at 1.5GB threshold)
+│   ├── grocery/               ← Conversational shopping list backed by SQLite
+│   ├── media/                 ← Watched-media store; filter seen from candidate lists
+│   ├── reminder/              ← Prints a free-text message via schedules dispatcher
+│   ├── devloop/               ← Dev-loop state narration for dev-crew standup
+│   ├── devqueue/              ← Transports dev-notes queue items to dev-queue branch
+│   └── summon/                ← Launches named builder sessions via claude remote-control
+├── scripts/
+│   ├── cron_followups.sh      ← Single cron entry point (runs every 10 min, 7-23h)
+│   ├── cron_nightly_checkpoint.sh ← Nightly 4am gateway checkpoint-restart
+│   ├── nightly_checkpoint.py  ← Checkpoint-restart orchestrator
+│   ├── build_manifest.py      ← Generates KNOWLEDGE_MANIFEST.md for workspace injection
+│   ├── discord_post.py        ← Stdlib Discord webhook poster (line-aware chunking)
+│   └── dev-loop/              ← Tom QA helpers, dev-loop tooling
 ├── knowledge/                 ← committed root (no real PII)
 │   ├── KNOWLEDGE.md           ← index and schema reference
 │   ├── TIERS.md               ← domain tier manifest (committed, not sensitive)
@@ -156,6 +173,8 @@ jarvis/
 │   ├── preferences/           ← generic preferences (voice, food, media — no PII)
 │   ├── projects/              ← Altaforma, Bolas
 │   ├── dev-crew/              ← dev-loop docs: roster, Jarvis memory system, OpenClaw recovery
+│   ├── dev-notes/             ← spec queue and dev session notes
+│   ├── parked/                ← parked research (promote-then-delete lifecycle)
 │   └── examples/              ← fake-data schema placeholders for private domains
 ├── config/
 │   ├── personal/              ← gitignored, all personal config here
@@ -164,9 +183,13 @@ jarvis/
 ├── logs/                      ← gitignored
 └── .github/
     └── workflows/
-        ├── security.yml       ← TruffleHog + gitleaks
-        ├── quality.yml        ← Ruff + pytest
-        └── docker.yml         ← compose validation
+        ├── security.yml       ← TruffleHog + gitleaks (CI gate)
+        ├── quality.yml        ← Ruff + pytest (CI gate)
+        ├── docker.yml         ← compose validation (CI gate)
+        ├── qa.yml             ← Tom QA (Gemini code review on PRs)
+        ├── qa-caller.yml      ← Tom QA dispatch helper
+        ├── merged.yml         ← post-merge hooks
+        └── dev-queue.yml      ← dev-queue branch automation
 ```
 
 ---
@@ -177,7 +200,7 @@ jarvis/
 |---|---|---|
 | Phase 1 | ✅ Done | Foundation — OpenClaw, Discord, first voice note |
 | Phase 2 | ✅ Done | Core integrations — HA (fan + LocalTuya LAN + Lorex cameras), Gmail, Calendar. Google Home + Spotify deferred. |
-| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, schedule registry ✅, price monitor (Firecrawl fetch layer) ✅, scheduler firing fix + single cron line + health signals ✅, briefing overhaul (BriefBlock model + news radar + reads coda + interests.md) ✅. Write-boundary hardening ✅. Job search deferred. |
+| Phase 3 | 🔄 In progress | Agentic skills — Gmail cleanup ✅, morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, schedule registry ✅, price monitor (Firecrawl + per-watch thresholds) ✅, scheduler firing fix + single cron line + health signals ✅, briefing overhaul (BriefBlock model + news radar + reads coda + interests.md) ✅, write-boundary hardening ✅, memory architecture redesign (dual-root + compaction rescue) ✅, Gmail intent-keyed redesign (tier/disposition/autonomy gating) ✅, nightly checkpoint-restart orchestrator ✅, travel-monitor (flights + hotels + packages) ✅, gateway-watchdog ✅, finance skill ✅, grocery skill ✅, media skill ✅. Job search deferred. |
 | Phase 4 | 🔲 Deferred | VPS migration + Pi deployment — deferred until Android app is ready and security is properly tested. Jarvis stays local-only until then. |
 | Phase 5 | 🔲 Not started | Jarvis Android app (Flutter, sideloaded APK) |
 
@@ -187,13 +210,17 @@ Update this table as phases complete. Use: 🔲 Not started / 🔄 In progress /
 
 ## CI/CD Pipeline
 
-Three GitHub Actions workflows — all must pass before merging to `main`:
+Three workflows gate merges to `main`; four additional workflows support the dev loop:
 
-| Workflow | File | Tools |
+| Workflow | File | Role |
 |---|---|---|
-| Security scan | `security.yml` | TruffleHog (full history) + gitleaks |
-| Python quality | `quality.yml` | Ruff + pytest (Python 3.11 + 3.12 matrix) |
-| Docker validation | `docker.yml` | `docker compose config` with `.env.example` |
+| Security scan | `security.yml` | TruffleHog (full history) + gitleaks — **CI gate** |
+| Python quality | `quality.yml` | Ruff + pytest (Python 3.11 + 3.12 matrix) — **CI gate** |
+| Docker validation | `docker.yml` | `docker compose config` with `.env.example` — **CI gate** |
+| Tom QA | `qa.yml` | Gemini code review on every PR; posts findings to Discord |
+| Tom QA caller | `qa-caller.yml` | Dispatch helper for Tom QA |
+| Post-merge hooks | `merged.yml` | Fires after merge to main |
+| Dev-queue | `dev-queue.yml` | Dev-queue branch automation |
 
 Branch strategy: `feature/skill-name` → `develop` → `main` (protected)
 
@@ -213,7 +240,7 @@ Branch strategy: `feature/skill-name` → `develop` → `main` (protected)
 
 ### HA architecture
 
-HA Core 2025.1.4 runs as a systemd service in WSL2 (`/srv/homeassistant` venv, Python 3.12). Config at `/home/ajpoole/.homeassistant/`. WSL2 mirrored networking (`~/.wslconfig`) gives HA direct LAN access — required for LocalTuya UDP discovery.
+HA Core runs as a systemd service in WSL2 (`/srv/homeassistant` venv, Python 3.12). Config at `/home/ajpoole/.homeassistant/`. WSL2 mirrored networking (`~/.wslconfig`) gives HA direct LAN access — required for LocalTuya UDP discovery.
 
 **Fan:** LocalTuya 2025.11.0 (xZetsubou fork) over protocol 3.5. Full local control — mode, speed, temp, child lock, display.
 
