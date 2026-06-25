@@ -291,12 +291,20 @@ def init_db():
             tag             TEXT NOT NULL DEFAULT 'none',
             reason          TEXT,
             staged_at       TEXT DEFAULT (datetime('now')),
-            label_ids_json  TEXT NOT NULL DEFAULT '[]'
+            label_ids_json  TEXT NOT NULL DEFAULT '[]',
+            disposition     TEXT NOT NULL DEFAULT 'file'
         )
     """)
     try:
         con.execute(
             "ALTER TABLE gmail_pending_actions ADD COLUMN label_ids_json TEXT NOT NULL DEFAULT '[]'"
+        )
+        con.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        con.execute(
+            "ALTER TABLE gmail_pending_actions ADD COLUMN disposition TEXT NOT NULL DEFAULT 'file'"
         )
         con.commit()
     except sqlite3.OperationalError:
@@ -556,6 +564,13 @@ def _seed_decision_layer(con: sqlite3.Connection) -> None:
             None,
             "Municipal bulletin — aware tier, named ledger mention",
         ),
+        (
+            "marketplacereply.",
+            "Marketplace seller reply",
+            "act",
+            "always_inbox",
+            "Reply-routing subdomain (e.g. marketplacereply.bestbuy.ca) — seller replies to AJ's messages, always correspondence",
+        ),
     ]
     for pattern, name, tier, bypass, note in sender_seeds:
         con.execute(
@@ -706,8 +721,8 @@ def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
     for s in summaries:
         con.execute(
             """INSERT OR REPLACE INTO gmail_pending_actions
-               (msg_id, sender_email, sender_display, subject, action, tag, reason, label_ids_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (msg_id, sender_email, sender_display, subject, action, tag, reason, label_ids_json, disposition)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 s.msg_id,
                 s.sender_email,
@@ -717,6 +732,7 @@ def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
                 s.tag,
                 s.reason,
                 json.dumps(s.current_label_ids),
+                s.disposition,
             ),
         )
     con.commit()
@@ -724,7 +740,7 @@ def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
 
 def load_pending(con: sqlite3.Connection) -> list[EmailSummary]:
     rows = con.execute(
-        "SELECT msg_id, sender_email, sender_display, subject, action, tag, reason, label_ids_json"
+        "SELECT msg_id, sender_email, sender_display, subject, action, tag, reason, label_ids_json, disposition"
         " FROM gmail_pending_actions"
     ).fetchall()
     return [
@@ -737,6 +753,7 @@ def load_pending(con: sqlite3.Connection) -> list[EmailSummary]:
             tag=r[5],
             reason=r[6] or "",
             current_label_ids=json.loads(r[7] or "[]"),
+            disposition=r[8] if r[8] else "file",
         )
         for r in rows
     ]
@@ -860,6 +877,7 @@ def _apply_keep_archive_policy(summaries: list[EmailSummary]) -> None:
         ):
             continue
         s.action = "archive"
+        s.disposition = "file"
 
 
 def fetch_inbox_messages(service, batch_size: int) -> list[dict]:
