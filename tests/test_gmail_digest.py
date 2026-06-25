@@ -56,7 +56,8 @@ def _make_pending_db():
             tag             TEXT NOT NULL DEFAULT 'none',
             reason          TEXT,
             staged_at       TEXT DEFAULT (datetime('now')),
-            label_ids_json  TEXT NOT NULL DEFAULT '[]'
+            label_ids_json  TEXT NOT NULL DEFAULT '[]',
+            disposition     TEXT NOT NULL DEFAULT 'file'
         )
     """)
     return con
@@ -167,9 +168,12 @@ def test_load_pending_missing_column_falls_back_to_empty():
         " VALUES ('m1','s@e.com','S','Sub','archive','receipts')"
     )
     con.commit()
-    # ALTER-table migration adds the column; simulate that it ran
+    # ALTER-table migration adds columns; simulate both migrations ran
     con.execute(
         "ALTER TABLE gmail_pending_actions ADD COLUMN label_ids_json TEXT NOT NULL DEFAULT '[]'"
+    )
+    con.execute(
+        "ALTER TABLE gmail_pending_actions ADD COLUMN disposition TEXT NOT NULL DEFAULT 'file'"
     )
     con.commit()
     summaries = skill.load_pending(con)
