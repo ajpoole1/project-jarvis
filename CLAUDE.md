@@ -22,15 +22,15 @@ Private repo. Personal data and knowledge live here. Logic and personal state ar
 |---|---|---|
 | Local brain | Windows PC / WSL2 | VS Code, OpenClaw (systemd user service), Python skills, SQLite |
 | Cloud brain | Hetzner VPS + Cloudflare tunnel | Discord bot, job scraper, Gmail agent, morning briefing (Phase 4) |
-| Hardware controller | Windows PC / WSL2 | Home Assistant Container (Phase 2+). Raspberry Pi + garden irrigation deferred to 2027. |
+| Hardware controller | Raspberry Pi 4 (`ha-pi`, 192.168.2.58) | Home Assistant Container + Frigate NVR (live 2026-06-27). Garden irrigation deferred to 2027. |
 
 ### Key design decisions — Do not revisit without good reason
 
 - **SQLite is the shared memory layer.** Skills query it on demand. It is never preloaded into Claude context.
 - **Two-root knowledge model.** `knowledge/` (committed) holds generic reference content (garden, recipes, preferences, projects). `~/.jarvis/knowledge/` (private, local-only, 700/600 perms, WSL2 home ext4) holds personal/people/home content. Agent reads both on demand (lazy RAG); writes route via the knowledge skill using `TIERS.md` domain mapping. See `knowledge/KNOWLEDGE.md` and `knowledge/TIERS.md` for full schema. FTS5 index rebuilt on each search call; no embeddings; no ingest-pdf. Both roots are agent-writable for `*.md` only — see Write Boundary section below.
 - **Python for all skill logic.** One virtualenv per skill for skills with third-party dependencies. Stdlib-only skills (`followups`, `schedules`, `knowledge`) are intentionally venv-free — their `requirements.txt` documents this explicitly. The dispatcher auto-selects `skills/<name>/.venv/bin/python` if present, falling back to system `python3` for stdlib-only skills. OpenClaw shells out to Python.
-- **Home Assistant is the smart home API.** One skill controls all devices. Never bypass HA to talk to devices directly. HA runs natively in WSL2 (Python venv at `/srv/homeassistant`), not in Docker.
-- **VPS + Pi hybrid is Phase 4+.** Current setup is PC-only. Zigbee, Pi, and garden irrigation are 2027 scope.
+- **Home Assistant is the smart home API.** One skill controls all devices. Never bypass HA to talk to devices directly. HA runs on a dedicated **Raspberry Pi 4** (`ha-pi`, `192.168.2.58`) — migrated off WSL2 on 2026-06-27. See `knowledge/home-assistant/` for full topology, device map, and Frigate config notes.
+- **VPS + Pi hybrid is Phase 4+.** Pi is now live for HA + Frigate (NVR). Zigbee and garden irrigation are 2027 scope.
 
 ---
 
@@ -230,9 +230,9 @@ Branch strategy: `feature/skill-name` → `develop` → `main` (protected)
 
 | Device | Protocol | Integration | Status |
 |---|---|---|---|
-| Smart Life fan (XFBD410) | LocalTuya LAN (protocol 3.5) | `switch.ellie_s_register_fan_power`, mode, speed, temp, child lock | ✅ Phase 2 done |
-| Lorex cameras (4 of 5) | RTSP → go2rtc → HA generic | `camera.front_yard`, `driveway`, `back_garage`, `pool` — WebRTC live feed | ✅ Phase 2 done |
-| Lorex doorbell | RTSP → go2rtc | `camera.doorbell` — blocked, unknown device password | 🔄 Phase 2 pending |
+| Smart Life fan (XFBD410) | LocalTuya LAN (protocol 3.5) | `switch.ellie_s_register_fan_power`, mode, speed, temp, child lock | ✅ Live on Pi |
+| Lorex cameras (4 of 5) | RTSP → Frigate | `camera.front_yard`, `driveway`, `back_garage`, `pool` via Frigate integration | ✅ Live on Pi |
+| Lorex doorbell | RTSP → go2rtc | blocked — unknown device password | 🔄 Pending |
 | Google Home devices | Google Cast | HA Google Cast integration | 🔲 Phase 2 pending |
 | Ceiling pot lights | Zigbee BR30 | Zigbee2MQTT → HA | 🔲 Phase 5 |
 | Kitchen wired fixtures | — | Smart dimmer or WiZ retrofit | 🔲 Phase 5 |
@@ -240,11 +240,11 @@ Branch strategy: `feature/skill-name` → `develop` → `main` (protected)
 
 ### HA architecture
 
-HA Core runs as a systemd service in WSL2 (`/srv/homeassistant` venv, Python 3.12). Config at `/home/ajpoole/.homeassistant/`. WSL2 mirrored networking (`~/.wslconfig`) gives HA direct LAN access — required for LocalTuya UDP discovery.
+HA Container + Frigate + Mosquitto run on a dedicated **Raspberry Pi 4** (`ha-pi`, `192.168.2.58`) — migrated off WSL2 on 2026-06-27. Full topology, device map, and gotchas: `knowledge/home-assistant/`. WSL HA is decommissioned (config preserved at `/home/ajpoole/.homeassistant/` and `/srv/homeassistant` for reference).
 
-**Fan:** LocalTuya 2025.11.0 (xZetsubou fork) over protocol 3.5. Full local control — mode, speed, temp, child lock, display.
+**Fan:** LocalTuya 2025.11.0 (xZetsubou fork) over protocol 3.5, Pi HA. Inverted-boolean quirk: HA "on" = physically off. See `knowledge/home-assistant/devices.md`.
 
-**Cameras:** go2rtc (`docker-compose.yml`) proxies RTSP streams from all 4 working Lorex cameras. HA generic camera entities consume go2rtc WebRTC streams. Doorbell (`192.168.2.40`) is excluded — device password unknown. Fix: factory reset the doorbell, re-pair in Lorex app, update `config/personal/go2rtc.yaml`.
+**Cameras:** Frigate 0.17.1 on Pi pulls RTSP directly from all 4 Lorex cams (sub-stream detect, main-stream record). Doorbell (`.40`) excluded — device password unknown. Fix: factory reset + re-pair in Lorex app, update `config/personal/go2rtc.yaml`.
 
 **go2rtc config** lives in `config/personal/go2rtc.yaml` (gitignored). Contains camera RTSP URLs with credentials — never commit.
 
