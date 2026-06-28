@@ -523,11 +523,16 @@ def phase_capture() -> tuple[bool, str]:
 
 def phase_restart() -> tuple[bool, str]:
     """Restart the gateway. Returns (success, description)."""
+    env = os.environ.copy()
+    uid = os.getuid()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
     result = subprocess.run(
         ["systemctl", "--user", "restart", GATEWAY_UNIT],
         capture_output=True,
         text=True,
         timeout=30,
+        env=env,
     )
     if result.returncode != 0:
         return False, f"systemctl restart failed: {result.stderr.strip()[:200]}"
