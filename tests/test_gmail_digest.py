@@ -247,7 +247,43 @@ def test_adjust_pending_by_sender_scopes_to_that_sender():
     assert "1 item" in msg
     actions = dict(con.execute("SELECT sender_email, action FROM gmail_pending_actions"))
     assert actions["alpha@example.com"] == "archive"
-    assert actions["beta@example.com"] == "keep"  # untouched
+    assert actions["beta@example.com"] == "keep"  # untouched by the alpha adjust
+
+
+def test_adjust_pending_writes_coherent_disposition_and_tier():
+    """adjust must set disposition + tier + calendar_hint to match the action, so both
+    the execute path (dispatches on disposition) and the display reflect the change.
+
+    Regression: adjusting only `action` left an [act]/inbox item showing [needs
+    calendar] [act] in `pending` and — worse — execute_actions would not move it,
+    since it dispatches on disposition (still 'inbox').
+    """
+    con = _make_pending_db()
+    staged = skill.EmailSummary(
+        msg_id="groom1",
+        sender="Groomer",
+        sender_email="groom@example.com",
+        subject="Grooming appt",
+        action="keep",
+        reason="test",
+        tier="act",
+        disposition="inbox",
+        calendar_hint=True,
+    )
+    expected = {
+        "archive": ("file", "archive", 0),
+        "trash": ("trash_direct", "archive", 0),
+        "unsubscribe": ("quarantine", "archive", 0),
+        "keep": ("inbox", "act", 1),  # stays in inbox → calendar hint preserved
+    }
+    for action, (disp, tier, cal) in expected.items():
+        skill.save_pending(con, [staged])
+        skill.adjust_pending(con, "groom1", action)
+        (loaded,) = skill.load_pending(con)
+        assert loaded.action == action
+        assert loaded.disposition == disp, f"{action}: disposition"
+        assert loaded.tier == tier, f"{action}: tier"
+        assert loaded.calendar_hint is bool(cal), f"{action}: calendar_hint"
 
 
 def test_adjust_pending_by_msg_id_targets_single_entry():

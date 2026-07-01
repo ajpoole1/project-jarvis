@@ -64,6 +64,16 @@ INBOX_LABELS = [
 ACTIONS = ("archive", "trash", "unsubscribe", "keep")
 # WS2 disposition ladder — the new model's target states
 DISPOSITIONS = ("inbox", "file", "quarantine", "trash_direct")
+# An `adjust` action maps to a coherent (disposition, tier) so execute_actions
+# (which dispatches on disposition) and build_staging_report (which shows tier +
+# groups by disposition) both reflect the change. Mirrors _apply_keep_archive_policy,
+# which sets action=archive + disposition=file together.
+ADJUST_TARGET_STATE = {
+    "archive": ("file", "archive"),  # leaves inbox, retrievable in All Mail
+    "trash": ("trash_direct", "archive"),  # Gmail trash; manual (AJ-authored) only
+    "unsubscribe": ("quarantine", "archive"),  # promos quarantine; run_unsubscribes still fires
+    "keep": ("inbox", "act"),  # stays in inbox, salient
+}
 TAGS = (
     "receipts",
     "bills",
@@ -830,28 +840,37 @@ def adjust_pending(con: sqlite3.Connection, target: str, action: str) -> str:
     """Change the staged action for a target, which may be either a sender email
     (matches all staged mail from that sender) or a single msg_id (matches exactly
     one entry — use this to disambiguate items that share a sender+subject).
+
+    Writes the full coherent state — action + disposition + tier — so both the
+    execute path (dispatches on disposition) and the pending display (shows tier,
+    groups by disposition) reflect the change. Moving an item out of the inbox also
+    retires its now-moot [needs calendar] hint.
     """
     if action not in ACTIONS:
         return f"Unknown action '{action}'. Choose from: {', '.join(ACTIONS)}"
+    disposition, tier = ADJUST_TARGET_STATE[action]
+    set_clause = "action = ?, disposition = ?, tier = ?"
+    params: list = [action, disposition, tier]
+    if disposition != "inbox":
+        set_clause += ", calendar_hint = 0"
     # A sender always contains '@'; a Gmail msg_id never does.
-    if "@" in target:
-        cursor = con.execute(
-            "UPDATE gmail_pending_actions SET action = ? WHERE sender_email = ?",
-            (action, target.lower()),
-        )
-        con.commit()
-        if cursor.rowcount == 0:
-            return f"No pending email from {target}."
-        plural = "s" if cursor.rowcount != 1 else ""
-        return f"Updated {cursor.rowcount} item{plural} from {target} → {action}"
+    by_sender = "@" in target
+    where_col, where_val = ("sender_email", target.lower()) if by_sender else ("msg_id", target)
     cursor = con.execute(
-        "UPDATE gmail_pending_actions SET action = ? WHERE msg_id = ?",
-        (action, target),
+        f"UPDATE gmail_pending_actions SET {set_clause} WHERE {where_col} = ?",
+        (*params, where_val),
     )
     con.commit()
     if cursor.rowcount == 0:
-        return f"No pending email with msg_id {target}."
-    return f"Updated msg {target} → {action}"
+        return (
+            f"No pending email from {target}."
+            if by_sender
+            else f"No pending email with msg_id {target}."
+        )
+    if by_sender:
+        plural = "s" if cursor.rowcount != 1 else ""
+        return f"Updated {cursor.rowcount} item{plural} from {target} → {action} [{disposition}]"
+    return f"Updated msg {target} → {action} [{disposition}]"
 
 
 def get_cached_action(con: sqlite3.Connection, sender_email: str) -> str | None:
