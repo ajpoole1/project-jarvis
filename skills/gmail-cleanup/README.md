@@ -64,10 +64,11 @@ One sender → three different dispositions. Impossible with a sender-keyed cach
 | `python skill.py stage` | Classify inbox, save to pending, show staged report grouped by disposition |
 | `python skill.py execute` | Apply all pending staged actions |
 | `python skill.py cancel` | Discard pending actions — nothing changes |
-| `python skill.py pending` | Show current staged actions |
-| `python skill.py adjust <email> <action>` | Change staged action for a specific sender before executing |
+| `python skill.py pending` | Show current staged actions (each line ends with `·id <msg_id>`) |
+| `python skill.py adjust <email\|msg_id> <action>` | Change staged action. A sender email changes all their staged mail; a `msg_id` (from the `·id` in the report) changes exactly one entry — use it to disambiguate items sharing a sender+subject |
 | `python skill.py digest` | Full inbox status report grouped by tier (ACT/AWARE/ARCHIVE). Read-only. |
 | `python skill.py body <msg_id>` | Fetch plain-text body of an email — use when subject is ambiguous |
+| `python skill.py paths` | Print the resolved `jarvis.db` path, its source (`JARVIS_DATA_DIR`/.jarvis.env vs `/data` fallback), and whether it exists |
 
 ### Decision layer — data, not code
 

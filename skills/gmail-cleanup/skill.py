@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -28,6 +29,23 @@ CONFIG_DIR = Path(os.environ.get("JARVIS_CONFIG_DIR", "/config/personal"))
 DB_PATH = DATA_DIR / "jarvis.db"
 CREDENTIALS_PATH = CONFIG_DIR / "gmail_credentials.json"
 TOKEN_PATH = CONFIG_DIR / "gmail_token.json"
+
+# JARVIS_DATA_DIR is loaded from ~/.jarvis.env above (not the shell env), which is
+# why DB_PATH resolves even with no shell var set and /data absent. Surface where the
+# DB actually lives so the persistence path is never opaque again.
+_DB_SOURCE = (
+    "JARVIS_DATA_DIR env/.jarvis.env"
+    if os.environ.get("JARVIS_DATA_DIR")
+    else "default fallback (/data)"
+)
+
+
+def _db_location() -> str:
+    return (
+        f"DB_PATH={DB_PATH.resolve() if DB_PATH.parent.exists() else DB_PATH} "
+        f"(source: {_DB_SOURCE}; exists={DB_PATH.exists()})"
+    )
+
 
 DEFAULT_BATCH_SIZE = int(os.environ.get("GMAIL_BATCH_SIZE", "50"))
 DRY_RUN = os.environ.get("GMAIL_DRY_RUN", "true").lower() == "true"
@@ -270,7 +288,15 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
+_db_location_logged = False
+
+
 def init_db():
+    global _db_location_logged
+    if not _db_location_logged:
+        # stderr only — dispatcher forwards stdout to Discord, so keep this off that path.
+        print(f"[gmail-cleanup] {_db_location()}", file=sys.stderr)
+        _db_location_logged = True
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""
@@ -292,23 +318,39 @@ def init_db():
             reason          TEXT,
             staged_at       TEXT DEFAULT (datetime('now')),
             label_ids_json  TEXT NOT NULL DEFAULT '[]',
-            disposition     TEXT NOT NULL DEFAULT 'file'
+            disposition     TEXT NOT NULL DEFAULT 'file',
+            tier            TEXT NOT NULL DEFAULT 'archive',
+            email_type      TEXT NOT NULL DEFAULT '',
+            needs_aj        INTEGER NOT NULL DEFAULT 0,
+            calendar_hint   INTEGER NOT NULL DEFAULT 0,
+            confidence      REAL NOT NULL DEFAULT 1.0,
+            autonomous      INTEGER NOT NULL DEFAULT 0,
+            uncertain       INTEGER NOT NULL DEFAULT 0,
+            watch_label     TEXT NOT NULL DEFAULT ''
         )
     """)
-    try:
-        con.execute(
-            "ALTER TABLE gmail_pending_actions ADD COLUMN label_ids_json TEXT NOT NULL DEFAULT '[]'"
-        )
-        con.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    try:
-        con.execute(
-            "ALTER TABLE gmail_pending_actions ADD COLUMN disposition TEXT NOT NULL DEFAULT 'file'"
-        )
-        con.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    # ALTER guards keep older DBs in sync with the CREATE TABLE above. Every column here
+    # backs an EmailSummary field that build_staging_report reads; without them a
+    # save_pending → load_pending round-trip silently reset tier/calendar_hint/etc. to
+    # their dataclass defaults (every item rendering as [archive]).
+    _pending_migrations = [
+        ("label_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("disposition", "TEXT NOT NULL DEFAULT 'file'"),
+        ("tier", "TEXT NOT NULL DEFAULT 'archive'"),
+        ("email_type", "TEXT NOT NULL DEFAULT ''"),
+        ("needs_aj", "INTEGER NOT NULL DEFAULT 0"),
+        ("calendar_hint", "INTEGER NOT NULL DEFAULT 0"),
+        ("confidence", "REAL NOT NULL DEFAULT 1.0"),
+        ("autonomous", "INTEGER NOT NULL DEFAULT 0"),
+        ("uncertain", "INTEGER NOT NULL DEFAULT 0"),
+        ("watch_label", "TEXT NOT NULL DEFAULT ''"),
+    ]
+    for col, coldef in _pending_migrations:
+        try:
+            con.execute(f"ALTER TABLE gmail_pending_actions ADD COLUMN {col} {coldef}")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     con.execute("""
         CREATE TABLE IF NOT EXISTS gmail_heartbeat_state (
             key   TEXT PRIMARY KEY,
@@ -721,8 +763,10 @@ def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
     for s in summaries:
         con.execute(
             """INSERT OR REPLACE INTO gmail_pending_actions
-               (msg_id, sender_email, sender_display, subject, action, tag, reason, label_ids_json, disposition)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (msg_id, sender_email, sender_display, subject, action, tag, reason,
+                label_ids_json, disposition, tier, email_type, needs_aj, calendar_hint,
+                confidence, autonomous, uncertain, watch_label)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 s.msg_id,
                 s.sender_email,
@@ -733,6 +777,14 @@ def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
                 s.reason,
                 json.dumps(s.current_label_ids),
                 s.disposition,
+                s.tier,
+                s.email_type,
+                int(s.needs_aj),
+                int(s.calendar_hint),
+                s.confidence,
+                int(s.autonomous),
+                int(s.uncertain),
+                s.watch_label,
             ),
         )
     con.commit()
@@ -740,7 +792,9 @@ def save_pending(con: sqlite3.Connection, summaries: list[EmailSummary]):
 
 def load_pending(con: sqlite3.Connection) -> list[EmailSummary]:
     rows = con.execute(
-        "SELECT msg_id, sender_email, sender_display, subject, action, tag, reason, label_ids_json, disposition"
+        "SELECT msg_id, sender_email, sender_display, subject, action, tag, reason,"
+        " label_ids_json, disposition, tier, email_type, needs_aj, calendar_hint,"
+        " confidence, autonomous, uncertain, watch_label"
         " FROM gmail_pending_actions"
     ).fetchall()
     return [
@@ -754,6 +808,14 @@ def load_pending(con: sqlite3.Connection) -> list[EmailSummary]:
             reason=r[6] or "",
             current_label_ids=json.loads(r[7] or "[]"),
             disposition=r[8] if r[8] else "file",
+            tier=r[9] if r[9] else "archive",
+            email_type=r[10] or "",
+            needs_aj=bool(r[11]),
+            calendar_hint=bool(r[12]),
+            confidence=r[13] if r[13] is not None else 1.0,
+            autonomous=bool(r[14]),
+            uncertain=bool(r[15]),
+            watch_label=r[16] or "",
         )
         for r in rows
     ]
@@ -764,17 +826,32 @@ def clear_pending(con: sqlite3.Connection):
     con.commit()
 
 
-def adjust_pending(con: sqlite3.Connection, sender_email: str, action: str) -> str:
+def adjust_pending(con: sqlite3.Connection, target: str, action: str) -> str:
+    """Change the staged action for a target, which may be either a sender email
+    (matches all staged mail from that sender) or a single msg_id (matches exactly
+    one entry — use this to disambiguate items that share a sender+subject).
+    """
     if action not in ACTIONS:
         return f"Unknown action '{action}'. Choose from: {', '.join(ACTIONS)}"
+    # A sender always contains '@'; a Gmail msg_id never does.
+    if "@" in target:
+        cursor = con.execute(
+            "UPDATE gmail_pending_actions SET action = ? WHERE sender_email = ?",
+            (action, target.lower()),
+        )
+        con.commit()
+        if cursor.rowcount == 0:
+            return f"No pending email from {target}."
+        plural = "s" if cursor.rowcount != 1 else ""
+        return f"Updated {cursor.rowcount} item{plural} from {target} → {action}"
     cursor = con.execute(
-        "UPDATE gmail_pending_actions SET action = ? WHERE sender_email = ?",
-        (action, sender_email.lower()),
+        "UPDATE gmail_pending_actions SET action = ? WHERE msg_id = ?",
+        (action, target),
     )
     con.commit()
     if cursor.rowcount == 0:
-        return f"No pending email from {sender_email}."
-    return f"Updated: {sender_email} → {action}"
+        return f"No pending email with msg_id {target}."
+    return f"Updated msg {target} → {action}"
 
 
 def get_cached_action(con: sqlite3.Connection, sender_email: str) -> str | None:
@@ -1396,7 +1473,10 @@ def build_staging_report(summaries: list[EmailSummary], dry_run: bool) -> str:
         for item in items[:10]:
             cal = " [needs calendar]" if item.calendar_hint else ""
             tier_tag = f" [{item.tier}]" if item.tier else ""
-            lines.append(f"  • {item.sender_email} — {item.subject[:55]}{cal}{tier_tag}")
+            # Surface msg_id so entries that share a sender+subject (e.g. three
+            # "Re: Appointment Request") are distinguishable and `body <msg_id>` is usable.
+            id_tag = f" ·id {item.msg_id}" if item.msg_id else ""
+            lines.append(f"  • {item.sender_email} — {item.subject[:55]}{cal}{tier_tag}{id_tag}")
         if len(items) > 10:
             lines.append(f"  _…and {len(items) - 10} more_")
     lines.append(
@@ -1581,7 +1661,7 @@ def stage(batch_size: int = DEFAULT_BATCH_SIZE) -> str:
         return report
     return (
         report
-        + "\n\nReply **execute** to apply, **cancel** to abort, or **adjust <sender> <action>** to change individual items."
+        + "\n\nReply **execute** to apply, **cancel** to abort, or **adjust <sender|msg_id> <action>** to change items (use the ·id shown per line to target one email)."
     )
 
 
@@ -1652,10 +1732,12 @@ def cmd_pending() -> str:
     return build_staging_report(summaries, dry_run=True)
 
 
-def cmd_adjust(sender_email: str, action: str) -> str:
-    """Change the staged action for a specific sender before executing."""
+def cmd_adjust(target: str, action: str) -> str:
+    """Change the staged action for a sender (all their mail) or a single msg_id."""
+    if not target or not action:
+        return "Usage: adjust <sender-email|msg_id> <action>"
     con = init_db()
-    return adjust_pending(con, sender_email, action)
+    return adjust_pending(con, target, action)
 
 
 # keep `run` as an alias so heartbeat/drain callers still work
@@ -3143,9 +3225,9 @@ if __name__ == "__main__":
     elif cmd == "pending":
         print(cmd_pending())
     elif cmd == "adjust":
-        sender = sys.argv[2] if len(sys.argv) > 2 else ""
+        target = sys.argv[2] if len(sys.argv) > 2 else ""
         action = sys.argv[3] if len(sys.argv) > 3 else ""
-        print(cmd_adjust(sender, action))
+        print(cmd_adjust(target, action))
     elif cmd in ("drain_categories", "drain-categories"):
         print(
             "drain_categories is backlog-only. Use: gmail backlog-drain --i-understand --categories"
@@ -3183,6 +3265,8 @@ if __name__ == "__main__":
         print(cmd_config(sys.argv[2:]))
     elif cmd in ("rules", "rules-show", "rules_show"):
         print(cmd_rules_show())
+    elif cmd in ("paths", "dbpath"):
+        print(_db_location())
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
