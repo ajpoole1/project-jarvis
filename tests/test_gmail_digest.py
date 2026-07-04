@@ -57,7 +57,15 @@ def _make_pending_db():
             reason          TEXT,
             staged_at       TEXT DEFAULT (datetime('now')),
             label_ids_json  TEXT NOT NULL DEFAULT '[]',
-            disposition     TEXT NOT NULL DEFAULT 'file'
+            disposition     TEXT NOT NULL DEFAULT 'file',
+            tier            TEXT NOT NULL DEFAULT 'archive',
+            email_type      TEXT NOT NULL DEFAULT '',
+            needs_aj        INTEGER NOT NULL DEFAULT 0,
+            calendar_hint   INTEGER NOT NULL DEFAULT 0,
+            confidence      REAL NOT NULL DEFAULT 1.0,
+            autonomous      INTEGER NOT NULL DEFAULT 0,
+            uncertain       INTEGER NOT NULL DEFAULT 0,
+            watch_label     TEXT NOT NULL DEFAULT ''
         )
     """)
     return con
@@ -168,16 +176,148 @@ def test_load_pending_missing_column_falls_back_to_empty():
         " VALUES ('m1','s@e.com','S','Sub','archive','receipts')"
     )
     con.commit()
-    # ALTER-table migration adds columns; simulate both migrations ran
-    con.execute(
-        "ALTER TABLE gmail_pending_actions ADD COLUMN label_ids_json TEXT NOT NULL DEFAULT '[]'"
-    )
-    con.execute(
-        "ALTER TABLE gmail_pending_actions ADD COLUMN disposition TEXT NOT NULL DEFAULT 'file'"
-    )
+    # ALTER-table migration adds columns; simulate the full set of migrations ran
+    # (mirrors init_db's _pending_migrations list).
+    for col, coldef in [
+        ("label_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("disposition", "TEXT NOT NULL DEFAULT 'file'"),
+        ("tier", "TEXT NOT NULL DEFAULT 'archive'"),
+        ("email_type", "TEXT NOT NULL DEFAULT ''"),
+        ("needs_aj", "INTEGER NOT NULL DEFAULT 0"),
+        ("calendar_hint", "INTEGER NOT NULL DEFAULT 0"),
+        ("confidence", "REAL NOT NULL DEFAULT 1.0"),
+        ("autonomous", "INTEGER NOT NULL DEFAULT 0"),
+        ("uncertain", "INTEGER NOT NULL DEFAULT 0"),
+        ("watch_label", "TEXT NOT NULL DEFAULT ''"),
+    ]:
+        con.execute(f"ALTER TABLE gmail_pending_actions ADD COLUMN {col} {coldef}")
     con.commit()
     summaries = skill.load_pending(con)
     assert summaries[0].current_label_ids == []
+
+
+def test_load_pending_restores_full_state():
+    """Round-trip must preserve tier/disposition/calendar_hint/autonomous/etc.
+
+    Regression for the bug where load_pending dropped every field except the
+    original nine columns, so build_staging_report rendered every reloaded item
+    as [archive] (tier's dataclass default) with calendar hints and autonomous
+    counts silently lost.
+    """
+    con = _make_pending_db()
+    summary = skill.EmailSummary(
+        msg_id="mfull",
+        sender="Vet",
+        sender_email="vet@example.com",
+        subject="Re: Appointment Request",
+        action="keep",
+        reason="test",
+        tier="act",
+        disposition="inbox",
+        email_type="appointment",
+        needs_aj=True,
+        calendar_hint=True,
+        confidence=0.9,
+        autonomous=False,
+        uncertain=True,
+    )
+    skill.save_pending(con, [summary])
+    (loaded,) = skill.load_pending(con)
+    assert loaded.tier == "act"
+    assert loaded.disposition == "inbox"
+    assert loaded.email_type == "appointment"
+    assert loaded.needs_aj is True
+    assert loaded.calendar_hint is True
+    assert loaded.confidence == 0.9
+    assert loaded.autonomous is False
+    assert loaded.uncertain is True
+
+
+def test_adjust_pending_by_sender_scopes_to_that_sender():
+    """adjust by sender email touches only that sender's staged mail."""
+    con = _make_pending_db()
+    skill.save_pending(
+        con,
+        [
+            _make_summary("m1", "Alpha", "keep"),
+            _make_summary("m2", "Beta", "keep"),
+        ],
+    )
+    msg = skill.adjust_pending(con, "alpha@example.com", "archive")
+    assert "1 item" in msg
+    actions = dict(con.execute("SELECT sender_email, action FROM gmail_pending_actions"))
+    assert actions["alpha@example.com"] == "archive"
+    assert actions["beta@example.com"] == "keep"  # untouched by the alpha adjust
+
+
+def test_adjust_pending_writes_coherent_disposition_and_tier():
+    """adjust must set disposition + tier + calendar_hint to match the action, so both
+    the execute path (dispatches on disposition) and the display reflect the change.
+
+    Regression: adjusting only `action` left an [act]/inbox item showing [needs
+    calendar] [act] in `pending` and — worse — execute_actions would not move it,
+    since it dispatches on disposition (still 'inbox').
+    """
+    con = _make_pending_db()
+    staged = skill.EmailSummary(
+        msg_id="groom1",
+        sender="Groomer",
+        sender_email="groom@example.com",
+        subject="Grooming appt",
+        action="keep",
+        reason="test",
+        tier="act",
+        disposition="inbox",
+        calendar_hint=True,
+    )
+    expected = {
+        "archive": ("file", "archive", 0),
+        "trash": ("trash_direct", "archive", 0),
+        "unsubscribe": ("quarantine", "archive", 0),
+        "keep": ("inbox", "act", 1),  # stays in inbox → calendar hint preserved
+    }
+    for action, (disp, tier, cal) in expected.items():
+        skill.save_pending(con, [staged])
+        skill.adjust_pending(con, "groom1", action)
+        (loaded,) = skill.load_pending(con)
+        assert loaded.action == action
+        assert loaded.disposition == disp, f"{action}: disposition"
+        assert loaded.tier == tier, f"{action}: tier"
+        assert loaded.calendar_hint is bool(cal), f"{action}: calendar_hint"
+
+
+def test_adjust_pending_by_msg_id_targets_single_entry():
+    """adjust by msg_id changes exactly one row, even when sender+subject collide."""
+    con = _make_pending_db()
+    # Three near-identical entries: same sender, same subject.
+    trio = [
+        skill.EmailSummary(
+            msg_id=mid,
+            sender="Vet",
+            sender_email="vet@example.com",
+            subject="Re: Appointment Request",
+            action="keep",
+            reason="test",
+        )
+        for mid in ("18f2a", "18f2b", "18f2c")
+    ]
+    skill.save_pending(con, trio)
+    msg = skill.adjust_pending(con, "18f2b", "archive")
+    assert "18f2b" in msg
+    actions = dict(con.execute("SELECT msg_id, action FROM gmail_pending_actions"))
+    assert actions == {"18f2a": "keep", "18f2b": "archive", "18f2c": "keep"}
+
+
+def test_adjust_pending_miss_and_bad_action():
+    """Misses and invalid actions return friendly messages, no rows changed."""
+    con = _make_pending_db()
+    skill.save_pending(con, [_make_summary("m1", "Alpha", "keep")])
+    assert "No pending email with msg_id" in skill.adjust_pending(con, "deadbeef", "archive")
+    assert "No pending email from" in skill.adjust_pending(con, "nobody@example.com", "archive")
+    assert "Unknown action" in skill.adjust_pending(con, "m1", "bogus")
+    # Nothing changed.
+    (action,) = con.execute("SELECT action FROM gmail_pending_actions WHERE msg_id='m1'").fetchone()
+    assert action == "keep"
 
 
 # ---------------------------------------------------------------------------

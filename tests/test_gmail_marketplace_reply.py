@@ -123,7 +123,15 @@ def _make_con() -> sqlite3.Connection:
             reason TEXT,
             staged_at TEXT DEFAULT (datetime('now')),
             label_ids_json TEXT NOT NULL DEFAULT '[]',
-            disposition TEXT NOT NULL DEFAULT 'file'
+            disposition TEXT NOT NULL DEFAULT 'file',
+            tier TEXT NOT NULL DEFAULT 'archive',
+            email_type TEXT NOT NULL DEFAULT '',
+            needs_aj INTEGER NOT NULL DEFAULT 0,
+            calendar_hint INTEGER NOT NULL DEFAULT 0,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            autonomous INTEGER NOT NULL DEFAULT 0,
+            uncertain INTEGER NOT NULL DEFAULT 0,
+            watch_label TEXT NOT NULL DEFAULT ''
         );
     """)
     skill._seed_decision_layer(con)
