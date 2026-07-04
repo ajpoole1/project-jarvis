@@ -52,14 +52,17 @@ def _service(domain, service, **kwargs):
 def cmd_fan(args):
     if not args:
         power = _state(ENTITY_FAN_POWER)
-        temp = _state(ENTITY_FAN_TEMP)
+        try:
+            temp = round((float(_state(ENTITY_FAN_TEMP)) - 32) * 5 / 9, 1)
+        except (ValueError, TypeError):
+            temp = _state(ENTITY_FAN_TEMP)
         speed = _state(ENTITY_FAN_SPEED)
         mode = _state(ENTITY_FAN_MODE)
         child_lock = _state(ENTITY_FAN_CHILDLOCK)
         display = _state(ENTITY_FAN_DISPLAY)
         try:
             target = round((float(_state(ENTITY_FAN_TARGET_TEMP)) - 32) * 5 / 9, 1)
-        except ValueError:
+        except (ValueError, TypeError):
             target = _state(ENTITY_FAN_TARGET_TEMP)
         return (
             f"**Fan status**\n"
@@ -81,7 +84,11 @@ def cmd_fan(args):
 
     if sub == "temp":
         if len(args) < 2:
-            return f"Current indoor temp: {_state(ENTITY_FAN_TEMP)}°C"
+            try:
+                temp = round((float(_state(ENTITY_FAN_TEMP)) - 32) * 5 / 9, 1)
+            except (ValueError, TypeError):
+                temp = _state(ENTITY_FAN_TEMP)
+            return f"Current indoor temp: {temp}°C"
         try:
             temp_c = float(args[1])
         except ValueError:

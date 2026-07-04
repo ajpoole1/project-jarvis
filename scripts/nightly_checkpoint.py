@@ -350,9 +350,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             summary TEXT NOT NULL,
-            suggested_path TEXT,
-            provenance TEXT NOT NULL DEFAULT 'explicit-capture',
-            confidence REAL,
+            suggested_path TEXT NOT NULL,
+            provenance TEXT NOT NULL CHECK(provenance IN ("explicit-capture","compaction-rescue","nightly-checkpoint","nightly-checkpoint-raw")),
+            confidence REAL NOT NULL DEFAULT 1.0,
             filed INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         )

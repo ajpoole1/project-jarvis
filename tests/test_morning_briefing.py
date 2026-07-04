@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -74,13 +75,29 @@ def test_build_brief_prompt_contains_anchor():
     today = date(2026, 6, 7)  # Sunday
     blocks = [skill.BriefBlock(type="weather", salience=35, take="sunny", detail="Sunny, 22°C")]
     prompt = skill._build_brief_prompt(blocks, today, "")
-    assert "Today is Sunday, 2026-06-07 (America/Toronto)." in prompt
+    assert f"Today is Sunday, 2026-06-07 (Eastern time). AJ is based in {skill.CITY}." in prompt
 
 
 def test_build_brief_prompt_anchor_is_first_line():
     today = date(2026, 6, 7)
     prompt = skill._build_brief_prompt([], today, "")
-    assert prompt.startswith("Today is Sunday, 2026-06-07 (America/Toronto).")
+    assert prompt.startswith(
+        f"Today is Sunday, 2026-06-07 (Eastern time). AJ is based in {skill.CITY}."
+    )
+
+
+def test_build_brief_prompt_anchor_does_not_leak_timezone_placename():
+    """The anchor must not contain a place-name-looking timezone ID (e.g. 'Toronto')
+    that could be misread by the model as AJ's actual location."""
+    today = date(2026, 6, 7)
+    prompt = skill._build_brief_prompt([], today, "")
+    anchor_line = prompt.split("\n", 1)[0]
+    assert "Toronto" not in anchor_line
+
+
+def test_build_brief_prompt_forbids_speculative_holidays():
+    prompt = skill._build_brief_prompt([], date(2026, 6, 7), "")
+    assert "holiday" in prompt.lower() and "long weekend" in prompt.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +442,100 @@ def test_get_weather_fetches_when_called_with_no_args():
     with patch.object(skill, "_fetch_wttr_data", return_value=None) as mock_fetch:
         result = skill._get_weather()
     mock_fetch.assert_called_once()
+    assert result is None
+
+
+def _wttr_payload(feels_like_c="18", rain_pcts=(10, 20), snow_pcts=(0, 0)):
+    return {
+        "weather": [
+            {
+                "maxtempC": "22",
+                "mintempC": "12",
+                "hourly": [
+                    {"chanceofrain": str(r), "chanceofsnow": str(s)}
+                    for r, s in zip(rain_pcts, snow_pcts, strict=False)
+                ],
+            }
+        ],
+        "current_condition": [
+            {
+                "FeelsLikeC": feels_like_c,
+                "weatherDesc": [{"value": "Sunny"}],
+            }
+        ],
+    }
+
+
+def test_get_weather_includes_feels_like_temp():
+    result = skill._get_weather(_wttr_payload(feels_like_c="18"))
+    assert "feels 18" in result.detail
+
+
+def test_get_weather_includes_rain_chance_when_above_threshold():
+    result = skill._get_weather(_wttr_payload(rain_pcts=(10, 45)))
+    assert "45% chance of rain" in result.detail
+
+
+def test_get_weather_omits_rain_chance_when_below_threshold():
+    result = skill._get_weather(_wttr_payload(rain_pcts=(5, 10)))
+    assert "chance of rain" not in result.detail
+
+
+def test_get_weather_includes_snow_chance_when_above_threshold():
+    result = skill._get_weather(_wttr_payload(snow_pcts=(0, 50)))
+    assert "50% chance of snow" in result.detail
+
+
+def _mock_upcoming_result(events):
+    result = MagicMock()
+    result.returncode = 0
+    result.stdout = json.dumps(events)
+    return result
+
+
+def test_get_holiday_returns_none_when_no_holiday_calendar_events():
+    events = [
+        {
+            "summary": "Session",
+            "start": "2026-07-31T09:00:00-04:00",
+            "calendar": "aaronjacobpoole@gmail.com",
+        }
+    ]
+    with (
+        patch("subprocess.run", return_value=_mock_upcoming_result(events)),
+        patch.object(Path, "exists", return_value=True),
+    ):
+        result = skill._get_holiday()
+    assert result is None
+
+
+def test_get_holiday_surfaces_confirmed_holiday_calendar_event():
+    events = [
+        {
+            "summary": "Civic Holiday",
+            "start": "2026-08-03",
+            "calendar": skill._HOLIDAY_CALENDAR_ID,
+        }
+    ]
+    with (
+        patch("subprocess.run", return_value=_mock_upcoming_result(events)),
+        patch.object(Path, "exists", return_value=True),
+    ):
+        result = skill._get_holiday()
+    assert result is not None
+    assert "Civic Holiday" in result.detail
+    assert "2026-08-03" in result.detail
+
+
+def test_get_holiday_ignores_non_holiday_calendar_events():
+    events = [
+        {"summary": "Move mortgage", "start": "2026-07-31", "calendar": "some-other-calendar-id"},
+    ]
+    with (
+        patch("subprocess.run", return_value=_mock_upcoming_result(events)),
+        patch.object(Path, "exists", return_value=True),
+    ):
+        result = skill._get_holiday()
     assert result is None
 
 

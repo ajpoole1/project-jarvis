@@ -61,6 +61,11 @@ _TEMP_COLD = 0  # ≥0  → heavy jacket + hat + mittens  /  <0 → snowsuit
 _RAIN_LIKELY = 60  # ≥60 → rain coat (take it and use it)
 _RAIN_POSSIBLE = 30  # ≥30 → pack rain coat (just in case)
 
+# Official "Holidays in Canada" Google calendar — already in GOOGLE_CALENDAR_IDS.
+# Ground truth for any holiday/long-weekend mention (see the no-speculation prompt rule).
+_HOLIDAY_CALENDAR_ID = "en.canadian.official#holiday@group.v.calendar.google.com"
+_HOLIDAY_LOOKAHEAD_DAYS = 4  # enough to catch a Monday holiday from a Friday briefing
+
 # Sentinel: distinguishes "caller passed no data" from "caller passed None (fetch failed)"
 _UNSPECIFIED: object = object()
 
@@ -366,7 +371,15 @@ def _get_weather(data: object = _UNSPECIFIED) -> BriefBlock | None:
         high = today["maxtempC"]
         low = today["mintempC"]
         desc = current["weatherDesc"][0]["value"]
-        raw = f"{CITY}: high {high}°C / low {low}°C, {desc.lower()}"
+        feels_c = current.get("FeelsLikeC", current.get("temp_C"))
+        hourly = today.get("hourly", [])
+        max_rain_pct = max((int(h.get("chanceofrain", 0)) for h in hourly), default=0)
+        max_snow_pct = max((int(h.get("chanceofsnow", 0)) for h in hourly), default=0)
+        raw = f"{CITY}: high {high}°C / low {low}°C (feels {feels_c}°C), {desc.lower()}"
+        if max_rain_pct >= _RAIN_POSSIBLE:
+            raw += f", {max_rain_pct}% chance of rain"
+        if max_snow_pct >= _RAIN_POSSIBLE:
+            raw += f", {max_snow_pct}% chance of snow"
         return BriefBlock(type="weather", salience=35, take=raw, detail=raw)
     except Exception:  # noqa: BLE001
         return None
@@ -474,6 +487,44 @@ def _get_calendar() -> BriefBlock | None:
             salience=55,
             take=f"{len(events)} calendar event(s) today/tomorrow",
             detail=detail,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _get_holiday() -> BriefBlock | None:
+    """Ground-truth holiday check against the official Holidays-in-Canada calendar.
+
+    Looks a few days further ahead than _get_calendar() so an upcoming long
+    weekend is visible from a Friday briefing, not just today/tomorrow.
+    """
+    skill_path = Path(__file__).parents[1] / "calendar" / "skill.py"
+    python_path = Path(__file__).parents[1] / "calendar" / ".venv" / "bin" / "python"
+    if not skill_path.exists() or not python_path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(python_path), str(skill_path), "upcoming", str(_HOLIDAY_LOOKAHEAD_DAYS)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        events = json.loads(result.stdout)
+        holidays = [e for e in events if e.get("calendar") == _HOLIDAY_CALENDAR_ID]
+        if not holidays:
+            return None
+        lines = [f"• {h.get('start', '')} — {h.get('summary', '')}" for h in holidays]
+        return BriefBlock(
+            type="holiday",
+            salience=40,
+            take=f"{len(holidays)} confirmed holiday(s) in the next {_HOLIDAY_LOOKAHEAD_DAYS} days",
+            detail=(
+                "Confirmed upcoming holidays, per the official Canadian holidays calendar"
+                " (ground truth — only mention holidays/long weekends listed here):\n"
+                + "\n".join(lines)
+            ),
         )
     except Exception:  # noqa: BLE001
         return None
@@ -836,7 +887,7 @@ Candidates:
 
 
 def _build_brief_prompt(blocks: list[BriefBlock], today: date, voice_text: str) -> str:
-    anchor = f"Today is {today.strftime('%A')}, {today.isoformat()} (America/Toronto)."
+    anchor = f"Today is {today.strftime('%A')}, {today.isoformat()} (Eastern time). AJ is based in {CITY}."
     ranked = sorted(blocks, key=lambda b: b.salience, reverse=True)
     context_parts = [f"[{b.type.upper()} | salience={b.salience}]\n{b.detail}" for b in ranked]
     return (
@@ -849,6 +900,8 @@ def _build_brief_prompt(blocks: list[BriefBlock], today: date, voice_text: str) 
         " Compress or drop what recurs and changes nothing (e.g. a standing daily session at the same time every day).\n"
         "- Frame weather as the *decision it drives*"
         " (how to dress Ellie, whether to bring an umbrella), not raw numbers.\n"
+        "- Only mention holidays or long weekends if the HOLIDAY data block below explicitly"
+        " lists one — never infer or guess one from general knowledge or the date alone.\n"
         "- No inbox status, no email count — those are on-demand only.\n"
         "- Voice: direct, dry, no filler openers, no trailing affirmations."
         " Short confident sentences. Occasional dry wit is fine.\n"
@@ -1031,6 +1084,7 @@ def run() -> list[str]:
 
     # Gather body blocks — capture named references for live-state write
     calendar_block = _get_calendar()
+    holiday_block = _get_holiday()
     deadline_block = _get_deadlines()
     gmail_block = _get_gmail_priority()
     dev_block = _get_dev_crew_standup()
@@ -1041,6 +1095,7 @@ def run() -> list[str]:
         b
         for b in [
             calendar_block,
+            holiday_block,
             deadline_block,
             gmail_block,
             dev_block,
