@@ -54,7 +54,7 @@ def cmd_fan(args):
         power = _state(ENTITY_FAN_POWER)
         try:
             temp = round((float(_state(ENTITY_FAN_TEMP)) - 32) * 5 / 9, 1)
-        except ValueError:
+        except (ValueError, TypeError):
             temp = _state(ENTITY_FAN_TEMP)
         speed = _state(ENTITY_FAN_SPEED)
         mode = _state(ENTITY_FAN_MODE)
@@ -62,7 +62,7 @@ def cmd_fan(args):
         display = _state(ENTITY_FAN_DISPLAY)
         try:
             target = round((float(_state(ENTITY_FAN_TARGET_TEMP)) - 32) * 5 / 9, 1)
-        except ValueError:
+        except (ValueError, TypeError):
             target = _state(ENTITY_FAN_TARGET_TEMP)
         return (
             f"**Fan status**\n"
@@ -86,7 +86,7 @@ def cmd_fan(args):
         if len(args) < 2:
             try:
                 temp = round((float(_state(ENTITY_FAN_TEMP)) - 32) * 5 / 9, 1)
-            except ValueError:
+            except (ValueError, TypeError):
                 temp = _state(ENTITY_FAN_TEMP)
             return f"Current indoor temp: {temp}°C"
         try:
