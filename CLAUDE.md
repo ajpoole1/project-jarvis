@@ -76,7 +76,7 @@ Every skill lives in `/skills/<skill-name>/`:
 - **Always commit:** `.env.example` with placeholder values, `/config/examples/` with fake data
 - **Payment skill:** card token reference only — raw card number never stored, logged, or passed as a string
 - **Gmail OAuth2:** request minimum scopes per skill — never request broad access. Gmail skill: read + modify (no send). Calendar: read + write events. Never request full account access.
-- **Kanka (lore skill):** `KANKA_TOKEN` lives in `~/.openclaw/workspace/project-echo/.env` — **agent-deny for read and write** (never `cat`/Edit/Write it). `lore push --yes` is the **only** Kanka-mutating path and is never autonomous: run `push` (dry-run) → present the diff to Discord → AJ ✅ → `push --yes`. Same stage-then-approve discipline as Gmail deletion. See External Skills section.
+- **Kanka (lore skill):** `KANKA_TOKEN` (and `ECHO_VOICE_BOT_TOKEN`) live in `/mnt/c/Users/aaron/Documents/python/project-echo/.env` — **agent-deny for read and write** (never `cat`/Edit/Write it). ⚠️ On DrvFs, so the deny relies on allow-list path-matching, not OS perms. `lore push --yes` is the **only** Kanka-mutating path and is never autonomous: run `push` (dry-run) → present the diff to Discord → AJ ✅ → `push --yes`. Same stage-then-approve discipline as Gmail deletion. See External Skills section.
 - **Before any PR to main:** check that no personal data files have been staged
 - **Shell is allowlisted with a chaining guard.** The agent's shell access is restricted via `~/.openclaw/workspace/.claude/settings.json`. A **PreToolUse hook** (`~/.openclaw/workspace/scripts/bash_guard.py`) fires before every Bash call and rejects any command containing shell operators: `;`, `&&`, `||`, `|`, `>`, `>>`, `<`, backtick, `$(`, embedded newlines. This forces one-invocation = one-command: no chaining, no piping, no redirection. The explicit deny list covers egress (`git push`, `curl`, `wget`, `ssh`), escape hatches (`bash -c`, `python -c`, `eval`, `source`, `tee`), and destructive ops (`rm -rf`). **Principle: shell invokes capabilities; it is never itself a capability.** Every side-effecting action is a named skill command with its own validation and stage-then-approve. Do not add write/exec primitives to the allow list.
 - **Skills and scripts are read-only to the agent.** Edit and Write tools are denied for `skills/`, `scripts/`, `.github/`, `docker-compose.yml`, `requirements*.txt`, `pyproject.toml`, and all instruction files. You write these from Claude Code or your IDE; the agent runs them. See Write Boundary section for the full model.
@@ -208,9 +208,9 @@ do **not** apply to them.
 | Property | Value |
 |---|---|
 | Repo | `project-echo` — separate repo, remote `github.com/ajpoole1/project-echo` (the GitHub clone is the mirror; **push is always a human action**) |
-| Location | `~/.openclaw/workspace/project-echo/` (relocated off DrvFs to ext4 on 2026-07-03 for enforceable perms) |
-| Skill | `~/.openclaw/workspace/project-echo/.claude/skills/lore/` — `SKILL.md` + `lore_cli.py` (validated-argv dispatcher over `engine/`) |
-| Interpreter | **`~/.openclaw/workspace/project-echo/.venv-linux/bin/python`** — a Linux venv. The bundled `.venv/` is Windows-native (`Scripts/python.exe`) and unusable by Jarvis. |
+| Location | `/mnt/c/Users/aaron/Documents/python/project-echo/` (DrvFs — lives alongside the other `python/*` repos, per AJ's 2026-07-05 decision; Option B — external path + allow-list extension). ⚠️ DrvFs does not enforce file perms, so `.env` secrets rely on the allow-list deny, not OS perms. |
+| Skill | `/mnt/c/Users/aaron/Documents/python/project-echo/.claude/skills/lore/` — `SKILL.md` + `lore_cli.py` (validated-argv dispatcher over `engine/`) |
+| Interpreter | **`/mnt/c/Users/aaron/Documents/python/project-echo/.venv-linux/bin/python`** — a Linux venv (rebuilt after the move; venvs hardcode abs paths). The bundled `.venv/` is Windows-native (`Scripts/python.exe`) and unusable by Jarvis. |
 | Runner (only allowed invocation) | `python .../lore/lore_cli.py <subcommand>` via the pinned interpreter above. One allow entry; there is no free-form passthrough to `engine/`. |
 | What it does | Reads/searches/edits/syncs the Empire of Ammar D&D campaign canon (Kanka 118513) — markdown in `lore/` (canon, syncs to Kanka), `workshop/` (pre-canon), `chronicle/` (play record). |
 
