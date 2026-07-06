@@ -99,16 +99,22 @@ def check_opt_tripwire() -> list[str]:
     try:
         dirty = subprocess.run(
             ["git", "-C", str(OPT_LIVE), "status", "--porcelain", "--untracked-files=no"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         if dirty.stdout.strip():
-            failures.append(f"/opt/jarvis-live has uncommitted changes: {dirty.stdout.strip()[:120]}")
+            failures.append(
+                f"/opt/jarvis-live has uncommitted changes: {dirty.stdout.strip()[:120]}"
+            )
         else:
             _log("tripwire OK: /opt/jarvis-live working tree clean")
 
         diverge = subprocess.run(
             ["git", "-C", str(OPT_LIVE), "rev-list", "--count", "HEAD...origin/main"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         count = diverge.stdout.strip()
         if count != "0":
