@@ -26,9 +26,7 @@ def main() -> int:
         print(f"spine_check.py not found at {SCRIPT}", file=sys.stderr)
         return 1
 
-    result = subprocess.run(["python3", str(SCRIPT)], capture_output=True, text=True)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
+    result = subprocess.run(["python3", str(SCRIPT)])
     if result.returncode != 0:
         print(f"spine-check failed (exit {result.returncode})", file=sys.stderr)
     return result.returncode
