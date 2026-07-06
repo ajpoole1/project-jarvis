@@ -33,116 +33,97 @@ def run_gh(*args: str) -> str:
     return result.stdout.strip()
 
 
-def list_all_repos() -> list[dict]:
-    """List all repos across REPO_OWNERS. Returns list of {owner, name, url, updatedAt}."""
-    repos = []
-    for owner in REPO_OWNERS:
-        try:
-            raw = run_gh(
-                "repo",
-                "list",
-                owner,
-                "--limit",
-                "100",
-                "--json",
-                "nameWithOwner,name,url,updatedAt",
-            )
-            if raw:
-                repos.extend(json.loads(raw))
-        except (RuntimeError, json.JSONDecodeError):
-            pass
-    return repos
-
-
 def read_open_prs() -> list[dict]:
-    """Read open PRs across all repos. Returns {repo, number, title, branch, qa_status}."""
+    """Read open PRs across all owners in one gh search call."""
+    owner_query = " ".join(f"owner:{o}" for o in REPO_OWNERS)
+    try:
+        raw = run_gh(
+            "search",
+            "prs",
+            "--state",
+            "open",
+            "--base",
+            "main",
+            "--limit",
+            "50",
+            "--json",
+            "repository,number,title,headRefName,statusCheckRollup,labels",
+            owner_query,
+        )
+    except RuntimeError:
+        return []
+
+    try:
+        items = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        return []
+
     prs = []
-    repos = list_all_repos()
-
-    for repo in repos:
-        repo_name = repo.get("nameWithOwner", "")
-        try:
-            raw = run_gh(
-                "pr",
-                "list",
-                "-R",
-                repo_name,
-                "--base",
-                "main",
-                "--state",
-                "open",
-                "--json",
-                "number,title,headRefName,statusCheckRollup,labels",
-            )
-            if not raw:
-                continue
-
-            repo_prs = json.loads(raw)
-            for pr in repo_prs:
-                qa_status = "unknown"
-                for check in pr.get("statusCheckRollup") or []:
-                    if (
-                        "tom" in check.get("name", "").lower()
-                        or "qa" in check.get("name", "").lower()
-                    ):
-                        qa_status = check.get("conclusion") or check.get("status") or "pending"
-                        break
-                prs.append(
-                    {
-                        "repo": repo_name,
-                        "number": pr.get("number"),
-                        "title": pr.get("title", ""),
-                        "branch": pr.get("headRefName", ""),
-                        "qa_status": qa_status,
-                        "labels": [lb.get("name", "") for lb in (pr.get("labels") or [])],
-                    }
-                )
-        except (RuntimeError, json.JSONDecodeError):
-            pass
-
+    for pr in items:
+        repo_name = (pr.get("repository") or {}).get("nameWithOwner", "")
+        qa_status = "unknown"
+        for check in pr.get("statusCheckRollup") or []:
+            name = check.get("name", "") if isinstance(check, dict) else ""
+            if "tom" in name.lower() or "qa" in name.lower():
+                qa_status = check.get("conclusion") or check.get("status") or "pending"
+                break
+        prs.append(
+            {
+                "repo": repo_name,
+                "number": pr.get("number"),
+                "title": pr.get("title", ""),
+                "branch": pr.get("headRefName", ""),
+                "qa_status": qa_status,
+                "labels": [lb.get("name", "") for lb in (pr.get("labels") or [])],
+            }
+        )
     return prs
 
 
 def read_recent_merges() -> list[dict]:
-    """Read merged PRs (last N days) across all repos. Returns {repo, number, title, mergedAt}."""
+    """Read merged PRs (last N days) across all owners in one gh search call."""
+    owner_query = " ".join(f"owner:{o}" for o in REPO_OWNERS)
+    cutoff_dt = datetime.now(UTC) - timedelta(days=RECENT_MERGE_DAYS)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    try:
+        raw = run_gh(
+            "search",
+            "prs",
+            "--state",
+            "merged",
+            "--base",
+            "main",
+            "--limit",
+            "50",
+            "--json",
+            "repository,number,title,mergedAt",
+            f"merged:>={cutoff_str}",
+            owner_query,
+        )
+    except RuntimeError:
+        return []
+
+    try:
+        items = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        return []
+
     merges = []
-    repos = list_all_repos()
-    cutoff = (datetime.now(UTC) - timedelta(days=RECENT_MERGE_DAYS)).isoformat()
-
-    for repo in repos:
-        repo_name = repo.get("nameWithOwner", "")
-        try:
-            raw = run_gh(
-                "pr",
-                "list",
-                "-R",
-                repo_name,
-                "--base",
-                "main",
-                "--state",
-                "merged",
-                "--json",
-                "number,title,mergedAt",
-            )
-            if not raw:
-                continue
-
-            repo_merges = json.loads(raw)
-            for pr in repo_merges:
-                merged_at = pr.get("mergedAt", "")
-                if merged_at >= cutoff:
-                    merges.append(
-                        {
-                            "repo": repo_name,
-                            "number": pr.get("number"),
-                            "title": pr.get("title", ""),
-                            "mergedAt": merged_at,
-                        }
-                    )
-        except (RuntimeError, json.JSONDecodeError):
-            pass
-
-    return sorted(merges, key=lambda x: x.get("mergedAt", ""), reverse=True)
+    for pr in items:
+        merged_at = pr.get("mergedAt") or ""
+        if not merged_at:
+            continue
+        repo_name = (pr.get("repository") or {}).get("nameWithOwner", "")
+        merges.append(
+            {
+                "repo": repo_name,
+                "number": pr.get("number"),
+                "title": pr.get("title", ""),
+                "mergedAt": merged_at,
+            }
+        )
+    return sorted(merges, key=lambda x: x["mergedAt"], reverse=True)
 
 
 def cmd_standup(_args: list[str]) -> int:
