@@ -6,6 +6,7 @@ Checks:
   1. Today's nonce is present in all 4 hook scripts.
   2. MEMORY.md final line is the expected tail sentinel for today's nonce.
   3. State file exists and is dated today.
+  4. /opt/jarvis-live git tripwire: no uncommitted changes, no divergence from origin/main.
 
 PASS → Discord status ping. FAIL → Discord alert with specifics.
 
@@ -87,6 +88,38 @@ def check_hooks(nonce: str) -> list[str]:
     return failures
 
 
+OPT_LIVE = Path("/opt/jarvis-live")
+
+
+def check_opt_tripwire() -> list[str]:
+    """Return failure strings if /opt/jarvis-live has drift from origin/main."""
+    failures = []
+    if not OPT_LIVE.exists():
+        return ["/opt/jarvis-live missing"]
+    try:
+        dirty = subprocess.run(
+            ["git", "-C", str(OPT_LIVE), "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if dirty.stdout.strip():
+            failures.append(f"/opt/jarvis-live has uncommitted changes: {dirty.stdout.strip()[:120]}")
+        else:
+            _log("tripwire OK: /opt/jarvis-live working tree clean")
+
+        diverge = subprocess.run(
+            ["git", "-C", str(OPT_LIVE), "rev-list", "--count", "HEAD...origin/main"],
+            capture_output=True, text=True, timeout=15,
+        )
+        count = diverge.stdout.strip()
+        if count != "0":
+            failures.append(f"/opt/jarvis-live diverged from origin/main by {count} commit(s)")
+        else:
+            _log("tripwire OK: /opt/jarvis-live is in sync with origin/main")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"/opt/jarvis-live git check failed: {exc}")
+    return failures
+
+
 def check_memory_tail(nonce: str) -> list[str]:
     """Return a list of failure strings (empty = pass)."""
     if not MEMORY_MD.exists():
@@ -124,7 +157,7 @@ def main() -> int:
     nonce = parts[1]
     _log(f"checking nonce: {nonce}")
 
-    failures = check_hooks(nonce) + check_memory_tail(nonce)
+    failures = check_hooks(nonce) + check_memory_tail(nonce) + check_opt_tripwire()
 
     if failures:
         _alert("; ".join(failures))
