@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo
 # Paths & config
 # ---------------------------------------------------------------------------
 
-PROJECT = Path("/mnt/c/Users/aaron/Documents/python/project-jarvis")
+PROJECT = Path("/opt/jarvis-live")
 DB_PATH = PROJECT / "data/jarvis.db"
 DISCORD_SCRIPT = PROJECT / "scripts/discord_post.py"
 WORKSPACE = Path.home() / ".openclaw/workspace"

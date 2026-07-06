@@ -3256,7 +3256,9 @@ if __name__ == "__main__":
     elif cmd in ("backlog-drain", "backlog_drain"):
         print(cmd_backlog_drain(sys.argv[2:]))
     elif cmd == "heartbeat":
-        print(cmd_heartbeat())
+        result = cmd_heartbeat()
+        if result and result != "SILENT":
+            print(result)
     elif cmd == "digest":
         print(cmd_digest())
     elif cmd == "body":
