@@ -26,38 +26,51 @@ REPO_OWNERS = ["ajpoole1", "altaforma-conseils"]
 
 
 def run_gh(*args: str) -> str:
-    """Run gh CLI command, raise on error."""
-    result = subprocess.run(["gh", *args], capture_output=True, text=True)
+    """Run gh CLI command, raise on error. FileNotFoundError if gh not on PATH."""
+    try:
+        result = subprocess.run(["gh", *args], capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("gh CLI not found") from exc
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip())
     return result.stdout.strip()
 
 
+def _search_prs(state: str, extra_args: list[str], fields: str) -> list[dict]:
+    """Run gh search prs once per owner and merge results (owner: is AND in GitHub query)."""
+    items: list[dict] = []
+    for owner in REPO_OWNERS:
+        try:
+            raw = run_gh(
+                "search",
+                "prs",
+                "--state",
+                state,
+                "--base",
+                "main",
+                "--limit",
+                "50",
+                "--json",
+                fields,
+                f"owner:{owner}",
+                *extra_args,
+            )
+        except RuntimeError:
+            continue
+        try:
+            items.extend(json.loads(raw) if raw else [])
+        except json.JSONDecodeError:
+            continue
+    return items
+
+
 def read_open_prs() -> list[dict]:
-    """Read open PRs across all owners in one gh search call."""
-    owner_query = " ".join(f"owner:{o}" for o in REPO_OWNERS)
-    try:
-        raw = run_gh(
-            "search",
-            "prs",
-            "--state",
-            "open",
-            "--base",
-            "main",
-            "--limit",
-            "50",
-            "--json",
-            "repository,number,title,headRefName,statusCheckRollup,labels",
-            owner_query,
-        )
-    except RuntimeError:
-        return []
-
-    try:
-        items = json.loads(raw) if raw else []
-    except json.JSONDecodeError:
-        return []
-
+    """Read open PRs across all owners."""
+    items = _search_prs(
+        "open",
+        [],
+        "repository,number,title,headRefName,statusCheckRollup,labels",
+    )
     prs = []
     for pr in items:
         repo_name = (pr.get("repository") or {}).get("nameWithOwner", "")
@@ -81,34 +94,14 @@ def read_open_prs() -> list[dict]:
 
 
 def read_recent_merges() -> list[dict]:
-    """Read merged PRs (last N days) across all owners in one gh search call."""
-    owner_query = " ".join(f"owner:{o}" for o in REPO_OWNERS)
+    """Read merged PRs (last N days) across all owners."""
     cutoff_dt = datetime.now(UTC) - timedelta(days=RECENT_MERGE_DAYS)
     cutoff_str = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    try:
-        raw = run_gh(
-            "search",
-            "prs",
-            "--state",
-            "merged",
-            "--base",
-            "main",
-            "--limit",
-            "50",
-            "--json",
-            "repository,number,title,mergedAt",
-            f"merged:>={cutoff_str}",
-            owner_query,
-        )
-    except RuntimeError:
-        return []
-
-    try:
-        items = json.loads(raw) if raw else []
-    except json.JSONDecodeError:
-        return []
-
+    items = _search_prs(
+        "merged",
+        [f"merged:>={cutoff_str}"],
+        "repository,number,title,mergedAt",
+    )
     merges = []
     for pr in items:
         merged_at = pr.get("mergedAt") or ""
