@@ -4,9 +4,9 @@
 # See scripts/nightly_checkpoint.py for the full implementation.
 #
 # Crontab line (add with: crontab -e):
-#   0 4 * * * /mnt/c/Users/aaron/Documents/python/project-jarvis/scripts/cron_nightly_checkpoint.sh
+#   0 4 * * * /opt/jarvis-live/scripts/cron_nightly_checkpoint.sh
 
-PROJECT=/mnt/c/Users/aaron/Documents/python/project-jarvis
+PROJECT=/opt/jarvis-live
 mkdir -p "$PROJECT/logs"
 
 # Load env vars (same safe parser as cron_followups.sh)

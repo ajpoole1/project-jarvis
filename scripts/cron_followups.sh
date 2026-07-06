@@ -4,7 +4,7 @@
 # Also dispatches any approved scheduled jobs that are due.
 # Posts to Discord only when fire produces output. Silent otherwise.
 
-PROJECT=/mnt/c/Users/aaron/Documents/python/project-jarvis
+PROJECT=/opt/jarvis-live
 mkdir -p "$PROJECT/logs"
 cd "$PROJECT" || exit 1
 
@@ -43,13 +43,4 @@ OUTPUT=$(python3 "$PROJECT/skills/followups/skill.py" fire 2>>"$PROJECT/logs/cro
 
 if [ -n "$OUTPUT" ]; then
     echo "$OUTPUT" | python3 scripts/discord_post.py
-fi
-
-# Auto-deploy: fast-forward runtime checkout to main on each tick.
-# Placed at end: bash has already read the full script before git pull can rewrite it.
-# Guard: skip silently on feature branches — ff-only against main fails there.
-if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "main" ]; then
-    git pull --ff-only origin main >> "$PROJECT/logs/deploy.log" 2>&1 || \
-        echo "⚠️ Auto-deploy: git pull --ff-only failed — runtime may be stale. Check logs/deploy.log." | \
-        python3 "$PROJECT/scripts/discord_post.py"
 fi
