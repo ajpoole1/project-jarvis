@@ -36,86 +36,84 @@ def run_gh(*args: str) -> str:
     return result.stdout.strip()
 
 
-def _search_prs(state: str, extra_args: list[str], fields: str) -> list[dict]:
-    """Run gh search prs once per owner and merge results (owner: is AND in GitHub query)."""
-    items: list[dict] = []
-    for owner in REPO_OWNERS:
-        try:
-            raw = run_gh(
-                "search",
-                "prs",
-                "--state",
-                state,
-                "--base",
-                "main",
-                "--limit",
-                "50",
-                "--json",
-                fields,
-                f"owner:{owner}",
-                *extra_args,
-            )
-        except RuntimeError:
-            continue
-        try:
-            items.extend(json.loads(raw) if raw else [])
-        except json.JSONDecodeError:
-            continue
-    return items
+def _gh_search_prs(owner: str, extra_flags: list[str], fields: str) -> list[dict]:
+    """Run gh search prs for a single owner; return parsed list or [] on error."""
+    try:
+        raw = run_gh(
+            "search",
+            "prs",
+            "--owner",
+            owner,
+            "--limit",
+            "50",
+            "--json",
+            fields,
+            *extra_flags,
+        )
+    except RuntimeError:
+        return []
+    try:
+        return json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        return []
 
 
 def read_open_prs() -> list[dict]:
-    """Read open PRs across all owners."""
-    items = _search_prs(
-        "open",
-        [],
-        "repository,number,title,headRefName,statusCheckRollup,labels",
-    )
+    """Read open PRs targeting main across all owners."""
     prs = []
-    for pr in items:
-        repo_name = (pr.get("repository") or {}).get("nameWithOwner", "")
-        qa_status = "unknown"
-        for check in pr.get("statusCheckRollup") or []:
-            name = check.get("name", "") if isinstance(check, dict) else ""
-            if "tom" in name.lower() or "qa" in name.lower():
-                qa_status = check.get("conclusion") or check.get("status") or "pending"
-                break
-        prs.append(
-            {
-                "repo": repo_name,
-                "number": pr.get("number"),
-                "title": pr.get("title", ""),
-                "branch": pr.get("headRefName", ""),
-                "qa_status": qa_status,
-                "labels": [lb.get("name", "") for lb in (pr.get("labels") or [])],
-            }
-        )
+    for owner in REPO_OWNERS:
+        for item in _gh_search_prs(
+            owner,
+            ["--state", "open", "--base", "main"],
+            "repository,number,title,headRefName,statusCheckRollup,labels",
+        ):
+            repo_name = (item.get("repository") or {}).get("nameWithOwner", "")
+            qa_status = "unknown"
+            for check in item.get("statusCheckRollup") or []:
+                name = check.get("name", "") if isinstance(check, dict) else ""
+                if "tom" in name.lower() or "qa" in name.lower():
+                    qa_status = check.get("conclusion") or check.get("status") or "pending"
+                    break
+            prs.append(
+                {
+                    "repo": repo_name,
+                    "number": item.get("number"),
+                    "title": item.get("title", ""),
+                    "branch": item.get("headRefName", ""),
+                    "qa_status": qa_status,
+                    "labels": [lb.get("name", "") for lb in (item.get("labels") or [])],
+                }
+            )
     return prs
 
 
 def read_recent_merges() -> list[dict]:
-    """Read merged PRs (last N days) across all owners."""
+    """Read merged PRs (last N days) targeting main across all owners.
+
+    gh search prs JSON does not expose mergedAt; closedAt is used as proxy
+    (for merged PRs closedAt == mergedAt).
+    """
     cutoff_dt = datetime.now(UTC) - timedelta(days=RECENT_MERGE_DAYS)
     cutoff_str = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    items = _search_prs(
-        "merged",
-        [f"merged:>={cutoff_str}"],
-        "repository,number,title,mergedAt",
-    )
     merges = []
-    for pr in items:
-        merged_at = pr.get("mergedAt") or ""
-        if not merged_at:
-            continue
-        repo_name = (pr.get("repository") or {}).get("nameWithOwner", "")
-        merges.append(
-            {
-                "repo": repo_name,
-                "number": pr.get("number"),
-                "title": pr.get("title", ""),
-                "mergedAt": merged_at,
-            }
-        )
+    for owner in REPO_OWNERS:
+        for item in _gh_search_prs(
+            owner,
+            ["--merged", "--base", "main", "--merged-at", f">={cutoff_str}"],
+            "repository,number,title,closedAt",
+        ):
+            merged_at = item.get("closedAt") or ""
+            if not merged_at:
+                continue
+            repo_name = (item.get("repository") or {}).get("nameWithOwner", "")
+            merges.append(
+                {
+                    "repo": repo_name,
+                    "number": item.get("number"),
+                    "title": item.get("title", ""),
+                    "mergedAt": merged_at,
+                }
+            )
     return sorted(merges, key=lambda x: x["mergedAt"], reverse=True)
 
 
