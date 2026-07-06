@@ -1,300 +1,194 @@
 #!/usr/bin/env python3
 """
-devloop skill — read-only narration of dev-loop state from git/GitHub.
+devloop skill — read-only narration of dev state from GitHub across all repos.
 
 Commands:
-  standup          Emit a dev-crew standup: queue items, open PRs, QA status,
-                   recent merges — all mapped to personas via the roster.
-                   Called by the morning briefing and on operator request.
+  standup          Emit a dev standup: open PRs and latest merged PRs across all
+                   repos (personal + org), fresh-work indicator. Queue support removed
+                   as of 2026-07-04.
 
 Reads:
-  - dev-queue branch: knowledge/dev-notes/queue/*.md (items by status)
-  - GitHub: open PRs, check status via gh CLI
-  - git log main: recent merges (last 7 days)
-  - knowledge/dev-crew/roster.md: persona → repo mapping
+  - GitHub: open PRs, merged PRs (last 7 days), QA status via gh CLI
+  - All repos: ajpoole1/* (personal) + altaforma-conseils/* (org)
 
-No writes. Gracefully degrades: if gh is unavailable or dev-queue doesn't
-exist, emits whatever state it can read.
+No writes. Gracefully degrades: if gh is unavailable, emits empty standup.
 """
 
 from __future__ import annotations
 
-import re
+import json
 import subprocess
 import sys
-from datetime import UTC, datetime
-from pathlib import Path
+from datetime import UTC, datetime, timedelta
 
-PROJECT = Path(__file__).resolve().parents[2]
-ROSTER_FILE = PROJECT / "knowledge/dev-crew/roster.md"
-DEVNOTES_QUEUE = "knowledge/dev-notes/queue"
-DEVNOTES_BACKLOG = "knowledge/dev-notes/backlog"
-DEV_QUEUE_BRANCH = "dev-queue"
 RECENT_MERGE_DAYS = 7
-
-
-# ── roster loader ─────────────────────────────────────────────────────────────
-
-
-def load_roster() -> dict[str, dict]:
-    """Parse roster.md; return {id: fields}. Empty dict on missing file."""
-    if not ROSTER_FILE.exists():
-        return {}
-    text = ROSTER_FILE.read_text(encoding="utf-8")
-    personas: dict[str, dict] = {}
-    for block in re.finditer(r"##\s+(.+?)\n+```yaml\n(.*?)```", text, re.DOTALL):
-        raw = block.group(2)
-        fields: dict = {}
-        for line in raw.splitlines():
-            m = re.match(r"^(\w+):\s*(.+)", line)
-            if m:
-                fields[m.group(1)] = m.group(2).strip()
-        if "id" in fields:
-            personas[fields["id"]] = fields
-    return personas
-
-
-def persona_for_repo(roster: dict[str, dict], repo_name: str) -> str | None:
-    """Return persona name for a given repo, or None."""
-    for p in roster.values():
-        repos_raw = p.get("repos", "")
-        if repo_name in repos_raw:
-            return p.get("name")
-    return None
-
-
-# ── git helpers ───────────────────────────────────────────────────────────────
-
-
-def run_git(*args: str, capture: bool = True) -> str:
-    result = subprocess.run(["git", *args], cwd=PROJECT, capture_output=capture, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
-    return result.stdout.strip() if capture else ""
+REPO_OWNERS = ["ajpoole1", "altaforma-conseils"]
 
 
 def run_gh(*args: str) -> str:
-    result = subprocess.run(["gh", *args], cwd=PROJECT, capture_output=True, text=True)
+    """Run gh CLI command, raise on error."""
+    result = subprocess.run(["gh", *args], capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip())
     return result.stdout.strip()
 
 
-# ── frontmatter parser (shared with devqueue) ─────────────────────────────────
-
-
-def parse_frontmatter(text: str) -> dict:
-    m = re.match(r"^---\r?\n(.*?)\r?\n---\r?\n?", text, re.DOTALL)
-    if not m:
-        return {}
-    fields: dict = {}
-    for line in m.group(1).splitlines():
-        kv = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)", line)
-        if kv:
-            key, val = kv.group(1), kv.group(2).strip()
-            if (val.startswith('"') and val.endswith('"')) or (
-                val.startswith("'") and val.endswith("'")
-            ):
-                val = val[1:-1]
-            fields[key] = val if val not in ("null", "~", "") else None
-    return fields
-
-
-# ── queue reader ──────────────────────────────────────────────────────────────
-
-
-def read_queue_items() -> list[dict]:
-    """Read queue items from dev-queue branch. Returns list of frontmatter dicts."""
-    items = []
-    try:
-        run_git("fetch", "origin", DEV_QUEUE_BRANCH)
-    except RuntimeError:
-        pass
-
-    try:
-        listing = run_git(
-            "ls-tree", "--name-only", f"origin/{DEV_QUEUE_BRANCH}", f"{DEVNOTES_QUEUE}/"
-        )
-    except RuntimeError:
+def list_all_repos() -> list[dict]:
+    """List all repos across REPO_OWNERS. Returns list of {owner, name, url, updatedAt}."""
+    repos = []
+    for owner in REPO_OWNERS:
         try:
-            listing = run_git("ls-tree", "--name-only", DEV_QUEUE_BRANCH, f"{DEVNOTES_QUEUE}/")
-        except RuntimeError:
-            return []
-
-    for filepath in listing.splitlines():
-        if not filepath.endswith(".md") or filepath.endswith(".gitkeep"):
-            continue
-        try:
-            ref = f"origin/{DEV_QUEUE_BRANCH}"
-            content = run_git("show", f"{ref}:{filepath}")
-        except RuntimeError:
-            try:
-                content = run_git("show", f"{DEV_QUEUE_BRANCH}:{filepath}")
-            except RuntimeError:
-                continue
-        fm = parse_frontmatter(content)
-        if fm:
-            fm["_path"] = filepath
-            items.append(fm)
-    return items
-
-
-# ── PR reader ─────────────────────────────────────────────────────────────────
+            raw = run_gh(
+                "repo",
+                "list",
+                owner,
+                "--limit",
+                "100",
+                "--json",
+                "nameWithOwner,name,url,updatedAt",
+            )
+            if raw:
+                repos.extend(json.loads(raw))
+        except (RuntimeError, json.JSONDecodeError):
+            pass
+    return repos
 
 
 def read_open_prs() -> list[dict]:
-    """Return open PRs targeting main with their QA check status."""
-    try:
-        import json
+    """Read open PRs across all repos. Returns {repo, number, title, branch, qa_status}."""
+    prs = []
+    repos = list_all_repos()
 
-        raw = run_gh(
-            "pr",
-            "list",
-            "--base",
-            "main",
-            "--state",
-            "open",
-            "--json",
-            "number,title,headRefName,statusCheckRollup,labels",
-        )
-        prs = json.loads(raw) if raw else []
-    except (RuntimeError, Exception):
-        return []
+    for repo in repos:
+        repo_name = repo.get("nameWithOwner", "")
+        try:
+            raw = run_gh(
+                "pr",
+                "list",
+                "-R",
+                repo_name,
+                "--base",
+                "main",
+                "--state",
+                "open",
+                "--json",
+                "number,title,headRefName,statusCheckRollup,labels",
+            )
+            if not raw:
+                continue
 
-    result = []
-    for pr in prs:
-        qa_status = "unknown"
-        for check in pr.get("statusCheckRollup") or []:
-            if "tom" in check.get("name", "").lower() or "qa" in check.get("name", "").lower():
-                qa_status = check.get("conclusion") or check.get("status") or "pending"
-                break
-        result.append(
-            {
-                "number": pr.get("number"),
-                "title": pr.get("title", ""),
-                "branch": pr.get("headRefName", ""),
-                "qa_status": qa_status,
-                "labels": [lb.get("name", "") for lb in (pr.get("labels") or [])],
-            }
-        )
-    return result
+            repo_prs = json.loads(raw)
+            for pr in repo_prs:
+                qa_status = "unknown"
+                for check in pr.get("statusCheckRollup") or []:
+                    if (
+                        "tom" in check.get("name", "").lower()
+                        or "qa" in check.get("name", "").lower()
+                    ):
+                        qa_status = check.get("conclusion") or check.get("status") or "pending"
+                        break
+                prs.append(
+                    {
+                        "repo": repo_name,
+                        "number": pr.get("number"),
+                        "title": pr.get("title", ""),
+                        "branch": pr.get("headRefName", ""),
+                        "qa_status": qa_status,
+                        "labels": [lb.get("name", "") for lb in (pr.get("labels") or [])],
+                    }
+                )
+        except (RuntimeError, json.JSONDecodeError):
+            pass
 
-
-# ── recent merges ─────────────────────────────────────────────────────────────
-
-
-def read_recent_merges() -> list[str]:
-    """Return merge commit subjects from main in the last N days."""
-    try:
-        run_git("fetch", "origin", "main")
-        since = f"--since={RECENT_MERGE_DAYS} days ago"
-        log = run_git(
-            "log",
-            "origin/main",
-            "--merges",
-            since,
-            "--pretty=format:%s",
-        )
-        return [line for line in log.splitlines() if line.strip()]
-    except RuntimeError:
-        return []
+    return prs
 
 
-# ── standup formatter ─────────────────────────────────────────────────────────
+def read_recent_merges() -> list[dict]:
+    """Read merged PRs (last N days) across all repos. Returns {repo, number, title, mergedAt}."""
+    merges = []
+    repos = list_all_repos()
+    cutoff = (datetime.now(UTC) - timedelta(days=RECENT_MERGE_DAYS)).isoformat()
+
+    for repo in repos:
+        repo_name = repo.get("nameWithOwner", "")
+        try:
+            raw = run_gh(
+                "pr",
+                "list",
+                "-R",
+                repo_name,
+                "--base",
+                "main",
+                "--state",
+                "merged",
+                "--json",
+                "number,title,mergedAt",
+            )
+            if not raw:
+                continue
+
+            repo_merges = json.loads(raw)
+            for pr in repo_merges:
+                merged_at = pr.get("mergedAt", "")
+                if merged_at >= cutoff:
+                    merges.append(
+                        {
+                            "repo": repo_name,
+                            "number": pr.get("number"),
+                            "title": pr.get("title", ""),
+                            "mergedAt": merged_at,
+                        }
+                    )
+        except (RuntimeError, json.JSONDecodeError):
+            pass
+
+    return sorted(merges, key=lambda x: x.get("mergedAt", ""), reverse=True)
 
 
 def cmd_standup(_args: list[str]) -> int:
+    """Emit standup: open PRs + latest merged PRs across all repos."""
     today = datetime.now(UTC).strftime("%Y-%m-%d")
-    roster = load_roster()
-    repo_name = PROJECT.name
-
-    lines = [f"**Dev-crew standup ({today})**"]
-
-    # Queue items
-    queue_items = read_queue_items()
-    authorized = [i for i in queue_items if i.get("status") == "authorized"]
-    building = [i for i in queue_items if i.get("status") == "building"]
-    built = [i for i in queue_items if i.get("status") == "built"]
-    proposed = [i for i in queue_items if i.get("status") == "proposed"]
+    lines = [f"**Dev standup ({today})**"]
 
     # Open PRs
-    open_prs = read_open_prs()
-    # Map PR branch → PR info
-    pr_by_branch: dict[str, dict] = {pr["branch"]: pr for pr in open_prs}
+    try:
+        open_prs = read_open_prs()
+    except RuntimeError:
+        open_prs = []
 
-    # Active builds (building items matched to PRs)
-    if building:
-        for item in building:
-            item_id = item.get("id", "?")
-            branch = f"feature/{item_id}"
-            persona_name = persona_for_repo(roster, repo_name) or "Builder"
-
-            pr = pr_by_branch.get(branch)
-            if pr:
-                qa = pr["qa_status"]
-                qa_tag = {
-                    "success": "✅ QA pass",
-                    "failure": "🚫 QA fail",
-                    "pending": "⏳ QA running",
-                    "unknown": "⏳ QA pending",
-                }.get(qa.lower(), f"QA: {qa}")
-                lines.append(
-                    f"• **{persona_name}**: building `{item_id}` — PR #{pr['number']} ({qa_tag}, awaiting operator merge)"
-                )
-            else:
-                lines.append(f"• **{persona_name}**: building `{item_id}` — no PR yet")
-
-    # Built, awaiting QA/merge
-    if built:
-        for item in built:
-            item_id = item.get("id", "?")
-            branch = f"feature/{item_id}"
-            pr = pr_by_branch.get(branch)
-            if pr:
-                qa = pr["qa_status"]
-                qa_tag = {
-                    "success": "✅ QA pass — awaiting operator merge",
-                    "failure": "🚫 QA fail — needs fixes",
-                    "pending": "⏳ QA running",
-                    "unknown": "⏳ QA pending",
-                }.get(qa.lower(), f"QA: {qa}")
-                lines.append(f"• PR #{pr['number']} `{item_id}`: {qa_tag}")
-
-    # Authorized, awaiting summon
-    if authorized:
-        slugs = ", ".join(f"`{i.get('id', '?')}`" for i in authorized)
-        lines.append(f"• Authorized, awaiting summon: {slugs}")
-
-    # Proposed, awaiting authorization
-    if proposed:
-        slugs = ", ".join(f"`{i.get('id', '?')}`" for i in proposed)
-        lines.append(f"• Proposed (not yet authorized): {slugs}")
-
-    # Unmatched open PRs (dev-loop PRs not in queue — edge case)
-    devloop_prs = [
-        pr
-        for pr in open_prs
-        if "dev-loop" in pr.get("labels", []) or pr["branch"].startswith("feature/")
-    ]
-    matched_branches = {f"feature/{i.get('id', '')}" for i in building + built}
-    unmatched = [pr for pr in devloop_prs if pr["branch"] not in matched_branches]
-    for pr in unmatched:
-        lines.append(f"• PR #{pr['number']} `{pr['branch']}`: open (no queue item match)")
+    if open_prs:
+        lines.append(f"\n**Open PRs ({len(open_prs)})**")
+        for pr in sorted(open_prs, key=lambda x: (x["repo"], -x["number"])):
+            qa_tag = {
+                "success": "✅",
+                "failure": "🚫",
+                "pending": "⏳",
+                "unknown": "⏳",
+            }.get(pr["qa_status"].lower(), f"({pr['qa_status']})")
+            lines.append(f"• `{pr['repo']}` PR #{pr['number']} {qa_tag}: {pr['title']}")
 
     # Recent merges
-    merges = read_recent_merges()
-    if merges:
-        lines.append(f"• Recent merges ({RECENT_MERGE_DAYS}d): " + "; ".join(merges[:3]))
+    try:
+        merges = read_recent_merges()
+    except RuntimeError:
+        merges = []
 
-    # Nothing active
+    if merges:
+        latest_merge = merges[0]
+        lines.append("\n**Latest work**")
+        lines.append(
+            f"• `{latest_merge['repo']}` PR #{latest_merge['number']}: "
+            f"{latest_merge['title']} (merged {latest_merge['mergedAt'][:10]})"
+        )
+        if len(merges) > 1:
+            lines.append(f"  ...{len(merges) - 1} other merges in last {RECENT_MERGE_DAYS}d")
+
+    # Nothing
     if len(lines) == 1:
-        lines.append("• Nothing active — queue is clear.")
+        lines.append("• Nothing active — no open PRs.")
 
     print("\n".join(lines))
     return 0
-
-
-# ── entry point ───────────────────────────────────────────────────────────────
 
 
 def main() -> int:
