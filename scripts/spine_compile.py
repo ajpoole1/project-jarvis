@@ -259,8 +259,10 @@ def job_chunk_nonces(nonce: str) -> None:
 # ── job 4: lints ───────────────────────────────────────────────────────────────
 
 
-def job_lints(nonce: str) -> None:
-    """Run all lint checks; alert on violations."""
+def job_lints(nonce: str) -> bool:
+    """Run all lint checks; alert on violations. Returns True if all pass."""
+    ok = True
+
     # Lint 1: chunk emission size
     for hook_path, chunk_name in CHUNK_HOOKS:
         if not hook_path.exists():
@@ -279,6 +281,7 @@ def job_lints(nonce: str) -> None:
             _log(f"lint: {chunk_name} emission {size}B")
             if size > CHUNK_MAX_BYTES:
                 _alert(f"chunk {chunk_name} emission {size}B exceeds {CHUNK_MAX_BYTES}B limit")
+                ok = False
         except Exception as exc:  # noqa: BLE001
             _log(f"lint: could not measure {chunk_name}: {exc}")
 
@@ -295,6 +298,7 @@ def job_lints(nonce: str) -> None:
             m = snapshot_pattern.search(text)
             if not m:
                 _alert(f"people card missing ## Snapshot: {card.name}")
+                ok = False
                 continue
             # Find end of snapshot section
             rest = text[m.end() :]
@@ -306,6 +310,7 @@ def job_lints(nonce: str) -> None:
                 _alert(
                     f"people card {card.name} Snapshot {snapshot_bytes}B exceeds {SNAPSHOT_MAX_BYTES}B"
                 )
+                ok = False
             else:
                 _log(f"lint: {card.name} Snapshot {snapshot_bytes}B OK")
 
@@ -323,6 +328,7 @@ def job_lints(nonce: str) -> None:
                 f"MEMORY.md tail sentinel mismatch — "
                 f"expected: {expected_tail!r} got: {final_line!r}"
             )
+            ok = False
         else:
             _log("lint: MEMORY.md tail sentinel OK")
 
@@ -335,8 +341,11 @@ def job_lints(nonce: str) -> None:
     ]:
         if not src.exists():
             _alert(f"source file unreadable: {label}")
+            ok = False
         else:
             _log(f"lint: {label} readable ({src.stat().st_size}B)")
+
+    return ok
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -368,9 +377,12 @@ def main() -> int:
 
     # Job 4: lints
     try:
-        job_lints(nonce)
+        lints_ok = job_lints(nonce)
     except Exception as exc:  # noqa: BLE001
         _alert(f"lint job failed: {exc}")
+        return 1
+    if not lints_ok:
+        _log("=== spine-compile FAILED (lint violations) ===")
         return 1
 
     _log(f"=== spine-compile done nonce={nonce} ===")
