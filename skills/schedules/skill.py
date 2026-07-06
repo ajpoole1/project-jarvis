@@ -695,11 +695,14 @@ def cmd_dispatch(argv: list[str]) -> None:
                 # stall alerts, and errors must reach AJ immediately regardless of hour.
                 if result.stdout.strip():
                     raw = result.stdout.strip()
-                    _HIGH_PREFIX = "SIGNAL:high\n"
-                    if raw.startswith(_HIGH_PREFIX):
-                        _post_discord_direct(raw[len(_HIGH_PREFIX) :], signal="high")
+                    if raw == "SILENT":
+                        pass  # skill signals nothing to report — do not forward
                     else:
-                        _post_discord(conn, raw, signal="ambient")
+                        _HIGH_PREFIX = "SIGNAL:high\n"
+                        if raw.startswith(_HIGH_PREFIX):
+                            _post_discord_direct(raw[len(_HIGH_PREFIX) :], signal="high")
+                        else:
+                            _post_discord(conn, raw, signal="ambient")
                 # Alert on failure
                 if result.returncode != 0:
                     err_tail = (result.stderr or "").strip()[-400:]
