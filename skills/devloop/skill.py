@@ -59,29 +59,25 @@ def _gh_search_prs(owner: str, extra_flags: list[str], fields: str) -> list[dict
 
 
 def read_open_prs() -> list[dict]:
-    """Read open PRs targeting main across all owners."""
+    """Read open PRs targeting main across all owners.
+
+    gh search prs JSON does not expose headRefName or statusCheckRollup;
+    only the fields available from the search API are used.
+    """
     prs = []
     for owner in REPO_OWNERS:
         for item in _gh_search_prs(
             owner,
             ["--state", "open", "--base", "main"],
-            "repository,number,title,headRefName,statusCheckRollup,labels",
+            "repository,number,title,url",
         ):
             repo_name = (item.get("repository") or {}).get("nameWithOwner", "")
-            qa_status = "unknown"
-            for check in item.get("statusCheckRollup") or []:
-                name = check.get("name", "") if isinstance(check, dict) else ""
-                if "tom" in name.lower() or "qa" in name.lower():
-                    qa_status = check.get("conclusion") or check.get("status") or "pending"
-                    break
             prs.append(
                 {
                     "repo": repo_name,
                     "number": item.get("number"),
                     "title": item.get("title", ""),
-                    "branch": item.get("headRefName", ""),
-                    "qa_status": qa_status,
-                    "labels": [lb.get("name", "") for lb in (item.get("labels") or [])],
+                    "url": item.get("url", ""),
                 }
             )
     return prs
@@ -131,13 +127,7 @@ def cmd_standup(_args: list[str]) -> int:
     if open_prs:
         lines.append(f"\n**Open PRs ({len(open_prs)})**")
         for pr in sorted(open_prs, key=lambda x: (x["repo"], -x["number"])):
-            qa_tag = {
-                "success": "✅",
-                "failure": "🚫",
-                "pending": "⏳",
-                "unknown": "⏳",
-            }.get(pr["qa_status"].lower(), f"({pr['qa_status']})")
-            lines.append(f"• `{pr['repo']}` PR #{pr['number']} {qa_tag}: {pr['title']}")
+            lines.append(f"• `{pr['repo']}` PR #{pr['number']}: {pr['title']}")
 
     # Recent merges
     try:
