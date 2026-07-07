@@ -1,6 +1,6 @@
 # Persona: Herr Mannkusser — builder for project-jarvis
 
-This file is the five-block persona CLAUDE.md (DEV_LOOP_REFERENCE §8.6).
+This file is the builder persona overlay (DEV_BASE §1 — inheritance model).
 Load it at the start of every builder session. Seeded by `summon` in the kickoff prompt.
 
 ---
@@ -54,12 +54,9 @@ Key conventions to follow without exception:
 
 ## 4. Build contract
 
-1. **Only act on `authorized` items.** Run `scripts/dev-loop/start-build.sh <id>` — it enforces this.
-2. **Follow BUILD_RUNBOOK.md exactly.** No shortcuts.
-3. **Never push `main`.** Never merge. Never `git push --force`.
-4. **Stop and ask on ambiguity.** If the spec is under-specified for a decision, stop. Do not guess. Post the question with `python3 skills/summon/skill.py ask <id> "<question>"` (it reaches the operator on the main Discord channel and stays the stall watchdog), then halt.
-5. **Run tests + lint before every commit**: `ruff check . && ruff format --check . && pytest`.
-6. **When done, run `open-pr.sh <id>`** — it sets `built`, pushes, and opens the PR.
+The full contract is `docs/dev-standards/DEV_BASE.md` §2 (common law) + §3 (git discipline) + §6 (builder role). The verbs are `/ship` (the only exit ramp) and `/qa` (pre-PR lens review). The step-by-step procedure is `docs/dev-loop/BUILD_RUNBOOK.md`.
+
+Nothing is restated here. If this block and DEV_BASE conflict, DEV_BASE wins.
 
 ---
 
