@@ -86,29 +86,49 @@ Jarvis's own identity, rules, and always-on context are delivered via a separate
 
 | Layer | Where | What runs |
 |---|---|---|
-| Local brain | Windows PC / WSL2 | OpenClaw, Python skills, SQLite, cron |
-| Cloud brain | Hetzner VPS + Cloudflare tunnel *(Phase 4)* | Discord bot, job scraper |
-| Hardware controller | Raspberry Pi 5 *(Phase 4)* | Home Assistant, Zigbee2MQTT, irrigation DAGs |
+| Local brain | Windows PC / WSL2 | OpenClaw, Python skills, SQLite, the dev-loop |
+| Home hardware controller | Raspberry Pi 4 (`ha-pi`, dedicated, own VLAN) | Home Assistant (Container, not HA OS) + Frigate NVR (Coral USB TPU for on-device detection) + Mosquitto, all in Docker Compose. 4 Lorex cameras pulled by RTSP; 24/7 recording with 5-day retention, 30-day event-clip retention. |
+| Client | `jarvis-app` (separate repo) | React Native/Expo Android client talking to the OpenClaw gateway's WebSocket — see [The app](#the-app) below |
+
+There's no cloud tier today — everything runs on the local network.
 
 ### Key decisions
 
 - **SQLite as shared memory.** Skills query on demand. Never preloaded into Claude context.
 - **Python for all skill logic.** One virtualenv per skill (only when a skill has third-party dependencies — stdlib-only skills skip the venv). OpenClaw shells out via bash.
 - **Skills are isolated.** Cross-skill communication happens via subprocess JSON, not imports.
-- **Zigbee over WiFi for lights.** Sonoff USB dongle. Avoids network congestion at scale.
 - **Home Assistant as the smart home API.** One skill controls all devices. Never bypass HA.
+- **Frigate + Coral for detection, not cloud NVR.** Local-only recording and object detection — no footage leaves the network. Detect runs on cheap sub-streams; the Coral TPU handles inference well under its 70–100 inf/sec ceiling.
+
+### The app
+
+Discord is the control surface today, but a dedicated client is in progress in a **separate repo, `jarvis-app`** — a React Native (Expo) + TypeScript Android client, not the Flutter app the original roadmap assumed. It talks directly to the OpenClaw gateway's node WebSocket (not through Discord), authenticating with an Ed25519 keypair generated on first run and paired via a setup code. It connects to Jarvis's **shared main session** — the same brain and memory as the Discord and CLI surfaces, so it's one continuous assistant, not a separate instance with its own history.
+
+Currently at milestone **M6 (Polish)** of its build plan: the skeleton, gateway reachability, auth handshake, and a working chat surface (M1–M5) are done; M6 is adding auto-reconnect, multi-session/channel visibility, and disconnect/retry UX. See `jarvis-app`'s own README for the full build plan and connection protocol details — not duplicated here since it's a separate repo with its own release cycle.
 
 ---
 
-## Phases
+## Where things stand
+
+The original phase roadmap (below, kept for history) has largely been overtaken by how the project actually grew — infra and the app both moved ahead of where the plan assumed they would, and the cloud tier dropped out entirely:
+
+- **Home hardware controller: done, live** on a Pi 4, not deferred to a future Pi5/Phase-4 milestone (details above).
+- **Cloud brain: off the table.** No VPS, no cloud tier — everything stays local.
+- **Client app: in progress** in `jarvis-app`, further along than a stub (details above).
+- **Everything else in Phase 3** (agentic skills) is done: morning briefing, garden, tasks, knowledge (FTS5 + capture loop), active follow-ups, finance, grocery, price/travel monitors, and the dev-loop + spine are all live.
+
+<details>
+<summary>Original phase roadmap (historical — no longer actively tracked)</summary>
 
 | Phase | Status | Goal |
 |---|---|---|
 | Phase 1 | ✅ Done | Foundation — OpenClaw, Discord bot, dev environment |
 | Phase 2 | ✅ Done | Core integrations — Gmail ✅, Calendar ✅, Home Assistant (fan + cameras) ✅ |
-| Phase 3 | 🔄 In progress | Agentic skills — morning briefing ✅, garden ✅, tasks ✅, knowledge (FTS5 + capture loop) ✅, active follow-ups ✅, finance ✅, grocery ✅, price/travel monitors ✅, dev-loop + spine ✅. Job search deferred. |
-| Phase 4 | 🔲 Deferred | VPS migration + Pi deployment — deferred until Android app ready |
-| Phase 5 | 🔲 Not started | Jarvis Android app (Flutter, sideloaded APK) |
+| Phase 3 | ✅ Done | Agentic skills — see the bullet list above |
+| Phase 4 | ✅ Superseded | Originally "VPS migration + Pi deployment" — the Pi half shipped (see Infrastructure layers above); the VPS/cloud half was dropped |
+| Phase 5 | 🔄 In progress | Jarvis client app — now React Native/Expo (not Flutter), building in `jarvis-app` |
+
+</details>
 
 ---
 
@@ -149,7 +169,7 @@ Jarvis's own identity, rules, and always-on context are delivered via a separate
 | Persistent memory | SQLite |
 | Control surface | Discord |
 | Scheduled tasks | `schedules` skill dispatcher (agent-safe cron) + a couple of raw WSL cron jobs → Discord webhook |
-| Smart home | Home Assistant + Zigbee2MQTT *(Phase 4)* |
+| Smart home | Home Assistant + Frigate + Coral TPU, on a dedicated Raspberry Pi 4 |
 | CI/CD | GitHub Actions — security scan, ruff + pytest, docker validation, dev-queue schema validation, Tom QA gate, merge cleanup |
 
 ---
