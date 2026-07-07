@@ -18,7 +18,7 @@ Check the current branch name (e.g. `feature/2026-0044-dev-standards-framework`)
 Extract the item ID. Look for `knowledge/dev-notes/queue/<id>.md`. If it exists, read it fully — intent, scope, acceptance criteria, notes. If it does not exist (ad-hoc author work), skip spec conformance (§2.1 of QA_LENSES.md) and proceed with the remaining lenses.
 
 **Step 2 — Collect the diff**
-Run `git diff main...HEAD`. Read the full output. This is the complete set of changes under review.
+Run `git diff origin/main...HEAD`. Read the full output. This is the complete set of changes under review.
 
 **Step 3 — Read charter lens declarations**
 Read `CHARTER.md` → `## QA Lenses` section. Note the listed convention-lens documents.

@@ -37,7 +37,7 @@ Invoke `/qa`. Process its JSON verdict per `QA_LENSES.md` §5:
 ## 3. Commit + push (atomic pair)
 
 1. Commit with a *why* message (DEV_BASE §3.5).
-2. Immediately `git push origin feature/<id>` — commit implies push (DEV_BASE §3.2).
+2. Immediately `git push origin HEAD` — commit implies push (DEV_BASE §3.2).
    A commit without its push is an incomplete step, not an option.
 3. Never push `main`. Never force-push.
 
