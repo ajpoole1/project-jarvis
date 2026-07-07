@@ -381,8 +381,8 @@ def build_kickoff(persona_name: str, item_id: str) -> str:
         f"You are {persona_name}, a Jarvis dev-loop builder. "
         f"Load {RUNBOOK}, then run: scripts/dev-loop/start-build.sh {item_id} "
         f"(the spec is at {spec_path} on the dev-queue branch). "
-        f"Follow the runbook exactly. Build on the feature branch, run tests and lint, "
-        f"then open a PR with scripts/dev-loop/open-pr.sh {item_id}. "
+        f"Follow the runbook exactly. Build on the feature branch, run `scripts/dev-loop/checks.sh` before every commit, "
+        f"then land with `/ship` (which runs checks, /qa, and opens the PR). "
         f"If the spec is under-specified for a required decision, do NOT guess: post your "
         f'question with `python3 skills/summon/skill.py ask {item_id} "<your question>"` '
         f"(this posts to the dev-loop Discord and records that you are blocked), then stop."
@@ -408,7 +408,7 @@ def build_revise_kickoff(persona_name: str, item_id: str, pr_url: str, tom_findi
         f"The branch feature/{item_id} already exists — do NOT run start-build.sh (it will abort). "
         f"The spec is at {spec_path}. "
         f"Tom QA findings (PR: {pr_ref}): {findings_summary}. "
-        f"Fix all blocking issues on feature/{item_id}, run `ruff check . && ruff format --check . && pytest`, "
+        f"Fix all blocking issues on feature/{item_id}, run `scripts/dev-loop/checks.sh`, "
         f"commit, then push with: git push origin feature/{item_id}. "
         f"If you need a decision, post: "
         f'`python3 skills/summon/skill.py ask {item_id} "<question>"` then stop.'

@@ -34,7 +34,7 @@ def test_build_kickoff_mentions_item_and_scripts():
     assert "Herr Mannkusser" in k
     assert "2026-0002-thing" in k
     assert "scripts/dev-loop/start-build.sh" in k
-    assert "scripts/dev-loop/open-pr.sh" in k
+    assert "scripts/dev-loop/checks.sh" in k
 
 
 def test_build_kickoff_directs_blocking_questions_to_ask():
