@@ -1,6 +1,6 @@
 # Build Runbook
 
-Step-by-step procedure for a builder session (e.g. Herr Mannkusser). Load with `DEV_LOOP_REFERENCE.md` and the repo's `CLAUDE.md`.
+Step-by-step procedure for a builder session (e.g. Herr Mannkusser). Load with `DEV_LOOP_REFERENCE.md` and the repo's `CLAUDE.md`. Base contract: `docs/dev-standards/DEV_BASE.md`.
 
 ---
 
@@ -13,10 +13,11 @@ Step-by-step procedure for a builder session (e.g. Herr Mannkusser). Load with `
 ## Build loop
 
 1. Read the spec fully: intent, scope, acceptance criteria, notes.
-2. Implement on `feature/<id>`. Commit atomically; messages describe *why*, not what.
+2. Implement on `feature/<id>`. One live branch at a time; commit implies push (DEV_BASE §3).
 3. Never touch `main`. Never merge. Never `git push --force`. Never push to any branch other than `feature/<id>`.
-4. Run tests + lint before committing: `ruff check . && ruff format --check . && pytest`.
-5. When complete, run `open-pr.sh <id>` — it sets status to `built`, pushes, and opens the PR.
+4. Run checks before committing: `scripts/dev-loop/checks.sh` (the single definition of green — identical to CI).
+5. Run `/qa` before opening the PR. Fix blocking findings; capture advisories for the PR body.
+6. When complete, land via `/ship` — it runs checks, `/qa`, commits, pushes, and opens the PR via `open-pr.sh <id>`.
 
 ## Ambiguity rule
 
