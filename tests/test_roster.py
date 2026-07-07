@@ -22,7 +22,7 @@ _spec.loader.exec_module(_mod)
 
 ROSTER_FILE = Path(__file__).parents[1] / "knowledge" / "dev-crew" / "roster.md"
 OVERLAY_FILE = Path(__file__).parents[1] / "knowledge" / "dev-crew" / "overlays" / "mannkusser.md"
-BUILDER_BASE_FILE = Path(__file__).parents[1] / "docs" / "dev-loop" / "BUILDER_BASE.md"
+DEV_BASE_FILE = Path(__file__).parents[1] / "docs" / "dev-standards" / "DEV_BASE.md"
 CHARTER_FILE = Path(__file__).parents[1] / "CHARTER.md"
 
 
@@ -39,8 +39,8 @@ def test_overlay_file_exists():
     assert OVERLAY_FILE.exists(), f"Overlay not found: {OVERLAY_FILE}"
 
 
-def test_builder_base_exists():
-    assert BUILDER_BASE_FILE.exists(), f"BUILDER_BASE.md not found: {BUILDER_BASE_FILE}"
+def test_dev_base_exists():
+    assert DEV_BASE_FILE.exists(), f"DEV_BASE.md not found: {DEV_BASE_FILE}"
 
 
 def test_charter_exists():
@@ -140,21 +140,21 @@ def test_overlay_references_not_duplicated():
 
 
 # ---------------------------------------------------------------------------
-# BUILDER_BASE content
+# DEV_BASE content (supersedes BUILDER_BASE)
 # ---------------------------------------------------------------------------
 
 
-def test_builder_base_has_extraction_marker():
-    text = BUILDER_BASE_FILE.read_text(encoding="utf-8")
+def test_dev_base_has_extraction_marker():
+    text = DEV_BASE_FILE.read_text(encoding="utf-8")
     assert "extractable" in text.lower() or "dev-standards" in text.lower()
 
 
-def test_builder_base_has_add_builder_note():
-    """Acceptance criterion 6: cascade is legible to the next person."""
-    text = BUILDER_BASE_FILE.read_text(encoding="utf-8")
+def test_dev_base_has_add_builder_note():
+    """Cascade legibility: the base must explain how to add a builder."""
+    text = DEV_BASE_FILE.read_text(encoding="utf-8")
     assert "add a builder" in text.lower() or "to add" in text.lower()
 
 
-def test_builder_base_has_invariants():
-    text = BUILDER_BASE_FILE.read_text(encoding="utf-8")
-    assert "Invariant" in text or "non-negotiable" in text.lower()
+def test_dev_base_has_invariants():
+    text = DEV_BASE_FILE.read_text(encoding="utf-8")
+    assert "non-negotiable" in text.lower() or "common law" in text.lower()
