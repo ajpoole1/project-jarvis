@@ -1,9 +1,9 @@
 # Project Charter — project-jarvis
 
-<!-- Template: copy to each project repo and fill the values in this file.
-     Invariant sections (build rigor, QA contract) are defined in
-     `docs/dev-standards/DEV_BASE.md` and referenced here — not restated.
-     Update the project-specific values; leave the inherited sections as pointers. -->
+<!-- Filled charter for project-jarvis. The blank template lives at
+     docs/dev-standards/CHARTER_TEMPLATE.md — edit that file, not this comment, to
+     update the template. Invariant sections (build rigor, QA contract) are inherited
+     from docs/dev-standards/DEV_BASE.md and referenced here — not restated. -->
 
 ---
 
@@ -64,8 +64,9 @@ passes or the operator explicitly overrides.
 
 ## QA Lenses
 
-- `docs/dev-standards/PY_STANDARDS.md`
-- `docs/guides/SKILL_GUIDE.md`
+standards_root: docs/dev-standards
+- @std/PY_STANDARDS.md
+- docs/guides/SKILL_GUIDE.md
 
 ## Cascade
 
@@ -73,6 +74,5 @@ passes or the operator explicitly overrides.
 `knowledge/dev-crew/overlays/mannkusser.md` (Herr's persona overlay).
 
 Adding a builder = write an overlay in `knowledge/dev-crew/overlays/<id>.md` + fill
-a copy of this charter template. The base is inherited; don't restate it. The base
-extracts to the multi-repo dev-standards hub in Phase 1; overlays and charters stay
-per-repo.
+a copy of `docs/dev-standards/CHARTER_TEMPLATE.md`. The base is inherited; don't restate it.
+For standing up a new repo on this framework, follow `docs/dev-standards/ROLLOUT.md`.

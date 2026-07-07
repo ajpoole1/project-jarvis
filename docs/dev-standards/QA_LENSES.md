@@ -38,15 +38,22 @@ Did the build exceed the spec, and is any mechanism more elaborate than the prob
 
 **Format contract.** A convention lens is any standards document ending in a section titled exactly `## Review Checklist` — terse, one check per line, each independently verifiable against a diff. Prose above the tail is for the builder to learn from; the tail is what the reviewer enforces. One file, two consumers.
 
-**Declaration.** The repo's `CHARTER.md` carries a `## QA Lenses` section listing the applicable documents by path, e.g.:
+**Declaration.** The repo's `CHARTER.md` carries a `## QA Lenses` section. The first line declares the standards root; subsequent lines list the applicable lens documents:
 
 ```
 ## QA Lenses
-- docs/dev-standards/PY_STANDARDS.md
+standards_root: <path>
+- @std/PY_STANDARDS.md
 - docs/guides/SKILL_GUIDE.md
 ```
 
-**Lifecycle.** New standard → write the doc with a checklist tail → add one line to the charter. Nothing else changes. A future repo (SQL/Airflow-heavy) declares different lenses in the same slot; the QA apparatus lifts across unmodified.
+`standards_root` is the directory holding the shared standards library. In the hub repo (`project-jarvis`) it is a repo-relative path (`docs/dev-standards`). In a consuming repo it is the absolute path to the hub checkout's `docs/dev-standards/` directory. When the standalone dev-standards repo exists (Phase D), migration is one `standards_root` line update per consuming repo.
+
+Lens paths prefixed `@std/` resolve against `standards_root` — `@std/PY_STANDARDS.md` resolves to `<standards_root>/PY_STANDARDS.md`. Unprefixed paths remain repo-root-relative and are used for repo-local guides.
+
+**Fail loud.** An `@std/` path with no `standards_root` declared, or a resolved path that does not exist on disk, is a **blocking configuration finding** in the `/qa` verdict — type `convention`, location `CHARTER.md`. It is never silently skipped.
+
+**Lifecycle.** New standard → write the doc with a checklist tail → add one `@std/` line to the charter. Nothing else changes. A future repo (SQL/Airflow-heavy) declares different lenses in the same slot; the QA apparatus lifts across unmodified.
 
 ## §4. Output contract
 

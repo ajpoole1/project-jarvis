@@ -1,7 +1,7 @@
 # DEV_BASE.md — Development Constitution
 
 status: canonical. Supersedes `BUILDER_BASE.md` (moved and reframed; all pointers updated in the same pass — the old file no longer exists).
-scope: **repo-agnostic.** This document governs *any agent holding a pen in any repo that adopts it* — the interactive author session and every named builder alike. It contains no repo names, paths, stacks, or test commands; those live in each repo's `CHARTER.md`. This directory (`docs/dev-standards/`) is the extraction seam for the future multi-repo hub: lifting it must be a `git mv`, never a rewrite.
+scope: **repo-agnostic.** This document governs *any agent holding a pen in any repo that adopts it* — the interactive author session and every named builder alike. It contains no repo names, paths, stacks, or test commands; those live in each repo's `CHARTER.md`. This directory (`docs/dev-standards/`) is the extraction seam for the future multi-repo hub: lifting it must be a `git mv`, never a rewrite. The hub is now multi-repo-consumable via `standards_root` + `@std/` lens resolution — see `ROLLOUT.md` for the stand-up recipe. A standalone dev-standards repo (Phase D) remains the end state.
 
 ---
 

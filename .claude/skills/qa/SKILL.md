@@ -21,10 +21,16 @@ Extract the item ID. Look for `knowledge/dev-notes/queue/<id>.md`. If it exists,
 Run `git diff origin/main...HEAD`. Read the full output. This is the complete set of changes under review.
 
 **Step 3 — Read charter lens declarations**
-Read `CHARTER.md` → `## QA Lenses` section. Note the listed convention-lens documents.
+Read `CHARTER.md` → `## QA Lenses` section. Extract `standards_root` (the first line after the section heading) and the list of lens paths.
+
+Resolve each path:
+- Paths prefixed `@std/` resolve to `<standards_root>/<rest-of-path>`. Example: `@std/PY_STANDARDS.md` with `standards_root: docs/dev-standards` → `docs/dev-standards/PY_STANDARDS.md`.
+- Unprefixed paths are repo-root-relative and used as-is.
+
+**Fail loud:** if an `@std/` path is declared but `standards_root` is absent, or the resolved path does not exist on disk, emit a blocking `convention` defect at location `CHARTER.md` and do not skip the lens — this is a configuration error, not an absence of content.
 
 **Step 4 — Read checklist tails**
-For each declared convention lens, read only the `## Review Checklist` section at the bottom of that document. Do not read the full document — the checklist is the enforced surface.
+For each resolved convention lens path, read only the `## Review Checklist` section at the bottom of that document. Do not read the full document — the checklist is the enforced surface.
 
 **Step 5 — Review**
 Review the diff through:
