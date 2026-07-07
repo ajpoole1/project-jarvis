@@ -24,7 +24,7 @@ The crew is a **projection of git state plus a launcher** — personas are confi
 1. **Two human gates:** the operator authorizes the spec (gate #1) and reviews + merges the PR (gate #2). Neither is a rubber stamp; they are the outside checks.
 2. **No auto-merge.** Merge is the only thing that touches `main`, and only the operator does it.
 3. **No orchestrator-autonomous builder spawn.** Summoning a builder is an explicit operator command, never automatic on authorize. A human is in every spawn.
-4. **Heterogeneous QA.** Tom is non-Claude. Never swap him to a Claude model — the decorrelation is the entire point; two same-family models share blind spots.
+4. **Heterogeneous QA.** Tom's primary reviewer is non-Claude (Gemini). Never swap the primary to a Claude model — the decorrelation is the entire point; two same-family models share blind spots. **Documented exception:** if Gemini is unavailable after full retry exhaustion (§8.5 retry budget), Tom may fall back to a Claude model for that run only, so merges aren't blocked by a third-party outage. Every fallback verdict is labeled "Claude fallback — Gemini unavailable" in the PR comment and Discord notification — it is never presented as an ordinary Tom pass. The fallback is a resilience valve, not a routine path; if it fires often, that's a signal to revisit the primary provider, not to make Claude the new default.
 5. **Authorize and summon are separate actions.** Authorize = "this spec is correct." Summon = "build it now." The operator may authorize many and summon few.
 
 ## 4. Guiding principles (carry into every build)
@@ -110,6 +110,8 @@ The allow/deny from §5. Background/unattended sessions auto-deny anything not a
 
 ### 8.5 QA contract (Tom's output)
 Tom returns JSON with three arrays: `spec_conformance` (deviations, severity), `defects` (blocking: bug/edge/security/missing-test, with location), `architecture_notes` (advisory). **Gate:** any blocking defect or blocking conformance deviation fails the workflow → blocks the (protected-branch) merge. Advisory notes flow to the backlog. **Fail-closed:** if Tom can't run, the check is red and an alert fires — never green.
+
+**Retry budget & fallback (per invariant #4):** the primary reviewer (Gemini) gets 5 attempts with exponential backoff on transient HTTP 429/503 or network errors, plus up to 3 attempts to recover a parseable JSON response. Only after that full budget is exhausted does the workflow attempt the Claude fallback — a single call, same prompt and schema, clearly labeled in the PR comment and Discord ping as a fallback verdict. If the fallback call also fails, the check stays red (fail-closed still holds — there is no third tier).
 
 ### 8.6 Persona `CLAUDE.md` (five blocks)
 1. **Identity** — name, role, repos owned.

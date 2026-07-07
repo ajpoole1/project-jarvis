@@ -8,6 +8,9 @@ name: QA Gate
 #
 # Secrets required in repo settings:
 #   QA_MODEL_API_KEY        — Google AI Studio key (gemini-3.5-flash); add $5/mo hard spend cap
+#   ANTHROPIC_API_KEY       — optional; Claude fallback used only if Gemini's retry budget is
+#                             exhausted (DEV_LOOP_REFERENCE §3 invariant #4, amended). Without
+#                             it, a Gemini outage still fails closed as before.
 #   DISCORD_DEVLOOP_WEBHOOK — Discord webhook for verdict pings
 
 on:
@@ -56,4 +59,5 @@ jobs:
       pr_number: ${{ github.event.pull_request.number }}
     secrets:
       QA_MODEL_API_KEY: ${{ secrets.QA_MODEL_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       DISCORD_DEVLOOP_WEBHOOK: ${{ secrets.DISCORD_DEVLOOP_WEBHOOK }}

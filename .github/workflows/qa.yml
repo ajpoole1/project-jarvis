@@ -27,6 +27,8 @@ on:
     secrets:
       QA_MODEL_API_KEY:
         required: true
+      ANTHROPIC_API_KEY:
+        required: false
       DISCORD_DEVLOOP_WEBHOOK:
         required: false
 
@@ -121,10 +123,11 @@ jobs:
           echo "$CLAUDE_MD" >> "$GITHUB_OUTPUT"
           echo "CTX_EOF" >> "$GITHUB_OUTPUT"
 
-      - name: Run Tom (Gemini QA)
+      - name: Run Tom (Gemini QA, Claude fallback)
         id: qa
         env:
           QA_MODEL_API_KEY: ${{ secrets.QA_MODEL_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PR_NUMBER: ${{ inputs.pr_number }}
           DIFF: ${{ steps.diff.outputs.diff }}
           SPEC: ${{ steps.spec.outputs.spec }}
@@ -133,9 +136,16 @@ jobs:
           QA_MIN_DIFF_LINES: ${{ inputs.qa_min_diff_lines }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, re, sys, time, requests
+          import json, os, sys, requests
           sys.path.insert(0, "scripts/dev-loop")
-          from tom_qa_helpers import count_changed_lines, make_skip_findings, parse_min_diff_lines, is_spec_only_diff
+          from tom_qa_helpers import (
+              count_changed_lines,
+              make_skip_findings,
+              parse_min_diff_lines,
+              is_spec_only_diff,
+              call_gemini_qa,
+              call_claude_fallback,
+          )
 
           # Read untrusted inputs from the environment, never by templating GitHub
           # Actions expressions into the script source. The diff can contain triple-quotes,
@@ -250,118 +260,27 @@ jobs:
           {diff}
           """
 
-          payload = {
-            "model": "gemini-3.5-flash",
-            "messages": [
-              {"role": "system", "content": system_prompt},
-              {"role": "user", "content": user_content}
-            ],
-            "response_format": {"type": "json_object"},
-            "max_tokens": 65536,
-          }
+          # Primary reviewer: Gemini, with its full retry budget (see tom_qa_helpers).
+          # PR #43 post-mortem: 3 consecutive 503s exhausted the old budget; increased to 5.
+          reviewer = "gemini"
+          findings = call_gemini_qa(api_key, system_prompt, user_content, requests)
 
-          # Outer loop: retry the full model call if JSON parse fails (up to _MAX_JSON_ATTEMPTS).
-          # Inner loop: retry on transient HTTP 503/429 or network errors with exponential backoff.
-          # PR #43 post-mortem: 3 consecutive 503s exhausted the budget; increased to 5.
-          # Persistent HTTP errors or all retries exhausted → fail closed (sys.exit(1)).
-          _RETRY_STATUSES = {429, 503}
-          _MAX_ATTEMPTS = 5
-          _MAX_JSON_ATTEMPTS = 3
-          findings = None
-          _last_raw = ""
-
-          for _json_attempt in range(1, _MAX_JSON_ATTEMPTS + 1):
-            resp = None
-            for _attempt in range(1, _MAX_ATTEMPTS + 1):
-              try:
-                resp = requests.post(
-                  "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-                  headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                  },
-                  json=payload,
-                  timeout=120,
-                )
-              except requests.exceptions.RequestException as _net_err:
-                _delay = 2 * (2 ** (_attempt - 1))
-                if _attempt < _MAX_ATTEMPTS:
-                  print(f"Tom network error (attempt {_attempt}/{_MAX_ATTEMPTS}): {_net_err} — retrying in {_delay}s", file=sys.stderr)
-                  time.sleep(_delay)
-                  continue
-                print(f"Tom network error persisted after {_MAX_ATTEMPTS} attempts: {_net_err} — failing closed", file=sys.stderr)
-                sys.exit(1)
-              if resp.status_code not in _RETRY_STATUSES:
-                break
-              _delay = 2 * (2 ** (_attempt - 1))
-              if _attempt < _MAX_ATTEMPTS:
-                print(f"Tom transient {resp.status_code} (attempt {_attempt}/{_MAX_ATTEMPTS}) — retrying in {_delay}s", file=sys.stderr)
-                time.sleep(_delay)
-              else:
-                print(f"Tom transient {resp.status_code} persisted after {_MAX_ATTEMPTS} attempts — failing closed", file=sys.stderr)
-
-            if resp is None or resp.status_code != 200:
-              print(f"Tom API error {resp.status_code if resp else 'no response'}: {resp.text[:500] if resp else ''}", file=sys.stderr)
-              sys.exit(1)
-
-            try:
-              _last_raw = resp.json()["choices"][0]["message"]["content"]
-            except (KeyError, IndexError, ValueError, Exception) as _shape_err:
-              if _json_attempt < _MAX_JSON_ATTEMPTS:
-                print(f"Tom unexpected response shape (attempt {_json_attempt}/{_MAX_JSON_ATTEMPTS}): {_shape_err} — retrying", file=sys.stderr)
-                continue  # retry the model call
-              print(f"Tom ERROR: unexpected response shape after {_MAX_JSON_ATTEMPTS} attempts: {_shape_err}", file=sys.stderr)
-              print(f"Response body (first 500 chars): {str(resp.json())[:500]}", file=sys.stderr)
-              sys.exit(1)
-            try:
-              _m = re.search(r'\{.*\}', _last_raw, re.DOTALL)
-              findings = json.loads(_m.group(0) if _m else _last_raw)
-              break  # clean parse — exit JSON retry loop
-            except json.JSONDecodeError:
-              if _json_attempt < _MAX_JSON_ATTEMPTS:
-                print(f"Tom JSON parse failed (attempt {_json_attempt}/{_MAX_JSON_ATTEMPTS}) — re-requesting model", file=sys.stderr)
-              else:
-                # All parse attempts failed — try partial recovery by extracting
-                # spec_conformance and defects individually from the truncated response.
-                # architecture_notes is commonly the last field and gets cut off when
-                # Gemini's response exceeds the output budget; the key findings are earlier.
-                print(f"Tom JSON parse failed after {_MAX_JSON_ATTEMPTS} attempts — attempting partial recovery.", file=sys.stderr)
-                print(f"Raw output (first 2000 chars):", file=sys.stderr)
-                print(_last_raw[:2000], file=sys.stderr)
-
-                def _extract_array(raw, key):
-                  """Extract a JSON array for key from potentially-truncated JSON."""
-                  m = re.search(r'"' + re.escape(key) + r'"\s*:\s*(\[)', raw, re.DOTALL)
-                  if not m:
-                    return None
-                  start = m.start(1)
-                  depth = 0
-                  for i, ch in enumerate(raw[start:]):
-                    if ch == '[':
-                      depth += 1
-                    elif ch == ']':
-                      depth -= 1
-                      if depth == 0:
-                        try:
-                          return json.loads(raw[start:start + i + 1])
-                        except json.JSONDecodeError:
-                          return None
-                  return None
-
-                sc = _extract_array(_last_raw, "spec_conformance")
-                df = _extract_array(_last_raw, "defects")
-                if sc is not None and df is not None:
-                  findings = {
-                    "spec_conformance": sc,
-                    "defects": df,
-                    "architecture_notes": [
-                      "[Partial response — Gemini output truncated before architecture_notes; spec_conformance and defects recovered]"
-                    ],
-                  }
-                  print("Tom WARNING: JSON truncated but spec_conformance+defects recovered — proceeding with partial results.", file=sys.stderr)
-                else:
-                  print(f"Tom ERROR: JSON parse and partial recovery both failed after {_MAX_JSON_ATTEMPTS} attempts.", file=sys.stderr)
+          # Fallback (DEV_LOOP_REFERENCE §3 invariant #4, amended): only after Gemini's
+          # full retry budget is exhausted, and only if a Claude key is configured. This
+          # is a resilience valve for provider outages, not a routine reviewer path — the
+          # verdict is always labeled so a Claude-reviewed PR is never mistaken for a
+          # normal Tom (Gemini) pass.
+          if findings is None:
+              anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+              if not anthropic_key:
+                  print("Tom ERROR: Gemini retry budget exhausted and no ANTHROPIC_API_KEY configured — failing closed.", file=sys.stderr)
                   sys.exit(1)
+              print("Tom: Gemini retry budget exhausted — attempting Claude fallback (single attempt).", file=sys.stderr)
+              findings = call_claude_fallback(anthropic_key, system_prompt, user_content, requests)
+              if findings is None:
+                  print("Tom ERROR: Claude fallback also failed — failing closed (no third tier).", file=sys.stderr)
+                  sys.exit(1)
+              reviewer = "claude-fallback"
 
           # Validate shape
           for key in ("spec_conformance", "defects", "architecture_notes"):
@@ -372,6 +291,7 @@ jobs:
             f.write("findings<<FINDINGS_EOF\n")
             f.write(json.dumps(findings, indent=2))
             f.write("\nFINDINGS_EOF\n")
+            f.write(f"reviewer={reviewer}\n")
 
           # Determine verdict
           blocking_conformance = [x for x in findings["spec_conformance"] if x.get("severity") == "blocking"]
@@ -387,7 +307,7 @@ jobs:
             f.write(f"blocking_count={len(blocking_conformance) + len(blocking_defects)}\n")
             f.write(f"artifact_type={artifact_type}\n")
 
-          print(f"Verdict: {'FAIL' if has_blocking else 'PASS'} — {len(blocking_defects)} blocking defect(s), {len(blocking_conformance)} blocking conformance deviation(s)")
+          print(f"Verdict: {'FAIL' if has_blocking else 'PASS'} ({reviewer}) — {len(blocking_defects)} blocking defect(s), {len(blocking_conformance)} blocking conformance deviation(s)")
           PYEOF
 
       - name: Write qa-findings artifact
@@ -413,12 +333,14 @@ jobs:
           FINDINGS: ${{ steps.qa.outputs.findings || '' }}
           VERDICT: ${{ steps.qa.outputs.verdict || 'ERROR' }}
           BLOCKING: ${{ steps.qa.outputs.blocking_count || '?' }}
+          REVIEWER: ${{ steps.qa.outputs.reviewer || 'gemini' }}
         run: |
           python3 - <<'PYEOF'
           import json, os, subprocess, sys
 
           verdict = os.environ.get("VERDICT", "ERROR")
           findings_raw = os.environ.get("FINDINGS", "")
+          reviewer = os.environ.get("REVIEWER", "gemini")
           pr_number = "${{ inputs.pr_number }}"
 
           if not findings_raw:
@@ -430,7 +352,8 @@ jobs:
               body = f"## Tom QA — ERROR\n\nCould not parse Tom's response. Raw output:\n```\n{findings_raw[:1000]}\n```"
             else:
               emoji = "✅" if verdict == "PASS" else ("⏭️" if verdict == "SKIP" else "🚫")
-              lines = [f"## Tom QA — {emoji} {verdict}", ""]
+              title_suffix = " (Claude fallback — Gemini unavailable)" if reviewer == "claude-fallback" else ""
+              lines = [f"## Tom QA — {emoji} {verdict}{title_suffix}", ""]
 
               blocking_d = [x for x in findings.get("defects", []) if x.get("severity") == "blocking"]
               advisory_d = [x for x in findings.get("defects", []) if x.get("severity") != "blocking"]
@@ -463,7 +386,10 @@ jobs:
                 lines.append("")
 
               lines.append("---")
-              lines.append("*Reviewed by Tom (Gemini) — non-Claude QA gate. See [DEV_LOOP_REFERENCE](docs/dev-loop/DEV_LOOP_REFERENCE.md) §8.5.*")
+              if reviewer == "claude-fallback":
+                lines.append("*Reviewed by Tom's Claude fallback — Gemini's retry budget was exhausted (provider outage), so this run used the documented fallback path instead of the usual non-Claude decorrelation. See [DEV_LOOP_REFERENCE](docs/dev-loop/DEV_LOOP_REFERENCE.md) §3 invariant #4 and §8.5.*")
+              else:
+                lines.append("*Reviewed by Tom (Gemini) — non-Claude QA gate. See [DEV_LOOP_REFERENCE](docs/dev-loop/DEV_LOOP_REFERENCE.md) §8.5.*")
               body = "\n".join(lines)
 
           result = subprocess.run(
@@ -482,6 +408,7 @@ jobs:
           BLOCKING: ${{ steps.qa.outputs.blocking_count || '?' }}
           ARTIFACT_TYPE: ${{ steps.qa.outputs.artifact_type || 'code' }}
           FINDINGS: ${{ steps.qa.outputs.findings || '' }}
+          REVIEWER: ${{ steps.qa.outputs.reviewer || 'gemini' }}
           PR_NUM: ${{ inputs.pr_number }}
           ITEM_ID: ${{ steps.spec.outputs.item_id }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
