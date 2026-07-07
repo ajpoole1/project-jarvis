@@ -409,6 +409,53 @@ def job_lints(nonce: str) -> bool:
         _alert(f"lint: spine_check.py not found at {checker_src}")
         ok = False
 
+    # Lint 6: settings.json registry sync — every hook path in CHUNK_HOOKS must be
+    # registered as a live SessionStart hook in ~/.claude/settings.json, and vice
+    # versa. A chunk hook that exists on disk and is known to the compiler/checker
+    # but never registered in settings.json fires in neither compiler nor checker
+    # (it isn't rewritten, and check_hooks() would happily run+PASS a script that
+    # never actually delivers in a real session) — this is the exact "the checker
+    # doesn't know it's not running" failure class this system exists to kill.
+    import json as _json
+
+    settings_path = Path("/home/ajpoole/.claude/settings.json")
+    if settings_path.exists():
+        try:
+            settings = _json.loads(settings_path.read_text(encoding="utf-8"))
+        except _json.JSONDecodeError as exc:
+            _alert(f"lint: settings.json unparseable: {exc}")
+            ok = False
+        else:
+            registered = {
+                h.get("command", "")
+                for entry in settings.get("hooks", {}).get("SessionStart", [])
+                for h in entry.get("hooks", [])
+            }
+            compiler_paths = {str(hook_path) for hook_path, _, _ in CHUNK_HOOKS}
+            missing_in_settings = compiler_paths - registered
+            missing_in_compiler = {
+                p for p in registered if p.startswith(str(HOOK_DIR))
+            } - compiler_paths
+            if missing_in_settings:
+                _alert(
+                    f"chunk registry drift: {sorted(missing_in_settings)} registered in "
+                    "CHUNK_HOOKS but not in ~/.claude/settings.json SessionStart hooks "
+                    "— this chunk is never actually fired in a live session"
+                )
+                ok = False
+            if missing_in_compiler:
+                _alert(
+                    f"chunk registry drift: {sorted(missing_in_compiler)} registered as a "
+                    "live SessionStart hook but not in CHUNK_HOOKS — the daily checker "
+                    "cannot verify it and a break would go unnoticed"
+                )
+                ok = False
+            if not missing_in_settings and not missing_in_compiler:
+                _log(f"lint: settings.json registry in sync ({len(compiler_paths)} hooks)")
+    else:
+        _alert(f"lint: settings.json not found at {settings_path}")
+        ok = False
+
     return ok
 
 
