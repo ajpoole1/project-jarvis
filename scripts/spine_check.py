@@ -3,7 +3,7 @@
 spine_check.py — daily sentinel verification (file-based, no gateway dependency).
 
 Checks:
-  1. Today's nonce is present in all 4 hook scripts.
+  1. Today's nonce is present in / emitted by all chunk hook scripts.
   2. MEMORY.md final line is the expected tail sentinel for today's nonce.
   3. State file exists and is dated today.
   4. /opt/jarvis-live git tripwire: no uncommitted changes, no divergence from origin/main.
@@ -31,11 +31,16 @@ MEMORY_MD = Path(
 )
 
 HOOK_DIR = Path("/home/ajpoole/.claude/hooks")
+# Each entry: (path, chunk_name, check_literal_nonce)
+# check_literal_nonce=True  → old pattern: nonce baked as literal in script text
+# check_literal_nonce=False → new pattern: hook reads nonce from state file at emission;
+#                              spine_check verifies by running the hook and inspecting output
 CHUNK_HOOKS = [
-    (HOOK_DIR / "jarvis-spine-redlines-core.sh", "REDLINES-CORE"),
-    (HOOK_DIR / "jarvis-spine-redlines-untrusted.sh", "REDLINES-UNTRUSTED"),
-    (HOOK_DIR / "jarvis-spine-routing-a.sh", "ROUTING-A"),
-    (HOOK_DIR / "jarvis-spine-routing-b.sh", "ROUTING-B"),
+    (HOOK_DIR / "jarvis-spine-redlines-core.sh", "REDLINES-CORE", False),
+    (HOOK_DIR / "jarvis-spine-redlines-gate.sh", "REDLINES-GATE", False),
+    (HOOK_DIR / "jarvis-spine-redlines-untrusted.sh", "REDLINES-UNTRUSTED", True),
+    (HOOK_DIR / "jarvis-spine-routing-a.sh", "ROUTING-A", True),
+    (HOOK_DIR / "jarvis-spine-routing-b.sh", "ROUTING-B", True),
 ]
 
 
@@ -73,18 +78,44 @@ def _alert(msg: str) -> None:
 
 
 def check_hooks(nonce: str) -> list[str]:
-    """Return a list of failure strings (empty = all pass)."""
+    """Return a list of failure strings (empty = all pass).
+
+    Hooks that bake the nonce as a literal are checked by text scan.
+    Hooks that read the nonce from the state file at emission are checked
+    by running the hook and verifying the output contains today's nonce.
+    """
+    import subprocess as sp
+
     failures = []
-    for hook_path, chunk_name in CHUNK_HOOKS:
+    for hook_path, chunk_name, check_literal in CHUNK_HOOKS:
         if not hook_path.exists():
             failures.append(f"{chunk_name}: hook file missing")
             continue
-        text = hook_path.read_text(encoding="utf-8")
         expected = f"nonce-{nonce}"
-        if expected not in text:
-            failures.append(f"{chunk_name}: nonce-{nonce} not found in hook")
+        if check_literal:
+            text = hook_path.read_text(encoding="utf-8")
+            if expected not in text:
+                failures.append(f"{chunk_name}: nonce-{nonce} not found in hook")
+            else:
+                _log(f"hook OK: {chunk_name} contains nonce-{nonce}")
         else:
-            _log(f"hook OK: {chunk_name} contains nonce-{nonce}")
+            try:
+                result = sp.run(
+                    ["bash", str(hook_path)],
+                    input='{"cwd":"/home/ajpoole/.openclaw/workspace"}',
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if expected not in result.stdout:
+                    failures.append(
+                        f"{chunk_name}: hook emission does not contain nonce-{nonce} "
+                        f"(got: {result.stdout[:80]!r})"
+                    )
+                else:
+                    _log(f"hook OK: {chunk_name} emitted nonce-{nonce}")
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{chunk_name}: hook execution failed: {exc}")
     return failures
 
 
@@ -169,7 +200,8 @@ def main() -> int:
         _alert("; ".join(failures))
         return 1
 
-    msg = f"✅ spine-check PASS nonce-{nonce}: all 4 hooks + MEMORY tail OK"
+    n = len(CHUNK_HOOKS)
+    msg = f"✅ spine-check PASS nonce-{nonce}: all {n} hooks + MEMORY tail OK"
     _log(msg)
     _post(msg)
     return 0
