@@ -9,7 +9,10 @@ import time
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODEL = "claude-opus-4-8"
+# Pinned explicitly — do not remove the pin or let this fall through to an
+# API default, which could silently resolve to an older Sonnet (4.6) family
+# model on a client/version bump. AJ specified sonnet-5 for this fallback.
+ANTHROPIC_MODEL = "claude-sonnet-5"
 RETRY_STATUSES = {429, 503}
 MAX_ATTEMPTS = 5
 MAX_JSON_ATTEMPTS = 3
@@ -122,14 +125,19 @@ def recover_partial_findings(raw: str) -> dict | None:
 
 def call_gemini_qa(
     api_key: str, system_prompt: str, user_content: str, requests_mod
-) -> dict | None:
+) -> tuple[dict | None, str | None]:
     """Call Gemini (via the OpenAI-compatible endpoint) with the full Tom retry budget.
 
     Retries transient HTTP 429/503 and network errors up to MAX_ATTEMPTS times with
     exponential backoff; retries a full model call up to MAX_JSON_ATTEMPTS times if
-    the response can't be parsed as JSON. Returns the parsed findings dict, or None
-    if the entire retry budget is exhausted without a usable response — callers
-    should treat None as "primary reviewer unavailable" and consider the fallback.
+    the response can't be parsed as JSON.
+
+    Returns (findings, failure_reason). On success, findings is a dict and
+    failure_reason is None. On exhaustion, findings is None and failure_reason
+    is a short human-readable string naming what actually happened (e.g.
+    "5 consecutive HTTP 503 from Gemini") — callers surface this verbatim in
+    the PR comment / Discord ping so a fallback is never a silent swap; it is
+    a loud, explained degradation.
     """
     payload = {
         "model": "gemini-3.5-flash",
@@ -143,6 +151,8 @@ def call_gemini_qa(
 
     for json_attempt in range(1, MAX_JSON_ATTEMPTS + 1):
         resp = None
+        last_status = None
+        net_err_desc = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 resp = requests_mod.post(
@@ -155,6 +165,7 @@ def call_gemini_qa(
                     timeout=120,
                 )
             except requests_mod.exceptions.RequestException as net_err:
+                net_err_desc = str(net_err)
                 delay = 2 * (2 ** (attempt - 1))
                 if attempt < MAX_ATTEMPTS:
                     print(
@@ -164,12 +175,14 @@ def call_gemini_qa(
                     )
                     time.sleep(delay)
                     continue
+                reason = f"{MAX_ATTEMPTS} consecutive network errors from Gemini ({net_err_desc})"
                 print(
                     f"Tom network error persisted after {MAX_ATTEMPTS} attempts: {net_err} "
                     "— exhausting Gemini retry budget",
                     file=sys.stderr,
                 )
-                return None
+                return None, reason
+            last_status = resp.status_code
             if resp.status_code not in RETRY_STATUSES:
                 break
             delay = 2 * (2 ** (attempt - 1))
@@ -188,12 +201,14 @@ def call_gemini_qa(
                 )
 
         if resp is None or resp.status_code != 200:
+            status_label = last_status if resp is not None else "no response"
+            reason = f"{MAX_ATTEMPTS} consecutive HTTP {status_label} from Gemini"
             print(
                 f"Tom API error {resp.status_code if resp else 'no response'}: "
                 f"{resp.text[:500] if resp else ''}",
                 file=sys.stderr,
             )
-            return None
+            return None, reason
 
         try:
             raw = resp.json()["choices"][0]["message"]["content"]
@@ -209,11 +224,14 @@ def call_gemini_qa(
                 f"Tom ERROR: unexpected response shape after {MAX_JSON_ATTEMPTS} attempts",
                 file=sys.stderr,
             )
-            return None
+            return (
+                None,
+                f"Gemini returned an unrecognized response shape after {MAX_JSON_ATTEMPTS} attempts",
+            )
 
         findings = extract_json_object(raw)
         if findings is not None:
-            return findings
+            return findings, None
 
         if json_attempt < MAX_JSON_ATTEMPTS:
             print(
@@ -235,25 +253,31 @@ def call_gemini_qa(
                 "— proceeding with partial results.",
                 file=sys.stderr,
             )
-            return recovered
+            return recovered, None
         print(
             f"Tom ERROR: JSON parse and partial recovery both failed after {MAX_JSON_ATTEMPTS} "
             "attempts.",
             file=sys.stderr,
         )
-        return None
+        return (
+            None,
+            f"Gemini's response could not be parsed as JSON after {MAX_JSON_ATTEMPTS} attempts",
+        )
 
-    return None
+    return None, "Gemini retry budget exhausted"
 
 
 def call_claude_fallback(
     api_key: str, system_prompt: str, user_content: str, requests_mod
-) -> dict | None:
+) -> tuple[dict | None, str | None]:
     """Single-attempt Claude fallback call, used only after Gemini's retry budget is exhausted.
 
     Per DEV_LOOP_REFERENCE §3 invariant #4: this is a resilience valve for outages,
     not a routine reviewer path. No retry loop here by design — if Claude also
-    fails, the check stays red (fail-closed holds; there is no third tier).
+    fails, the check stays red (fail-closed holds; there is no third tier, and the
+    workflow must not bounce back to Gemini).
+
+    Returns (findings, failure_reason), same contract as call_gemini_qa.
     """
     payload = {
         "model": ANTHROPIC_MODEL,
@@ -274,24 +298,27 @@ def call_claude_fallback(
         )
     except requests_mod.exceptions.RequestException as net_err:
         print(f"Tom fallback (Claude) network error: {net_err}", file=sys.stderr)
-        return None
+        return None, f"Claude fallback network error: {net_err}"
 
     if resp.status_code != 200:
         print(
             f"Tom fallback (Claude) API error {resp.status_code}: {resp.text[:500]}",
             file=sys.stderr,
         )
-        return None
+        return None, f"Claude fallback returned HTTP {resp.status_code}"
 
     try:
         raw = resp.json()["content"][0]["text"]
     except (KeyError, IndexError, ValueError):
         print("Tom fallback (Claude) unexpected response shape", file=sys.stderr)
-        return None
+        return None, "Claude fallback returned an unrecognized response shape"
 
     findings = extract_json_object(raw)
     if findings is not None:
-        return findings
+        return findings, None
 
     print("Tom fallback (Claude) JSON parse failed — attempting partial recovery.", file=sys.stderr)
-    return recover_partial_findings(raw)
+    recovered = recover_partial_findings(raw)
+    if recovered is not None:
+        return recovered, None
+    return None, "Claude fallback's response could not be parsed as JSON"

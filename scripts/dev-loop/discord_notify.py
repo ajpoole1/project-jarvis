@@ -20,14 +20,17 @@ def main() -> None:
     artifact_type = os.environ.get("ARTIFACT_TYPE", "code")
     findings_raw = os.environ.get("FINDINGS", "")
     reviewer = os.environ.get("REVIEWER", "gemini")
+    fallback_reason = os.environ.get("FALLBACK_REASON", "")
     pr = os.environ.get("PR_NUM", "?")
     item = os.environ.get("ITEM_ID", "")
     run_url = os.environ.get("RUN_URL", "")
 
     item_label = f" ({item})" if item and item != "none" else ""
-    fallback_label = (
-        " [Claude fallback — Gemini unavailable]" if reviewer == "claude-fallback" else ""
-    )
+    if reviewer == "claude-fallback":
+        reason_note = f" ({fallback_reason})" if fallback_reason else ""
+        fallback_label = f" [Claude fallback — Gemini unavailable{reason_note}]"
+    else:
+        fallback_label = ""
 
     if artifact_type == "spec":
         msg = f"[SPEC — advisory] ✅ Tom QA PASS — PR #{pr}{item_label} — spec-only diff, advisory notes only."
@@ -59,7 +62,11 @@ def main() -> None:
         if len(msg) > 1900:
             msg = msg[:1900] + "\n  … (truncated)"
     else:
-        msg = f"⚠️ Tom QA ERROR — PR #{pr}{item_label} — Tom could not run. Merge is blocked. See: {run_url}"
+        reason_note = f" Reason: {fallback_reason}." if fallback_reason else ""
+        msg = (
+            f"⚠️ Tom QA ERROR — PR #{pr}{item_label} — Tom could not run "
+            f"(Gemini and Claude fallback both failed).{reason_note} Merge is blocked. See: {run_url}"
+        )
 
     data = json.dumps({"content": msg}).encode()
     req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})

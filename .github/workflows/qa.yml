@@ -145,6 +145,7 @@ jobs:
               is_spec_only_diff,
               call_gemini_qa,
               call_claude_fallback,
+              ANTHROPIC_MODEL,
           )
 
           # Read untrusted inputs from the environment, never by templating GitHub
@@ -263,24 +264,36 @@ jobs:
           # Primary reviewer: Gemini, with its full retry budget (see tom_qa_helpers).
           # PR #43 post-mortem: 3 consecutive 503s exhausted the old budget; increased to 5.
           reviewer = "gemini"
-          findings = call_gemini_qa(api_key, system_prompt, user_content, requests)
+          fallback_reason = None
+          findings, gemini_failure_reason = call_gemini_qa(api_key, system_prompt, user_content, requests)
 
           # Fallback (DEV_LOOP_REFERENCE §3 invariant #4, amended): only after Gemini's
           # full retry budget is exhausted, and only if a Claude key is configured. This
           # is a resilience valve for provider outages, not a routine reviewer path — the
           # verdict is always labeled so a Claude-reviewed PR is never mistaken for a
-          # normal Tom (Gemini) pass.
+          # normal Tom (Gemini) pass, and the PR comment/Discord ping states WHY Gemini
+          # was skipped (loud degradation, not a silent swap).
           if findings is None:
               anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
               if not anthropic_key:
-                  print("Tom ERROR: Gemini retry budget exhausted and no ANTHROPIC_API_KEY configured — failing closed.", file=sys.stderr)
+                  reason = f"{gemini_failure_reason}; no ANTHROPIC_API_KEY configured"
+                  print(f"Tom ERROR: {reason} — failing closed.", file=sys.stderr)
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write(f"fallback_reason={reason}\n")
                   sys.exit(1)
-              print("Tom: Gemini retry budget exhausted — attempting Claude fallback (single attempt).", file=sys.stderr)
-              findings = call_claude_fallback(anthropic_key, system_prompt, user_content, requests)
+              print(f"Tom: {gemini_failure_reason} — attempting Claude ({ANTHROPIC_MODEL}) fallback (single attempt).", file=sys.stderr)
+              findings, claude_failure_reason = call_claude_fallback(anthropic_key, system_prompt, user_content, requests)
               if findings is None:
-                  print("Tom ERROR: Claude fallback also failed — failing closed (no third tier).", file=sys.stderr)
+                  # Terminal state: no third tier, no bouncing back to Gemini. Both
+                  # providers are named explicitly so this doesn't read as an
+                  # ambiguous "something broke" — it's "here is exactly what broke".
+                  reason = f"Gemini failed ({gemini_failure_reason}); Claude fallback also failed ({claude_failure_reason})"
+                  print(f"Tom ERROR: {reason} — failing closed.", file=sys.stderr)
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write(f"fallback_reason={reason}\n")
                   sys.exit(1)
               reviewer = "claude-fallback"
+              fallback_reason = gemini_failure_reason
 
           # Validate shape
           for key in ("spec_conformance", "defects", "architecture_notes"):
@@ -292,6 +305,7 @@ jobs:
             f.write(json.dumps(findings, indent=2))
             f.write("\nFINDINGS_EOF\n")
             f.write(f"reviewer={reviewer}\n")
+            f.write(f"fallback_reason={fallback_reason or ''}\n")
 
           # Determine verdict
           blocking_conformance = [x for x in findings["spec_conformance"] if x.get("severity") == "blocking"]
@@ -307,7 +321,8 @@ jobs:
             f.write(f"blocking_count={len(blocking_conformance) + len(blocking_defects)}\n")
             f.write(f"artifact_type={artifact_type}\n")
 
-          print(f"Verdict: {'FAIL' if has_blocking else 'PASS'} ({reviewer}) — {len(blocking_defects)} blocking defect(s), {len(blocking_conformance)} blocking conformance deviation(s)")
+          reviewer_label = f"{reviewer} — {fallback_reason}" if fallback_reason else reviewer
+          print(f"Verdict: {'FAIL' if has_blocking else 'PASS'} ({reviewer_label}) — {len(blocking_defects)} blocking defect(s), {len(blocking_conformance)} blocking conformance deviation(s)")
           PYEOF
 
       - name: Write qa-findings artifact
@@ -334,6 +349,7 @@ jobs:
           VERDICT: ${{ steps.qa.outputs.verdict || 'ERROR' }}
           BLOCKING: ${{ steps.qa.outputs.blocking_count || '?' }}
           REVIEWER: ${{ steps.qa.outputs.reviewer || 'gemini' }}
+          FALLBACK_REASON: ${{ steps.qa.outputs.fallback_reason || '' }}
         run: |
           python3 - <<'PYEOF'
           import json, os, subprocess, sys
@@ -341,10 +357,12 @@ jobs:
           verdict = os.environ.get("VERDICT", "ERROR")
           findings_raw = os.environ.get("FINDINGS", "")
           reviewer = os.environ.get("REVIEWER", "gemini")
+          fallback_reason = os.environ.get("FALLBACK_REASON", "")
           pr_number = "${{ inputs.pr_number }}"
 
           if not findings_raw:
-            body = "## Tom QA — ERROR\n\nTom could not produce findings. This check is **red** by design (fail-closed). Investigate the workflow logs."
+            reason_note = f"\n\n**Reason:** {fallback_reason}" if fallback_reason else ""
+            body = f"## Tom QA — ERROR\n\nTom could not produce findings — both Gemini (primary) and the Claude fallback failed. This check is **red** by design (fail-closed).{reason_note}\n\nInvestigate the workflow logs."
           else:
             try:
               findings = json.loads(findings_raw)
@@ -354,6 +372,9 @@ jobs:
               emoji = "✅" if verdict == "PASS" else ("⏭️" if verdict == "SKIP" else "🚫")
               title_suffix = " (Claude fallback — Gemini unavailable)" if reviewer == "claude-fallback" else ""
               lines = [f"## Tom QA — {emoji} {verdict}{title_suffix}", ""]
+              if reviewer == "claude-fallback" and fallback_reason:
+                lines.append(f"⚠️ **Reviewed by Claude (claude-sonnet-5), not Gemini.** Reason: {fallback_reason}.")
+                lines.append("")
 
               blocking_d = [x for x in findings.get("defects", []) if x.get("severity") == "blocking"]
               advisory_d = [x for x in findings.get("defects", []) if x.get("severity") != "blocking"]
@@ -409,6 +430,7 @@ jobs:
           ARTIFACT_TYPE: ${{ steps.qa.outputs.artifact_type || 'code' }}
           FINDINGS: ${{ steps.qa.outputs.findings || '' }}
           REVIEWER: ${{ steps.qa.outputs.reviewer || 'gemini' }}
+          FALLBACK_REASON: ${{ steps.qa.outputs.fallback_reason || '' }}
           PR_NUM: ${{ inputs.pr_number }}
           ITEM_ID: ${{ steps.spec.outputs.item_id }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
