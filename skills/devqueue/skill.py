@@ -7,23 +7,31 @@ Commands:
   push <file>              Validate then add to knowledge/dev-notes/queue/ and push
                            to the dev-queue branch ONLY (hard-locked).
                            Requires prior approval via `approve <item-id>`.
+  close <item-id> <reason> Close a queue item WITHOUT building it (abandoned,
+                           superseded, no longer relevant). Flips status to
+                           `closed`, records the reason, moves the item from
+                           queue/ to archive/ on the dev-queue branch ONLY
+                           (hard-locked). `archive` is an accepted alias for
+                           this command. Requires prior approval via
+                           `approve <item-id>`, same as push.
   approve <item-id> <discord-user-id>
-                           Record AJ's approval for a push. Called by the Discord bot
-                           after verifying the ✅ reaction came from AJ's user ID.
-                           One approval covers one item, once.
+                           Record AJ's approval for a push or close. Called by
+                           the Discord bot after verifying the ✅ reaction came
+                           from AJ's user ID. One approval covers one item, once.
   list [queue|backlog|archive]  List items in a queue dir from the dev-queue branch
 
 Schema (REFERENCE §8.1):
   Required fields: id, title, status, scope, origin, author, created
-  status enum: proposed|authorized|building|built|merged
+  status enum: proposed|authorized|building|built|merged|closed
   scope enum: well-bounded-local|needs-design-pass
   origin enum: brainstorm|iteration-backlog
   id must match filename (without .md extension)
+  closed items additionally carry: closed_reason, closed_at
 
-Security: the push subcommand is physically unable to push to any branch or path
-other than dev-queue / knowledge/dev-notes/**. Any attempt to override is rejected
-before git is invoked. Push also requires an unconsumed approval record from AJ's
-Discord user ID. One approval covers one item, once.
+Security: the push and close subcommands are physically unable to touch any
+branch or path other than dev-queue / knowledge/dev-notes/**. Any attempt to
+override is rejected before git is invoked. Both require an unconsumed
+approval record from AJ's Discord user ID. One approval covers one item, once.
 """
 
 from __future__ import annotations
@@ -56,7 +64,7 @@ _LOG_PATH = (
 AJ_DISCORD_USER_ID = os.environ.get("AJ_DISCORD_USER_ID", "")
 
 REQUIRED_FIELDS = ["id", "title", "status", "scope", "origin", "author", "created"]
-STATUS_VALUES = {"proposed", "authorized", "building", "built", "merged"}
+STATUS_VALUES = {"proposed", "authorized", "building", "built", "merged", "closed"}
 SCOPE_VALUES = {"well-bounded-local", "needs-design-pass"}
 ORIGIN_VALUES = {"brainstorm", "iteration-backlog"}
 
@@ -186,6 +194,30 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     return fields, body
 
 
+def close_frontmatter(text: str, reason: str, closed_at: str) -> str:
+    """Return text with status flipped to 'closed' and closed_reason/closed_at
+    appended to the frontmatter block. Mirrors merged.yml's status-flip
+    approach (regex over the frontmatter block only, body untouched) but adds
+    the two extra fields a close needs that a merge-archival doesn't."""
+    m = re.match(r"^(---\r?\n)(.*?)(\r?\n---\r?\n?)(.*)$", text, re.DOTALL)
+    if not m:
+        raise ValueError("close_frontmatter: no frontmatter block found")
+    open_marker, fm_block, close_marker, body = m.groups()
+
+    fm_block = re.sub(r"^(status:\s*).*$", r"\g<1>closed", fm_block, count=1, flags=re.MULTILINE)
+    # This is a hand-rolled parser (parse_frontmatter), not real YAML: it strips
+    # exactly one leading/trailing quote pair and does no escape processing. So
+    # embedded double-quotes round-trip fine unescaped, but a newline in reason
+    # would inject a bogus extra "line" into the frontmatter block and corrupt
+    # it — collapse to single-line rather than let that happen silently.
+    single_line_reason = " ".join(reason.split())
+    fm_block = (
+        fm_block.rstrip("\n") + f'\nclosed_reason: "{single_line_reason}"\nclosed_at: {closed_at}'
+    )
+
+    return open_marker + fm_block + close_marker + body
+
+
 def validate_spec(path: Path) -> list[str]:
     """Return a list of validation errors (empty = valid)."""
     errors: list[str] = []
@@ -289,6 +321,66 @@ def _assert_approved(item_id: str, dest_rel: str) -> int:
     return approval_id
 
 
+# ── worktree acquisition (shared by push and close) ───────────────────────────
+
+
+def _acquire_dev_queue_worktree() -> Path:
+    """Fetch dev-queue and return a fresh worktree with it checked out.
+
+    Raises RuntimeError if the branch doesn't exist locally or remotely.
+    Caller owns cleanup of the returned path (git worktree remove --force,
+    falling back to shutil.rmtree).
+    """
+    try:
+        run_git("fetch", "origin", TARGET_BRANCH)
+    except RuntimeError:
+        print(
+            f"Warning: could not fetch origin/{TARGET_BRANCH} — proceeding with local state",
+            file=sys.stderr,
+        )
+
+    local_exists = True
+    try:
+        run_git("rev-parse", "--verify", TARGET_BRANCH)
+    except RuntimeError:
+        local_exists = False
+
+    remote_exists = True
+    try:
+        run_git("rev-parse", "--verify", f"origin/{TARGET_BRANCH}")
+    except RuntimeError:
+        remote_exists = False
+
+    wt_path = Path(tempfile.mkdtemp(prefix="devqueue-wt-"))
+    if local_exists:
+        run_git("worktree", "add", str(wt_path), TARGET_BRANCH)
+        if remote_exists:
+            try:
+                run_git("merge", "--ff-only", f"origin/{TARGET_BRANCH}", cwd=wt_path)
+            except RuntimeError:
+                print(
+                    f"Warning: {TARGET_BRANCH} diverged from origin/{TARGET_BRANCH} — continuing without fast-forward",
+                    file=sys.stderr,
+                )
+    elif remote_exists:
+        run_git("worktree", "add", "-b", TARGET_BRANCH, str(wt_path), f"origin/{TARGET_BRANCH}")
+    else:
+        shutil.rmtree(str(wt_path), ignore_errors=True)
+        raise RuntimeError(
+            f"Branch '{TARGET_BRANCH}' does not exist locally or remotely. "
+            "Bootstrap it manually: git checkout --orphan dev-queue && git push -u origin dev-queue"
+        )
+
+    return wt_path
+
+
+def _release_worktree(wt_path: Path) -> None:
+    try:
+        run_git("worktree", "remove", "--force", str(wt_path))
+    except RuntimeError:
+        shutil.rmtree(str(wt_path), ignore_errors=True)
+
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 
@@ -372,46 +464,7 @@ def cmd_push(args: list[str]) -> int:
     wt_path: Path | None = None
     try:
         try:
-            run_git("fetch", "origin", TARGET_BRANCH)
-        except RuntimeError:
-            print(
-                f"Warning: could not fetch origin/{TARGET_BRANCH} — proceeding with local state",
-                file=sys.stderr,
-            )
-
-        local_exists = True
-        try:
-            run_git("rev-parse", "--verify", TARGET_BRANCH)
-        except RuntimeError:
-            local_exists = False
-
-        remote_exists = True
-        try:
-            run_git("rev-parse", "--verify", f"origin/{TARGET_BRANCH}")
-        except RuntimeError:
-            remote_exists = False
-
-        wt_path = Path(tempfile.mkdtemp(prefix="devqueue-wt-"))
-        try:
-            if local_exists:
-                run_git("worktree", "add", str(wt_path), TARGET_BRANCH)
-                if remote_exists:
-                    try:
-                        run_git("merge", "--ff-only", f"origin/{TARGET_BRANCH}", cwd=wt_path)
-                    except RuntimeError:
-                        print(
-                            f"Warning: {TARGET_BRANCH} diverged from origin/{TARGET_BRANCH} — continuing without fast-forward",
-                            file=sys.stderr,
-                        )
-            elif remote_exists:
-                run_git(
-                    "worktree", "add", "-b", TARGET_BRANCH, str(wt_path), f"origin/{TARGET_BRANCH}"
-                )
-            else:
-                raise RuntimeError(
-                    f"Branch '{TARGET_BRANCH}' does not exist locally or remotely. "
-                    "Bootstrap it manually: git checkout --orphan dev-queue && git push -u origin dev-queue"
-                )
+            wt_path = _acquire_dev_queue_worktree()
 
             dest_dir_path = wt_path / dest_dir
             dest_dir_path.mkdir(parents=True, exist_ok=True)
@@ -432,13 +485,109 @@ def cmd_push(args: list[str]) -> int:
             return 1
         finally:
             if wt_path is not None:
-                try:
-                    run_git("worktree", "remove", "--force", str(wt_path))
-                except RuntimeError:
-                    shutil.rmtree(str(wt_path), ignore_errors=True)
+                _release_worktree(wt_path)
 
     except Exception as e:  # noqa: BLE001 — OSError from mkdtemp, unexpected failures
         _log_attempt(item_id, TARGET_BRANCH, [dest_rel], str(approval_id), "FAILED", str(e))
+        _restore_approval(approval_id)
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_close(args: list[str]) -> int:
+    """close <item-id> <reason>
+
+    Close a queue item WITHOUT building it — abandoned, superseded, or no
+    longer relevant. Flips status to 'closed', records closed_reason and
+    closed_at in the frontmatter, and moves the item from queue/ to archive/
+    on the dev-queue branch. Hard-locked to that branch/path exactly like
+    push. Requires prior approval via `approve <item-id>`, same gate as push.
+    """
+    if len(args) < 2:
+        print('Usage: close <item-id> "<reason>"', file=sys.stderr)
+        return 1
+
+    item_id = args[0]
+    reason = " ".join(args[1:]).strip()
+    if not reason:
+        print('Usage: close <item-id> "<reason>" — reason cannot be empty', file=sys.stderr)
+        return 1
+
+    queue_rel = f"{DEVNOTES_ROOT}/queue/{item_id}.md"
+    archive_rel = f"{DEVNOTES_ROOT}/archive/{item_id}.md"
+
+    # Guard 1: hard-lock branch + path (no flag can override) — checked for both
+    # the read side (queue) and the write side (archive).
+    _assert_push_target(TARGET_BRANCH, str(PROJECT / queue_rel))
+    _assert_push_target(TARGET_BRANCH, str(PROJECT / archive_rel))
+
+    # Guard 2: approval gate — must have unconsumed AJ approval, same as push
+    approval_id = _assert_approved(item_id, archive_rel)
+
+    _log_attempt(
+        item_id,
+        TARGET_BRANCH,
+        [queue_rel, archive_rel],
+        str(approval_id),
+        "ALLOW",
+        "approval consumed",
+    )
+
+    wt_path: Path | None = None
+    try:
+        try:
+            wt_path = _acquire_dev_queue_worktree()
+
+            src_path = wt_path / queue_rel
+            if not src_path.exists():
+                raise RuntimeError(
+                    f"Item '{item_id}' not found at {queue_rel} on {TARGET_BRANCH} "
+                    "— may already be closed/archived, or the id is wrong."
+                )
+
+            spec_text = src_path.read_text(encoding="utf-8")
+            errors = validate_spec(src_path)
+            if errors:
+                # Still closeable — a malformed spec shouldn't be un-closeable — but
+                # warn loudly since close_frontmatter's regex needs a status: line.
+                print(
+                    f"Warning: '{item_id}' has schema errors (closing anyway): {errors}",
+                    file=sys.stderr,
+                )
+
+            closed_at = datetime.now(UTC).strftime("%Y-%m-%d")
+            updated_text = close_frontmatter(spec_text, reason, closed_at)
+
+            dest_dir_path = wt_path / f"{DEVNOTES_ROOT}/archive"
+            dest_dir_path.mkdir(parents=True, exist_ok=True)
+            (wt_path / archive_rel).write_text(updated_text, encoding="utf-8")
+
+            run_git("add", archive_rel, cwd=wt_path)
+            run_git("rm", "-f", queue_rel, cwd=wt_path)
+            run_git("commit", "-m", f"close: {item_id} ({reason})", cwd=wt_path)
+            run_git("push", "origin", TARGET_BRANCH, capture=False, cwd=wt_path)
+
+            logging.info(
+                "close succeeded item=%s approval_id=%s reason=%s", item_id, approval_id, reason
+            )
+            print(f"Closed '{item_id}' — moved {queue_rel} -> {archive_rel} ({reason})")
+            return 0
+
+        except (RuntimeError, SystemExit, ValueError) as e:
+            _log_attempt(
+                item_id, TARGET_BRANCH, [queue_rel, archive_rel], str(approval_id), "FAILED", str(e)
+            )
+            _restore_approval(approval_id)
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        finally:
+            if wt_path is not None:
+                _release_worktree(wt_path)
+
+    except Exception as e:  # noqa: BLE001 — OSError from mkdtemp, unexpected failures
+        _log_attempt(
+            item_id, TARGET_BRANCH, [queue_rel, archive_rel], str(approval_id), "FAILED", str(e)
+        )
         _restore_approval(approval_id)
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -494,7 +643,7 @@ def cmd_list(args: list[str]) -> int:
 def main() -> int:
     _setup_logging()
     if len(sys.argv) < 2:
-        print("Usage: skill.py <validate|approve|push|list> [args...]", file=sys.stderr)
+        print("Usage: skill.py <validate|approve|push|close|list> [args...]", file=sys.stderr)
         return 1
 
     cmd, *rest = sys.argv[1:]
@@ -504,10 +653,12 @@ def main() -> int:
         return cmd_approve(rest)
     elif cmd == "push":
         return cmd_push(rest)
+    elif cmd in ("close", "archive"):
+        return cmd_close(rest)
     elif cmd == "list":
         return cmd_list(rest)
     else:
-        print(f"Unknown command '{cmd}'; use validate|approve|push|list", file=sys.stderr)
+        print(f"Unknown command '{cmd}'; use validate|approve|push|close|list", file=sys.stderr)
         return 1
 
 

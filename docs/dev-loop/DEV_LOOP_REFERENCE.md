@@ -83,7 +83,7 @@ Lives on a `dev-queue` branch under `knowledge/dev-notes/{queue,backlog,archive}
 ---
 id: 2026-0001-example
 title: …
-status: proposed        # proposed|authorized|building|built|merged
+status: proposed        # proposed|authorized|building|built|merged|closed
 scope: well-bounded-local   # | needs-design-pass
 origin: brainstorm      # | iteration-backlog
 author: jarvis
@@ -97,6 +97,15 @@ qa_artifact: null
 ---
 ## Intent / ## Scope / ## Acceptance criteria / ## Notes
 ```
+
+`closed` items additionally carry `closed_reason` (mandatory, why it was
+abandoned/superseded rather than built) and `closed_at` (date). Set by
+`devqueue close <item-id> "<reason>"` (alias: `archive`), which moves the
+spec from `queue/` to `archive/` on `dev-queue` — same hard-lock
+(branch/path) and approval gate as `push`. Distinct from the CI-driven
+`merged.yml` archival, which sets `status: merged` for items that actually
+shipped; `close` is for items that never got built.
+
 **Lifecycle:** `proposed → authorized → building → built → merged`. **Idempotency:** a builder acts only on `authorized`; it sets `building` (the claim), then `built`. It never touches `proposed`, an already-`building` item, `built`, or `merged`. `building`/`built` live on the feature branch; the queue on `dev-queue` shows `authorized` until merge.
 
 ### 8.2 Roster (`knowledge/dev-crew/roster.md`)
