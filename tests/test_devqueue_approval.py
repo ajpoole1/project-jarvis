@@ -133,6 +133,35 @@ def test_consume_approval_one_item_once(tmp_db):
     assert second is None
 
 
+def test_consume_approval_concurrent_does_not_double_consume(tmp_db):
+    """Two threads racing _consume_approval on the same item: exactly one wins.
+
+    Regression test for Tom QA finding (PR #97): the old SELECT-then-UPDATE
+    had a window where two connections could both read consumed=0 before
+    either wrote consumed=1. The fix folds the read and write into one
+    atomic UPDATE ... WHERE id = (SELECT ...) RETURNING id statement.
+    """
+    import threading
+
+    _mod.cmd_approve(["2026-0099-test-item", AJ_ID])
+
+    results = []
+    barrier = threading.Barrier(2)
+
+    def worker():
+        barrier.wait()
+        results.append(_mod._consume_approval("2026-0099-test-item", AJ_ID))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1, f"expected exactly one winner, got {results}"
+
+
 # ---------------------------------------------------------------------------
 # _assert_approved
 # ---------------------------------------------------------------------------

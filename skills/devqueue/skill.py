@@ -126,9 +126,12 @@ def _record_approval(item_id: str, discord_user_id: str) -> int:
 
 
 def _consume_approval(item_id: str, aj_user_id: str) -> int | None:
-    """Find and mark an unconsumed approval as consumed (optimistic lock).
+    """Find and mark an unconsumed approval as consumed (single atomic statement).
 
     Returns the approval row id if found and consumed, None if no valid approval exists.
+    The UPDATE's WHERE clause and write happen as one atomic statement (not a
+    SELECT followed by a separate UPDATE), so two concurrent calls cannot both
+    match the same unconsumed row and double-consume a single approval.
     The approval is restored via _restore_approval(id) if the subsequent push fails,
     so AJ can retry without re-approving.
     """
@@ -136,20 +139,18 @@ def _consume_approval(item_id: str, aj_user_id: str) -> int | None:
         with conn:
             row = conn.execute(
                 """
-                SELECT id FROM devqueue_approvals
-                WHERE item_id = ? AND approved_by = ? AND consumed = 0
-                ORDER BY created_at ASC LIMIT 1
+                UPDATE devqueue_approvals
+                SET consumed = 1, consumed_at = ?
+                WHERE id = (
+                    SELECT id FROM devqueue_approvals
+                    WHERE item_id = ? AND approved_by = ? AND consumed = 0
+                    ORDER BY created_at ASC LIMIT 1
+                )
+                RETURNING id
                 """,
-                (item_id, aj_user_id),
+                (datetime.now(UTC).isoformat(), item_id, aj_user_id),
             ).fetchone()
-            if row is None:
-                return None
-            approval_id = row["id"]
-            conn.execute(
-                "UPDATE devqueue_approvals SET consumed = 1, consumed_at = ? WHERE id = ?",
-                (datetime.now(UTC).isoformat(), approval_id),
-            )
-    return approval_id
+    return row["id"] if row is not None else None
 
 
 def _restore_approval(approval_id: int) -> None:
