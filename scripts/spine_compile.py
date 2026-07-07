@@ -120,11 +120,40 @@ def _read_source(path: Path, label: str) -> str:
     return path.read_text(encoding="utf-8").rstrip()
 
 
+def _densify(text: str) -> str:
+    """Collapse a markdown source into a single dense line.
+
+    Drops blank lines, `---` dividers, and leading/trailing whitespace.
+    Section headers (## ...) are preserved as pipe-separated inline segments.
+    Paragraph prose is joined with spaces. Result is one line of text.
+    """
+    segments = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if current:
+            segments.append(" ".join(current))
+            current.clear()
+
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line or line == "---":
+            flush()
+        elif line.startswith("## "):
+            flush()
+            segments.append(line)
+        else:
+            current.append(line)
+    flush()
+    return " | ".join(segments)
+
+
 def _build_spine_block(nonce: str) -> list[str]:
     """Build the managed spine block as a list of MEMORY.md bullet lines.
 
-    Sources are read here to ensure they're readable (lint gate) even though
-    the hard-rule text is canonical and kept verbatim in the block.
+    DENSE MODE: persona.md and voice.md are collapsed to single lines each
+    so the entire managed block fits well under the 200-line load cap.
+    Sources are still read for the lint readability gate.
     """
     persona = _read_source(PERSONA_SRC, "persona.md")
     voice = _read_source(VOICE_SRC, "voice.md")
@@ -146,17 +175,9 @@ def _build_spine_block(nonce: str) -> list[str]:
     for rule in hard_rules:
         lines.append(f"- {rule}")
 
-    # Verbatim persona
-    lines.append("- [BEGIN PERSONA — verbatim from persona.md]")
-    for line in persona.split("\n"):
-        lines.append(f"- {line}" if line.strip() else "-")
-    lines.append("- [END PERSONA]")
-
-    # Verbatim voice
-    lines.append("- [BEGIN VOICE — verbatim from voice.md]")
-    for line in voice.split("\n"):
-        lines.append(f"- {line}" if line.strip() else "-")
-    lines.append("- [END VOICE]")
+    # Dense single-line persona and voice (saves ~130 lines vs verbatim)
+    lines.append(f"- [PERSONA] {_densify(persona)}")
+    lines.append(f"- [VOICE] {_densify(voice)}")
 
     lines.append("- [END SPINE]")
     return lines
@@ -183,10 +204,9 @@ def job_rebuild_memory(nonce: str) -> None:
     if start_idx is None or end_idx is None:
         raise ValueError("Could not find SPINE BLOCK markers in MEMORY.md")
 
-    # Strip existing tail sentinel from the end
+    # Strip ALL existing tail sentinel lines (idempotency: removes duplicates too)
     tail_marker = "[MEMORY TAIL SENTINEL"
-    while original_lines and original_lines[-1].startswith(tail_marker):
-        original_lines.pop()
+    original_lines = [ln for ln in original_lines if not ln.startswith(tail_marker)]
     while original_lines and original_lines[-1] == "":
         original_lines.pop()
 
@@ -315,6 +335,7 @@ def job_lints(nonce: str) -> bool:
                 _log(f"lint: {card.name} Snapshot {snapshot_bytes}B OK")
 
     # Lint 3: MEMORY.md growth + tail sentinel check
+    LINE_WARN = 180
     if MEMORY_MD.exists():
         content = MEMORY_MD.read_text(encoding="utf-8")
         total_bytes = len(content.encode("utf-8"))
@@ -323,6 +344,16 @@ def job_lints(nonce: str) -> bool:
         final_line = lines[-1] if lines else ""
         expected_tail = f"[MEMORY TAIL SENTINEL nonce-{nonce}]"
         _log(f"lint: MEMORY.md {total_bytes}B {total_lines} lines")
+        if total_lines >= LINE_WARN:
+            _alert(
+                f"MEMORY.md line count {total_lines} ≥ {LINE_WARN} — prune before hitting 200-line load cap"
+            )
+            ok = False
+        # Duplicate sentinel check
+        sentinel_lines = [ln for ln in lines if ln.startswith("[MEMORY TAIL SENTINEL")]
+        if len(sentinel_lines) > 1:
+            _alert(f"MEMORY.md has {len(sentinel_lines)} tail sentinel lines — idempotency failure")
+            ok = False
         if final_line != expected_tail:
             _alert(
                 f"MEMORY.md tail sentinel mismatch — "
