@@ -28,6 +28,7 @@ Discord user ID. One approval covers one item, once.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -115,12 +116,12 @@ def _get_db() -> sqlite3.Connection:
 
 def _record_approval(item_id: str, discord_user_id: str) -> int:
     """Insert an unconsumed approval record. Returns the new row id."""
-    conn = _get_db()
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO devqueue_approvals (item_id, approved_by, created_at) VALUES (?, ?, ?)",
-            (item_id, discord_user_id, datetime.now(UTC).isoformat()),
-        )
+    with contextlib.closing(_get_db()) as conn:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO devqueue_approvals (item_id, approved_by, created_at) VALUES (?, ?, ?)",
+                (item_id, discord_user_id, datetime.now(UTC).isoformat()),
+            )
     return cur.lastrowid
 
 
@@ -128,42 +129,37 @@ def _consume_approval(item_id: str, aj_user_id: str) -> int | None:
     """Find and mark an unconsumed approval as consumed (optimistic lock).
 
     Returns the approval row id if found and consumed, None if no valid approval exists.
-    The caller is responsible for calling _restore_approval(id) if the subsequent
-    push fails, so AJ must re-approve rather than a stale approval silently persisting.
+    The approval is restored via _restore_approval(id) if the subsequent push fails,
+    so AJ can retry without re-approving.
     """
-    conn = _get_db()
-    with conn:
-        row = conn.execute(
-            """
-            SELECT id FROM devqueue_approvals
-            WHERE item_id = ? AND approved_by = ? AND consumed = 0
-            ORDER BY created_at ASC LIMIT 1
-            """,
-            (item_id, aj_user_id),
-        ).fetchone()
-        if row is None:
-            return None
-        approval_id = row["id"]
-        conn.execute(
-            "UPDATE devqueue_approvals SET consumed = 1, consumed_at = ? WHERE id = ?",
-            (datetime.now(UTC).isoformat(), approval_id),
-        )
+    with contextlib.closing(_get_db()) as conn:
+        with conn:
+            row = conn.execute(
+                """
+                SELECT id FROM devqueue_approvals
+                WHERE item_id = ? AND approved_by = ? AND consumed = 0
+                ORDER BY created_at ASC LIMIT 1
+                """,
+                (item_id, aj_user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            approval_id = row["id"]
+            conn.execute(
+                "UPDATE devqueue_approvals SET consumed = 1, consumed_at = ? WHERE id = ?",
+                (datetime.now(UTC).isoformat(), approval_id),
+            )
     return approval_id
 
 
 def _restore_approval(approval_id: int) -> None:
-    """Mark a previously-consumed approval as unconsumed on push failure.
-
-    This is called when git push fails after the approval was consumed, so AJ
-    must explicitly re-approve before the next attempt rather than having a
-    permanently-burned token.
-    """
-    conn = _get_db()
-    with conn:
-        conn.execute(
-            "UPDATE devqueue_approvals SET consumed = 0, consumed_at = NULL WHERE id = ?",
-            (approval_id,),
-        )
+    """Mark a previously-consumed approval as unconsumed on push failure."""
+    with contextlib.closing(_get_db()) as conn:
+        with conn:
+            conn.execute(
+                "UPDATE devqueue_approvals SET consumed = 0, consumed_at = NULL WHERE id = ?",
+                (approval_id,),
+            )
     logging.info("approval restored approval_id=%s (push failed)", approval_id)
 
 
