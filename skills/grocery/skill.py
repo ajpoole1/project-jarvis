@@ -970,7 +970,8 @@ def main() -> None:
         elif args.cmd == "from-recipe":
             print(cmd_from_recipe(conn, args.slug))
         elif args.cmd == "sync-note":
-            print(cmd_sync_note(conn))
+            result = cmd_sync_note(conn)
+            print("SILENT" if result == "No changes." else result)
         elif args.cmd == "plan":
             print(cmd_plan(conn))
         elif args.cmd == "propose-schedule":
