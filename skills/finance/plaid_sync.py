@@ -195,17 +195,23 @@ def _save_cursor(conn: sqlite3.Connection, label: str, cursor: str) -> None:
 def _parse_plaid_date(date_str: str) -> str:
     """Normalize Plaid date strings to YYYY-MM-DD.
 
-    Plaid may return either ISO format ('2026-07-06') or HTTP date format
-    ('Mon, 06 Jul 2026 00:00:00 GMT'). Returns the input unchanged if neither parses.
+    Plaid returns either ISO format ('2026-07-06') or HTTP date format
+    ('Mon, 06 Jul 2026 00:00:00 GMT'). Returns '' on unrecognised input so
+    callers get an obviously-invalid value rather than a corrupt partial string.
     """
     if not date_str:
-        return date_str
+        return ""
     if "," in date_str:
         try:
             return datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %Z").strftime("%Y-%m-%d")
         except ValueError:
-            return date_str[:10]
-    return date_str[:10]
+            return ""
+    # Expect YYYY-MM-DD; validate before truncating
+    try:
+        datetime.strptime(date_str[:10], "%Y-%m-%d")
+        return date_str[:10]
+    except ValueError:
+        return ""
 
 
 def _map_transaction(conn: sqlite3.Connection, raw: dict, label: str) -> dict | None:
@@ -223,7 +229,7 @@ def _map_transaction(conn: sqlite3.Connection, raw: dict, label: str) -> dict | 
         )
         return None
 
-    amount = -(raw.get("amount", 0.0))  # Plaid positive = debit; we want negative = spend
+    amount = -(raw.get("amount") or 0.0)  # Plaid positive = debit; we want negative = spend
     txn_id = raw.get("transaction_id", "")
     name = raw.get("name") or raw.get("merchant_name") or ""
 

@@ -62,6 +62,15 @@ def test_parse_plaid_date_empty():
     assert _parse_plaid_date("") == ""
 
 
+def test_parse_plaid_date_corrupt_http_returns_empty():
+    # Fallback on parse failure must not return a partial string like "Mon, 06 Ju"
+    assert _parse_plaid_date("Mon, 06 NOTAMONTH 2026 00:00:00 GMT") == ""
+
+
+def test_parse_plaid_date_corrupt_iso_returns_empty():
+    assert _parse_plaid_date("not-a-date") == ""
+
+
 # ---------------------------------------------------------------------------
 # _get_tokens
 # ---------------------------------------------------------------------------
