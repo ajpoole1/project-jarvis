@@ -55,6 +55,8 @@ Lens paths prefixed `@std/` resolve against `standards_root` — `@std/PY_STANDA
 
 **Lifecycle.** New standard → write the doc with a checklist tail → add one `@std/` line to the charter. Nothing else changes. A future repo (SQL/Airflow-heavy) declares different lenses in the same slot; the QA apparatus lifts across unmodified.
 
+**Precedence:** where a repo guide's rule conflicts with a shared lens rule, the repo guide wins. Every such override must be declared in the repo guide, naming the superseded lens line and the reason. An undeclared conflict between a repo guide and a declared lens is itself a review finding.
+
 ## §4. Output contract
 
 Findings are emitted as JSON in the external-QA vocabulary, so local and external review are commensurate and processed identically:
