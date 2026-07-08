@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "signal/run-summary/v1",
+  "title": "Signal nightly run-summary v1",
+  "description": "Written by Signal's orchestrator terminal task to S3 on every run (success and failure). Consumed by Jarvis for monitoring, briefing, and remediation. Treat as an API contract — bump schema_version for breaking changes.",
+
+  "type": "object",
+  "required": ["schema_version", "meta", "deploy", "dags", "rows_written", "quarantine_count", "wind_down"],
+  "additionalProperties": false,
+
+  "properties": {
+
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Increment for any breaking field change. Jarvis's parser gates on this value."
+    },
+
+    "meta": {
+      "type": "object",
+      "required": ["run_date", "overall_status", "window_start_utc", "window_end_utc"],
+      "additionalProperties": false,
+      "properties": {
+        "run_date": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "Logical date of the run (YYYY-MM-DD, America/Toronto)."
+        },
+        "overall_status": {
+          "type": "string",
+          "enum": ["success", "failed", "partial"],
+          "description": "'success' = all DAGs succeeded. 'failed' = at least one DAG failed. 'partial' = some skipped/upstream-failed but none explicitly failed."
+        },
+        "window_start_utc": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 UTC timestamp when the orchestrator DAG started."
+        },
+        "window_end_utc": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 UTC timestamp when the run-summary task ran (end of observable window)."
+        }
+      }
+    },
+
+    "deploy": {
+      "type": "object",
+      "required": ["exit_status", "tier"],
+      "additionalProperties": false,
+      "description": "deploy.sh outcome from this boot. Jarvis's readiness logic already depends on deploy success; the nightly record carries it so post-hoc audits can distinguish a DAG bug from a deploy bug.",
+      "properties": {
+        "exit_status": {
+          "type": "integer",
+          "description": "Exit code of deploy.sh. 0 = success. Non-zero = deployment failed (DAG runs may be stale or absent)."
+        },
+        "tier": {
+          "type": "string",
+          "enum": ["code-only", "compose-rebuild", "migration-applied", "unknown"],
+          "description": "Tier detected by deploy.sh: code-only = scheduler restart only; compose-rebuild = full docker compose up --build; migration-applied = SQL migration(s) applied before scheduler start."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Optional free-text from deploy.sh — error message on failure, migration filenames on migration-applied tier, empty on clean code-only runs."
+        }
+      }
+    },
+
+    "dags": {
+      "type": "array",
+      "description": "One entry per DAG that was triggered (or attempted) by the orchestrator this run.",
+      "items": {
+        "type": "object",
+        "required": ["dag_id", "dag_run_id", "logical_date", "state", "wall_clock_seconds"],
+        "additionalProperties": false,
+        "properties": {
+          "dag_id": { "type": "string" },
+          "dag_run_id": { "type": "string" },
+          "logical_date": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Airflow logical date (UTC ISO-8601) for this dag run."
+          },
+          "state": {
+            "type": "string",
+            "enum": ["success", "failed", "upstream_failed", "skipped", "running", "queued"],
+            "description": "Final state at the time the run-summary task ran."
+          },
+          "wall_clock_seconds": {
+            "type": ["integer", "null"],
+            "description": "Elapsed seconds from DAG run start to end. Null if the run did not complete."
+          },
+          "failed_tasks": {
+            "type": "array",
+            "description": "Present (and non-empty) only when state=failed.",
+            "items": {
+              "type": "object",
+              "required": ["task_id", "state"],
+              "additionalProperties": false,
+              "properties": {
+                "task_id": { "type": "string" },
+                "state": { "type": "string" },
+                "log_excerpt": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "maxItems": 20,
+                  "description": "Last N lines of the task log. Jarvis displays the first 3 in a brief; all lines available for escalation context."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "rows_written": {
+      "type": "object",
+      "description": "Map of table name → rows upserted/inserted this run. Omit a table if zero rows were written (so an empty object means nothing ran). Jarvis surfaces this in the nightly brief and uses deltas to detect silent failures.",
+      "additionalProperties": { "type": "integer", "minimum": 0 },
+      "examples": [
+        { "raw_prices": 8421, "stock_signals": 7983, "relatedness_matrix": 1840200 }
+      ]
+    },
+
+    "data_gates": {
+      "type": "object",
+      "description": "Pass/fail of nightly plausibility checks once the hardening pass lands them. Keyed by check name. Absent until the hardening pass — Jarvis treats a missing data_gates block as 'not yet implemented', not as failure.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["passed"],
+        "additionalProperties": false,
+        "properties": {
+          "passed": { "type": "boolean" },
+          "detail": {
+            "type": "string",
+            "description": "Human-readable result — threshold, measured value, or failure reason."
+          }
+        }
+      },
+      "examples": [
+        {
+          "raw_prices_null_rate": { "passed": true, "detail": "null_rate=0.001 < threshold=0.05" },
+          "outcomes_beta_dist": { "passed": false, "detail": "SPY median=1.43 outside [0.8, 1.2]" }
+        }
+      ]
+    },
+
+    "quarantine_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of tickers quarantined (added to the quarantine set) during this run. A spike here is a data-quality signal worth flagging."
+    },
+
+    "wind_down": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": false,
+      "description": "Outcome of the wind-down / shutdown task.",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["completed", "skipped", "failed", "backstop"],
+          "description": "'completed' = wind-down task ran and stop Lambda was invoked. 'skipped' = wind-down task was not reached (upstream failure). 'failed' = wind-down task ran but stop Lambda call failed. 'backstop' = the 5am EventBridge backstop fired before wind-down ran."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Optional free-text — error message on failure, Lambda response on completed."
+        }
+      }
+    }
+
+  },
+
+  "examples": [
+    {
+      "schema_version": 1,
+      "meta": {
+        "run_date": "2026-07-08",
+        "overall_status": "success",
+        "window_start_utc": "2026-07-08T07:05:00Z",
+        "window_end_utc": "2026-07-08T09:12:34Z"
+      },
+      "deploy": {
+        "exit_status": 0,
+        "tier": "code-only",
+        "detail": ""
+      },
+      "dags": [
+        {
+          "dag_id": "dag_stock_ingest",
+          "dag_run_id": "scheduled__2026-07-08T07:05:00+00:00",
+          "logical_date": "2026-07-08T07:05:00Z",
+          "state": "success",
+          "wall_clock_seconds": 1843,
+          "failed_tasks": []
+        },
+        {
+          "dag_id": "dag_stock_indicators",
+          "dag_run_id": "scheduled__2026-07-08T07:05:00+00:00",
+          "logical_date": "2026-07-08T07:05:00Z",
+          "state": "success",
+          "wall_clock_seconds": 2107,
+          "failed_tasks": []
+        }
+      ],
+      "rows_written": {
+        "raw_prices": 8421,
+        "stock_signals": 7983
+      },
+      "data_gates": {},
+      "quarantine_count": 2,
+      "wind_down": {
+        "status": "completed",
+        "detail": "stop Lambda invoked; EC2 stopping"
+      }
+    }
+  ]
+}
