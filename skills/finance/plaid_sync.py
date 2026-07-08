@@ -309,7 +309,7 @@ def cmd_plaid_sync(conn: sqlite3.Connection) -> str:
         )
 
     lines = []
-    total_added = 0
+    total_changed = 0
     for label, token in tokens:
         try:
             result = sync_item(conn, label, token)
@@ -318,12 +318,12 @@ def cmd_plaid_sync(conn: sqlite3.Connection) -> str:
                 f"~{result['modified']} modified, "
                 f"-{result['removed']} removed"
             )
-            total_added += result["added"]
+            total_changed += result["added"] + result["modified"]
         except Exception as e:
             log.error("plaid_sync error for %s: %s", label, e)
             lines.append(f"  {label}: ERROR — {e}")
 
-    if total_added > 0:
+    if total_changed > 0:
         from skills.finance.db import apply_finance_rules_all
 
         updated = apply_finance_rules_all(conn)
