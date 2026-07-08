@@ -35,6 +35,7 @@ Inherit `docs/dev-standards/DEV_BASE.md` (§5 — Author role) + `CHARTER.md`.
 | QA lens definitions | `docs/dev-standards/QA_LENSES.md` |
 | Python conventions | `docs/dev-standards/PY_STANDARDS.md` |
 | How to build a skill | `docs/guides/SKILL_GUIDE.md` |
+| Multi-repo adoption (stand up a new repo) | `docs/dev-standards/ROLLOUT.md` |
 | Build procedure (builder sessions) | `docs/dev-loop/BUILD_RUNBOOK.md` |
 | Dev-loop invariants, loop mechanics | `docs/dev-loop/DEV_LOOP_REFERENCE.md` |
 | Jarvis runtime context layer (SPINE) | `knowledge/dev-crew/jarvis-memory.md` |

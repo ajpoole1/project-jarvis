@@ -132,8 +132,10 @@ jarvis/
 │   ├── ARCHITECTURE.md        ← you are here — full architecture reference
 │   ├── dev-standards/
 │   │   ├── DEV_BASE.md        ← development constitution (repo-agnostic)
-│   │   ├── QA_LENSES.md       ← QA lens definitions
-│   │   └── PY_STANDARDS.md    ← Python convention lens
+│   │   ├── QA_LENSES.md       ← QA lens definitions + @std/ resolution contract
+│   │   ├── PY_STANDARDS.md    ← Python convention lens
+│   │   ├── CHARTER_TEMPLATE.md ← blank charter template for new repos (hub-maintained)
+│   │   └── ROLLOUT.md         ← recipe: stand up a new repo on this framework
 │   ├── guides/
 │   │   └── SKILL_GUIDE.md     ← how to build a Jarvis skill
 │   ├── dev-crew/
