@@ -47,7 +47,7 @@ standards_root: <path>
 - docs/guides/SKILL_GUIDE.md
 ```
 
-`standards_root` is the directory holding the shared standards library. In the hub repo (`project-jarvis`) it is a repo-relative path (`docs/dev-standards`). In a consuming repo it is the absolute path to the hub checkout's `docs/dev-standards/` directory. When the standalone dev-standards repo exists (Phase D), migration is one `standards_root` line update per consuming repo.
+`standards_root` is the directory holding the shared standards library. In the hub repo (`project-jarvis`) it is a repo-relative path (`docs/dev-standards`). In a consuming repo it is a repo-root-relative sibling path (e.g. `../project-jarvis/docs/dev-standards`) — all local repos live as siblings under one parent directory, so up-and-over resolution is stable across machines and path forms. Absolute paths are permitted but not preferred. When the standalone dev-standards repo exists (Phase D), migration is one `standards_root` line update per consuming repo.
 
 Lens paths prefixed `@std/` resolve against `standards_root` — `@std/PY_STANDARDS.md` resolves to `<standards_root>/PY_STANDARDS.md`. Unprefixed paths remain repo-root-relative and are used for repo-local guides.
 

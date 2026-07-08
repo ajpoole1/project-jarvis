@@ -18,9 +18,11 @@ Copy `docs/dev-standards/CHARTER_TEMPLATE.md` from the hub to the consuming repo
 - `<REPO-NAME>` — the repo's name.
 - `<canonical-check-command>` — the single command that runs linting + tests, used identically by
   agents and CI (defined in Step 3).
-- `standards_root` — the absolute path to the hub's `docs/dev-standards/` directory on this
-  machine (e.g. `/mnt/c/Users/aaron/Documents/python/project-jarvis/docs/dev-standards`). This
-  stays absolute until Phase D; do not make it relative to the consuming repo.
+- `standards_root` — the path to the hub's `docs/dev-standards/` directory. Preferred form: a
+  repo-root-relative sibling path (e.g. `../project-jarvis/docs/dev-standards`) — all local repos
+  live as siblings under one parent directory, so up-and-over resolution is stable across machines
+  and path forms. Absolute paths are permitted as a fallback (e.g. if the resolver doesn't support
+  relative paths in a given context). Phase D will replace this with a single-repo reference.
 - QA pairing, stack, goal, cascade — repo-specific values; fill from context.
 
 Do not restate content from `DEV_BASE.md` — the charter points at it, never copies it.
@@ -147,9 +149,15 @@ it.
 }
 ```
 
-This avoids per-session prompts. The tradeoff: the path is machine-specific and hardcoded until
-Phase D. Commit the settings file; each developer on a different machine updates the path locally
-(or uses a gitignored override).
+Note the two-value distinction: the `standards_root` value in `CHARTER.md` is the sibling-relative
+form (`../project-jarvis/docs/dev-standards`) — portable, committed, correct for the `@std/`
+resolver. The `additionalDirectories` entry in `settings.json` must be an **absolute path** —
+Claude Code does not resolve relative entries in this field. Keep both: CHARTER carries the
+relative form; settings carries the expanded form for the permission grant.
+
+This avoids per-session prompts. The tradeoff: `settings.json` is machine-specific. Commit the
+file with the path filled in; each developer on a different machine updates it locally (or uses a
+gitignored override).
 
 **Alternative:** accept the per-session prompt when Claude Code first attempts to read a
 `@std/`-resolved path. This works but interrupts automated builder sessions.
@@ -160,7 +168,7 @@ In `CHARTER.md` → `## QA Lenses`, list every lens the repo needs:
 
 ```
 ## QA Lenses
-standards_root: /absolute/path/to/project-jarvis/docs/dev-standards
+standards_root: ../project-jarvis/docs/dev-standards
 - @std/PY_STANDARDS.md
 - docs/guides/LOCAL_GUIDE.md
 ```

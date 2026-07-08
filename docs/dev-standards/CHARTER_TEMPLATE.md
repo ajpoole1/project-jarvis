@@ -54,14 +54,18 @@ or the operator explicitly overrides.
 
 ## QA Lenses
 
-standards_root: <absolute-path-to-hub-dev-standards-dir-OR-repo-relative-path>
+standards_root: <sibling-relative-or-repo-relative-path>
 - @std/PY_STANDARDS.md
 - <repo-relative-path/LOCAL_GUIDE.md>
 
 <!-- standards_root examples:
      - Hub repo (project-jarvis): standards_root: docs/dev-standards
-     - Consuming repo (until Phase D): standards_root: /mnt/c/Users/aaron/Documents/python/project-jarvis/docs/dev-standards
-     Add one @std/ line per shared lens; add unprefixed lines for repo-local guides only. -->
+     - Consuming repo (preferred): standards_root: ../project-jarvis/docs/dev-standards
+       (sibling-relative — stable across machines; all local repos share one parent directory)
+     - Consuming repo (fallback): standards_root: /absolute/path/to/project-jarvis/docs/dev-standards
+     Add one @std/ line per shared lens; add unprefixed lines for repo-local guides only.
+     Note: settings.json additionalDirectories must use the absolute form — Claude Code does not
+     resolve relative entries there. CHARTER carries relative; settings carries absolute. -->
 
 ## Cascade
 
