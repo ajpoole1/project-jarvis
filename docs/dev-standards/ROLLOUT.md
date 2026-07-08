@@ -76,6 +76,27 @@ End every session with `/handoff`.
 
 Replace `<standards_root>` with the absolute path from Step 1.
 
+## Step 2a — Brownfield adoption (skip if the repo has no existing CLAUDE.md)
+
+If the repo already has a `CLAUDE.md` or any agent contract file, **append-and-keep is
+prohibited.** Two authorities in the same file will drift. Every block of the existing contract
+must be triaged into exactly one destination before the overlay is written.
+
+**Triage destinations:**
+
+| Block type | Destination |
+|---|---|
+| (a) Covered by a declared lens checklist | Delete — the lens enforces it; prose is redundant |
+| (b) Charter material (check command, stack, QA params, goal) | `CHARTER.md` — the right home for repo identity |
+| (c) Repo-specific convention worth enforcing | A repo guide in lens format (prose + `## Review Checklist` tail), declared in the charter; any rule that conflicts with a shared lens carries an explicit override declaration per `QA_LENSES.md §3` precedence |
+| (d) Identity and safety essentials | The thin overlay (Step 2 template) |
+
+Present the triage table (block → destination) to the operator for approval before executing any
+moves. Do not delete or relocate content speculatively.
+
+**End state:** the overlay is the only contract text in `CLAUDE.md`. Every surviving rule lives in
+exactly one place — charter, lens, or guide. Nothing is duplicated between sources.
+
 ## Step 3 — Create the canonical check script
 
 The check script is the single definition of green. It must be invoked identically by agents and
@@ -164,6 +185,13 @@ gitignored override).
 
 ## Step 6 — Declare lenses in the charter
 
+Declare only lenses that match the repo's actual surface area. Every declared checklist costs
+review tokens on every `/qa` run and can produce spurious findings against code that uses a
+different stack. A Python-only repo should not carry `SQL_STANDARDS.md` if it issues no queries;
+a scraping repo needs `SCRAPING_STANDARDS.md` but probably not `AIRFLOW_STANDARDS.md`. When
+uncertain, start with fewer lenses and add as the surface grows — removing a lens later is cheaper
+than fixing false-positive noise on every PR.
+
 In `CHARTER.md` → `## QA Lenses`, list every lens the repo needs:
 
 ```
@@ -184,7 +212,12 @@ This is lens accretion — the same pattern as Tom's external QA feedback loop.
 
 ## Step 7 — Acceptance test
 
-Run `/qa` on any trivial diff (e.g. add a blank line to `CHARTER.md`, stage it):
+Vendored skills register at session start. The acceptance run must happen in a fresh session (or
+after a session reload) following the vendoring commit — not in the same session that copied the
+files. Manual resolution of any `/qa` issues during the vendoring session is preparation, not
+acceptance.
+
+Run `/qa` on a trivial staged diff (e.g. add a blank line to `CHARTER.md`, stage it):
 
 ```bash
 git add CHARTER.md
@@ -196,6 +229,8 @@ Then invoke `/qa`. Observe:
 2. It resolves each `@std/` path against `standards_root`.
 3. It reads the `## Review Checklist` tail of each resolved file.
 4. The verdict JSON is emitted with no configuration defects.
+
+Record the verdict before the repo's first `/ship`.
 
 **If `/qa` emits a blocking `convention` defect at `CHARTER.md`:** the resolution failed. Check:
 - `standards_root` is set and the path exists on disk.
@@ -213,10 +248,11 @@ defect here is a hard stop — do not open a PR until it is resolved.
 repo: update `standards_root` to the new path. The `@std/` declarations, vendored skills, and
 checklist tails are unchanged.
 
-**Lens documents.** The current shared library: `PY_STANDARDS.md`. Forthcoming (blocked on
-authoring sessions with the operator): `SQL_STANDARDS.md`, `AIRFLOW_STANDARDS.md`,
-`API_CLIENT_STANDARDS.md`, `SCRAPING_STANDARDS.md`. Phase B rollouts are blocked on
-`AIRFLOW_STANDARDS.md` and `API_CLIENT_STANDARDS.md` landing.
+**Lens documents.** The authoritative list of shared lenses is the contents of
+`docs/dev-standards/` in the hub. Each file with a `## Review Checklist` tail is a usable lens.
+Current shared lenses include: `PY_STANDARDS.md`, `SQL_STANDARDS.md`, `API_CLIENT_STANDARDS.md`,
+and `SCRAPING_STANDARDS.md` — all with checklist tails and available for declaration. This note
+does not restate the set; read the directory.
 
 **Vendoring cadence.** Re-vendor skills when the hub ships a breaking procedure change. The
 provenance date is the signal — if a consuming repo's date is behind a significant hub commit,
