@@ -4,6 +4,7 @@ Commands:
   import <file> [--account ID] [--owner personal|altaforma]
   import-holdings <file> [--as-of DATE]
   ingest                      sweep the dropbox inbox folder
+  plaid-sync                  pull new transactions from all Plaid-connected items
   accounts
   liquid
   spend [--month|--week|--from DATE --to DATE] [--owner personal|altaforma]
@@ -74,6 +75,7 @@ from skills.finance.db import (  # noqa: E402
     upsert_position,
     upsert_transaction,
 )
+from skills.finance.plaid_sync import cmd_plaid_sync  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Env + paths
@@ -1637,6 +1639,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="finance", description="Personal CFO skill")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("plaid-sync", help="Pull new transactions from all Plaid-connected items")
+
     p_ingest = sub.add_parser("ingest", help="Sweep finance inbox, import CSVs, archive/quarantine")
     p_ingest.add_argument(
         "--no-discord", action="store_true", help="Suppress Discord summary posting"
@@ -1809,7 +1813,10 @@ def main() -> None:
     conn = init_db(str(DB_PATH))
 
     try:
-        if args.cmd == "ingest":
+        if args.cmd == "plaid-sync":
+            print(cmd_plaid_sync(conn))
+
+        elif args.cmd == "ingest":
             print(cmd_ingest(conn, post_discord=not args.no_discord))
 
         elif args.cmd == "import":

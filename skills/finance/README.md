@@ -9,11 +9,15 @@ third-party dependencies or network access.
 ```
 Bank CSV exports   →  csv_import.py  →  db.py (finance.db)  →  skill.py commands
 Dropbox inbox     →  csv_import.py ↗                        →  brief.py (morning-briefing)
-                                      finance_rules table   →  salience.py (proactive signals)
+Plaid API         →  plaid_sync.py ↗   finance_rules table  →  salience.py (proactive signals)
 ```
 
 **Dropbox inbox:** `/mnt/c/Users/aaron/jarvis-finance/inbox/` — drop CSV exports here,
 run `finance ingest`, they are parsed, imported, rule-matched, and archived automatically.
+
+**Plaid sync:** live transaction pull for connected institutions. Run `finance plaid-sync`
+to fetch new/modified/removed transactions since the last call. Cursors are persisted in
+`plaid_cursors` so each run is incremental. See [Plaid sync setup](#plaid-sync-setup) below.
 
 ## Account inventory
 
@@ -130,12 +134,42 @@ No venv required — stdlib only.
 JARVIS_DATA_DIR=/mnt/c/Users/aaron/Documents/python/project-jarvis/data
 ```
 
+## Plaid sync setup
+
+Requires a Plaid production account. Add to `~/.jarvis.env`:
+
+```bash
+PLAID_CLIENT_ID=<from dashboard.plaid.com/developers/keys>
+PLAID_SECRET=<production secret>
+PLAID_ACCESS_TOKEN_<LABEL>=access-production-...   # one per connected institution
+PLAID_ITEM_ID_<LABEL>=...                          # optional, informational
+```
+
+`<LABEL>` is a short uppercase identifier (e.g. `TD_VISA`). Multiple institutions are
+supported — add one `PLAID_ACCESS_TOKEN_*` entry per item.
+
+To connect a new institution, run the Plaid quickstart at `/home/ajpoole/plaid-quickstart/`,
+complete the Link flow, then capture the access token from `/api/info` and append it to
+`~/.jarvis.env`.
+
+**DB tables created by plaid_sync:**
+
+| Table | Purpose |
+|---|---|
+| `plaid_cursors` | Per-label sync cursor; enables incremental pulls |
+| `plaid_account_map` | Maps Plaid `account_id` → internal DB account ID |
+
+**Source handoff:** once Plaid covers an account, delete the overlapping CSV rows to avoid
+duplicates. Plaid rows use `source='plaid'` and `id='plaid-<transaction_id>'`; CSV rows
+use `source='csv'` and a SHA256-based ID.
+
 ## Modules
 
 | File | Purpose |
 |---|---|
 | `csv_import.py` | RBC / TD / MBNA / Desjardins / Wealthsimple / Rogers CSV parser with SHA256 dedup |
 | `db.py` | Schema init, upsert helpers, finance_rules engine, recurring detection, tag_proposals |
+| `plaid_sync.py` | Plaid `transactions/sync` pull — cursor persistence, account mapping, DB upsert |
 | `brief.py` | `finance_brief()` — importable snapshot for morning-briefing (includes salience_block) |
 | `salience.py` | `compute_salience_block()` — 5 proactive signals: cashflow, irregular charges, anomalies, sub drift, duplicates |
 | `alerts.py` | 3 P1 alerts: large unusual charge, bill shortfall, duplicate charge |
