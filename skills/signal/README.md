@@ -136,11 +136,11 @@ See `run_summary_schema_v1.json` for the full JSON Schema. Floor fields (§6.3 o
 migration plan):
 
 - `meta` — run_date, overall_status, window_start_utc, window_end_utc
-- `deploy` — exit_status, tier (deploy.sh outcome; required for readiness logic)
+- `deploy` — exit_status, tier, commit_hash, timestamp_utc (deploy.sh outcome; **nullable in v1** — key always present, value null until deploy.sh writes `deploy_status.json` in v1.1; tier ∈ {no-change, code-only, compose-rebuild, migration-applied, unknown})
 - `dags[]` — dag_id, dag_run_id, logical_date, state, wall_clock_seconds, failed_tasks
-- `rows_written` — table → row count map
+- `rows_written` — table → rows-present-for-run_date map; **fixed table set always present, zeros never elided** (a present zero is the holiday-vs-outage discriminator)
 - `data_gates` — plausibility check pass/fail (populated by hardening pass; absent = not yet implemented)
 - `quarantine_count` — integer
-- `wind_down` — status, detail
+- `wind_down` — **producer-facts only**: attempted (bool), result ∈ {invoked, skipped_other_dags_running, invoke_failed}, detail. NOT a `status` enum — `completed`/`backstop` are Jarvis-side inferences (stop-event + summary presence; missing summary by ~6am = backstop), never fields.
 
 `schema_version` is required; Jarvis's parser gates on it. Bump for any breaking change.

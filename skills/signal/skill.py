@@ -408,8 +408,14 @@ def _print_summary(s: dict) -> None:
     print(f"  Status:      {meta.get('overall_status', '?').upper()}")
     print(f"  Window:      {meta.get('window_start_utc','?')} → {meta.get('window_end_utc','?')}")
 
-    deploy = s.get("deploy", {})
-    print(f"\n  Deploy:      exit={deploy.get('exit_status','?')}  tier={deploy.get('tier','?')}")
+    deploy = s.get("deploy")
+    if deploy is None:
+        print("\n  Deploy:      (no status emitted — deploy.sh predates the status writer)")
+    else:
+        commit = deploy.get("commit_hash", "?")
+        print(
+            f"\n  Deploy:      exit={deploy.get('exit_status', '?')}  tier={deploy.get('tier', '?')}  commit={commit}"
+        )
 
     print("\n  DAGs:")
     for dag in s.get("dags", []):
@@ -436,7 +442,12 @@ def _print_summary(s: dict) -> None:
 
     print(f"\n  Quarantine count:  {s.get('quarantine_count', '?')}")
     wd = s.get("wind_down", {})
-    print(f"  Wind-down:         {wd.get('status','?')}")
+    # Producer-facts only: attempted + result. 'completed'/'backstop' are Jarvis-side
+    # inferences (stop-event + summary presence), not fields in the summary.
+    if wd.get("attempted"):
+        print(f"  Wind-down:         {wd.get('result', '?')}  {wd.get('detail', '')}".rstrip())
+    else:
+        print("  Wind-down:         not reached (upstream failure short-circuited the DAG)")
     print()
 
 
@@ -626,6 +637,16 @@ def cmd_remediate(args: argparse.Namespace, cfg: dict) -> None:
 
         if not ready:
             raise TimeoutError("Airflow did not become reachable within the timeout")
+
+        # NOTE (§6.4 fix-landed gate — deferred to a dedicated PR): a check that the
+        # remediation boot actually deployed the merged fix (refuse to retrigger on a
+        # 'no-change' boot) belongs here, between "Airflow is up" and retrigger. It is
+        # NOT implementable against v1: the run-summary carries deploy status only at
+        # run-END, so at this point the only summary that exists is the ORIGINAL failed
+        # run's — reading it would reflect the wrong boot. The correct source is a
+        # fresh read of deploy.sh's deploy_status.json at boot time (SSM/mounted file),
+        # which is v1.1 plumbing Signal hasn't shipped. Deferred so this PR stays the
+        # clean Q11 schema contract; the gate lands once that read path is specified.
 
         print("[signal] Airflow is up — retriggering DAG …")
 
