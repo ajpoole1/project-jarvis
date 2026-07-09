@@ -45,10 +45,10 @@
     },
 
     "deploy": {
-      "type": "object",
-      "required": ["exit_status", "tier"],
+      "type": ["object", "null"],
+      "required": ["exit_status", "tier", "commit_hash", "timestamp_utc"],
       "additionalProperties": false,
-      "description": "deploy.sh outcome from this boot. Jarvis's readiness logic already depends on deploy success; the nightly record carries it so post-hoc audits can distinguish a DAG bug from a deploy bug.",
+      "description": "deploy.sh outcome from this boot. Distinguishes a DAG bug from a deploy bug in post-hoc audits. PLUMBING (pre-decided, don't re-litigate): deploy.sh runs at boot BEFORE the scheduler exists, so an Airflow Variable/XCom cannot receive it — nothing is up. deploy.sh writes deploy_status.json to the mounted checkout (exit_status, tier, timestamp_utc, commit_hash); the summary task reads that file. ~3 lines in deploy.sh, Signal-owned (PR-2 territory). v1: this block MAY be null if the status file is absent (deploy.sh predates the writer). v1.1: required once deploy.sh writes it. Jarvis treats null as 'deploy status not yet emitted', not failure.",
       "properties": {
         "exit_status": {
           "type": "integer",
@@ -56,8 +56,17 @@
         },
         "tier": {
           "type": "string",
-          "enum": ["code-only", "compose-rebuild", "migration-applied", "unknown"],
-          "description": "Tier detected by deploy.sh: code-only = scheduler restart only; compose-rebuild = full docker compose up --build; migration-applied = SQL migration(s) applied before scheduler start."
+          "enum": ["no-change", "code-only", "compose-rebuild", "migration-applied", "unknown"],
+          "description": "Tier detected by deploy.sh: no-change = boot fetched nothing new, NOTHING deployed (deploy.sh's 'restart'); code-only = new code, scheduler restart; compose-rebuild = full docker compose up --build; migration-applied = SQL migration(s) applied before scheduler start; unknown = fallback. REMEDIATION-CRITICAL (§6.4): Jarvis merges a fix → starts the workbench → deploy.sh should pick it up. If the boot reports 'no-change' when a fix was supposedly merged, the fix did NOT fetch (wrong branch, push failed) and retriggering would re-run the broken code — burning the once-only retry budget on a known failure. 'no-change' vs 'code-only' is how Jarvis verifies the fix landed before retriggering; the two must never be squashed."
+        },
+        "commit_hash": {
+          "type": "string",
+          "description": "The origin/main commit deploy.sh reset --hard to. Lets Jarvis tie a run to exact deployed code."
+        },
+        "timestamp_utc": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 UTC when deploy.sh finished. Distinguishes a fresh deploy from a stale status file left by a prior boot."
         },
         "detail": {
           "type": "string",
@@ -115,10 +124,11 @@
 
     "rows_written": {
       "type": "object",
-      "description": "Map of table name → rows upserted/inserted this run. Omit a table if zero rows were written (so an empty object means nothing ran). Jarvis surfaces this in the nightly brief and uses deltas to detect silent failures.",
+      "description": "Map of table name → rows PRESENT for run_date (COUNT(*) WHERE date = run_date, not a write-delta — an idempotent re-run reports the same final-state count). ALWAYS carries the fixed table set; the producer runs the same fixed COUNT queries every night, so there is no 'skipped table' case and a key is NEVER omitted. Zero is a measured value, never elided: raw_prices=0 on a successful ingest = market holiday; raw_prices=0 with other failure symptoms = API died — a present zero is exactly the holiday-vs-outage discriminator, and omitting the key would make that anomaly invisible.",
       "additionalProperties": { "type": "integer", "minimum": 0 },
       "examples": [
-        { "raw_prices": 8421, "stock_signals": 7983, "relatedness_matrix": 1840200 }
+        { "raw_prices": 8421, "stock_signals": 7983, "relatedness_matrix": 1840200 },
+        { "raw_prices": 0, "stock_signals": 0, "relatedness_matrix": 1840200 }
       ]
     },
 
@@ -153,18 +163,22 @@
 
     "wind_down": {
       "type": "object",
-      "required": ["status"],
+      "required": ["attempted", "result"],
       "additionalProperties": false,
-      "description": "Outcome of the wind-down / shutdown task.",
+      "description": "What the wind-down task OBSERVED at write time — producer-facts only, no consumer inferences. Timeline: the summary is written inside the run; wind-down then async-invokes workbench-stop; the box dies shortly after. So 'completed' (stop actually happened) and 'backstop' (5am kill) are NOT recordable here — the former hasn't happened yet, the latter kills the process that would write it. Jarvis infers those: stop-event present + this summary present = completed; summary absent/truncated by ~6am = backstop night (a first-class alarm, not a field value).",
       "properties": {
-        "status": {
+        "attempted": {
+          "type": "boolean",
+          "description": "Did the wind-down task reach the point of invoking workbench-stop? False if wind-down was never reached (upstream failure short-circuited the DAG before it)."
+        },
+        "result": {
           "type": "string",
-          "enum": ["completed", "skipped", "failed", "backstop"],
-          "description": "'completed' = wind-down task ran and stop Lambda was invoked. 'skipped' = wind-down task was not reached (upstream failure). 'failed' = wind-down task ran but stop Lambda call failed. 'backstop' = the 5am EventBridge backstop fired before wind-down ran."
+          "enum": ["invoked", "skipped_other_dags_running", "invoke_failed"],
+          "description": "The invoke outcome the task observed, written as its final act BEFORE the async invoke returns: 'invoked' = workbench-stop Lambda invoke issued; 'skipped_other_dags_running' = self-check found another tenant DAG active so did not invoke (§5 wind-down ownership); 'invoke_failed' = the invoke call itself raised."
         },
         "detail": {
           "type": "string",
-          "description": "Optional free-text — error message on failure, Lambda response on completed."
+          "description": "Optional free-text — error on invoke_failed, which other DAGs on skipped_other_dags_running, Lambda request-id on invoked."
         }
       }
     }
@@ -183,6 +197,8 @@
       "deploy": {
         "exit_status": 0,
         "tier": "code-only",
+        "commit_hash": "a0b7a3a",
+        "timestamp_utc": "2026-07-08T07:02:11Z",
         "detail": ""
       },
       "dags": [
@@ -205,13 +221,17 @@
       ],
       "rows_written": {
         "raw_prices": 8421,
-        "stock_signals": 7983
+        "stock_signals": 7983,
+        "signal_features": 7983,
+        "relatedness_matrix": 0,
+        "prediction_outcomes": 6120
       },
       "data_gates": {},
       "quarantine_count": 2,
       "wind_down": {
-        "status": "completed",
-        "detail": "stop Lambda invoked; EC2 stopping"
+        "attempted": true,
+        "result": "invoked",
+        "detail": "workbench-stop invoke request-id 7f3a…"
       }
     }
   ]

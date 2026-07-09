@@ -82,6 +82,57 @@ def test_schema_version_missing_warns():
 
 
 # ---------------------------------------------------------------------------
+# schema file is self-consistent — its own bundled examples validate
+# ---------------------------------------------------------------------------
+
+
+def test_schema_examples_validate_against_schema():
+    """Guard against schema/example drift: every example bundled in
+    run_summary_schema_v1.json (top-level + per-property) must validate against the
+    schema itself. Skipped if jsonschema isn't installed (not a hard test dep)."""
+    import json
+
+    jsonschema = pytest.importorskip("jsonschema")
+    schema_path = Path(__file__).parents[1] / "skills" / "signal" / "run_summary_schema_v1.json"
+    schema = json.loads(schema_path.read_text())
+    for ex in schema.get("examples", []):
+        jsonschema.validate(ex, schema)
+
+
+def test_schema_null_deploy_validates():
+    """The v1 first-run case (deploy: null) must satisfy the schema — key present,
+    value null."""
+    import json
+
+    jsonschema = pytest.importorskip("jsonschema")
+    schema_path = Path(__file__).parents[1] / "skills" / "signal" / "run_summary_schema_v1.json"
+    schema = json.loads(schema_path.read_text())
+    payload = {
+        "schema_version": 1,
+        "meta": {
+            "run_date": "2026-07-09",
+            "overall_status": "success",
+            "window_start_utc": "2026-07-09T07:05:00Z",
+            "window_end_utc": "2026-07-09T09:00:00Z",
+        },
+        "deploy": None,
+        "dags": [
+            {
+                "dag_id": "dag_stock_ingest",
+                "dag_run_id": "x",
+                "logical_date": "2026-07-09T07:05:00Z",
+                "state": "success",
+                "wall_clock_seconds": 10,
+            }
+        ],
+        "rows_written": {"raw_prices": 0},
+        "quarantine_count": 0,
+        "wind_down": {"attempted": True, "result": "invoked"},
+    }
+    jsonschema.validate(payload, schema)
+
+
+# ---------------------------------------------------------------------------
 # retry claim / resolve
 # ---------------------------------------------------------------------------
 
@@ -118,7 +169,7 @@ def _summary(state="failed", overall="failed"):
         "dags": [{"dag_id": "dag_ingest", "state": state, "logical_date": "2026-07-08"}],
         "rows_written": {},
         "quarantine_count": 0,
-        "wind_down": {"status": "completed"},
+        "wind_down": {"attempted": True, "result": "invoked"},
     }
 
 
@@ -285,6 +336,38 @@ def test_remediate_leash_dag_hangs_running(fake_s3, stub_summary, monkeypatch):
     assert "arn:stop" in stop_calls
 
 
+# ---------------------------------------------------------------------------
+# remediate happy path — retrigger to success
+# ---------------------------------------------------------------------------
+
+
+def test_remediate_success_resolves_and_stops(fake_s3, stub_summary, monkeypatch):
+    """Full happy path: workbench up, DAG retriggered, reaches success → retry
+    resolved success, workbench stopped."""
+    monkeypatch.setattr(
+        _mod, "_s3_get_json", lambda b, k, c: _summary() if "run-summaries" in k else fake_s3.get(k)
+    )
+    monkeypatch.setattr(_mod, "_airflow_token", lambda cfg: "tok")
+    monkeypatch.setattr(
+        _mod,
+        "_airflow_get",
+        lambda path, tok, cfg: {} if path == "/health" else {"state": "success"},
+    )
+    monkeypatch.setattr(_mod, "_airflow_trigger_dag", lambda *a, **k: {"dag_run_id": "run1"})
+    monkeypatch.setattr(_mod, "_print_summary", lambda s: None)
+    monkeypatch.setattr(_mod.time, "sleep", lambda *_: None)  # skip the 60s monitor poll wait
+
+    calls = []
+    monkeypatch.setattr(_mod, "_invoke_lambda", lambda arn, p, c: calls.append(arn) or {})
+
+    args = SimpleNamespace(date=None, dag_id=None, force=False)
+    _mod.cmd_remediate(args, CFG)  # runs to success, no exit
+
+    rec = fake_s3[_mod._retry_key("dag_ingest", "2026-07-08")]
+    assert rec["attempts"][-1]["outcome"] == "success"
+    assert "arn:start" in calls and "arn:stop" in calls
+
+
 def test_claim_race_guard_aborts_on_readback_mismatch(fake_s3, monkeypatch):
     """If the read-back after a claim doesn't show our stamp (a racing writer
     overwrote it), _claim_retry aborts rather than proceeding to double-fire."""
@@ -434,6 +517,43 @@ def test_summary_raw_dumps_json(monkeypatch, capsys):
     _mod.cmd_summary(SimpleNamespace(date="2026-07-08", raw=True), CFG)
     out = capsys.readouterr().out
     assert '"schema_version"' in out
+
+
+def test_summary_renders_null_deploy_and_winddown_result(monkeypatch, capsys):
+    """Producer-shape contract: deploy may be null (pre-writer), and wind_down
+    carries attempted+result, not a 'status' enum."""
+    s = _summary()
+    s["deploy"] = None
+    s["wind_down"] = {"attempted": True, "result": "skipped_other_dags_running"}
+    monkeypatch.setattr(_mod, "_s3_get_json", lambda b, k, c: s)
+    _mod.cmd_summary(SimpleNamespace(date="2026-07-08", raw=False), CFG)
+    out = capsys.readouterr().out
+    assert "no status emitted" in out  # null deploy branch
+    assert "skipped_other_dags_running" in out  # wind_down.result rendered
+
+
+def test_summary_renders_populated_deploy(monkeypatch, capsys):
+    """The non-null deploy branch renders exit/tier/commit (v1.1 populated case)."""
+    s = _summary()
+    s["deploy"] = {
+        "exit_status": 0,
+        "tier": "code-only",
+        "commit_hash": "a0b7a3a",
+        "timestamp_utc": "2026-07-08T07:02:11Z",
+    }
+    monkeypatch.setattr(_mod, "_s3_get_json", lambda b, k, c: s)
+    _mod.cmd_summary(SimpleNamespace(date="2026-07-08", raw=False), CFG)
+    out = capsys.readouterr().out
+    assert "code-only" in out
+    assert "a0b7a3a" in out  # commit_hash rendered
+
+
+def test_summary_renders_winddown_not_reached(monkeypatch, capsys):
+    s = _summary()
+    s["wind_down"] = {"attempted": False, "result": "invoke_failed"}
+    monkeypatch.setattr(_mod, "_s3_get_json", lambda b, k, c: s)
+    _mod.cmd_summary(SimpleNamespace(date="2026-07-08", raw=False), CFG)
+    assert "not reached" in capsys.readouterr().out
 
 
 def test_summary_warns_on_schema_mismatch(monkeypatch, capsys):
